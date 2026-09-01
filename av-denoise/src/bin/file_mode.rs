@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{IsTerminal, stdout};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use av_decoders::{Decoder, DecoderError, Rational32};
-use av_denoise::{Depth, FrameLayout, PlanarDenoiser, PlaneOptions, Planes, Subsampling, push_needs_retry};
+use av_denoise::{Depth, FrameLayout, PlanarDenoiser, PlaneOptions, Planes, Subsampling};
 use av_scenechange::{DetectionOptions, new_detector};
 use indicatif::ProgressBar;
 use v_frame::frame::Frame;
@@ -19,50 +19,55 @@ use crate::frame_index;
 use crate::progress::{self, denoise_bar_visible, denoise_progress_bar};
 use crate::y4m_format::subsampling_to_y4m;
 
-/// Target ceiling for CPU-side frame buffers held in flight. Channel
-/// depths shrink to stay under this when frames are large.
 const FRAME_MEMORY_BUDGET_BYTES: usize = 1 << 30;
 
-/// Channel depths used when frames are small enough to afford them.
-const FRAME_CHANNEL_DEPTH_MAX: usize = 8;
-const OUTPUT_CHANNEL_DEPTH_MAX: usize = 32;
-
-/// Floors that keep the pipeline from starving no matter the frame size.
-const FRAME_CHANNEL_DEPTH_MIN: usize = 2;
-const OUTPUT_CHANNEL_DEPTH_MIN: usize = 4;
-
-/// Channel depths for one run, with the frame counts they imply.
-#[derive(Debug, Clone, Copy)]
-struct ChannelBudget {
-    frame_depth: usize,
-    output_depth: usize,
+struct FrameMemorySemaphore {
+    available: Mutex<usize>,
+    permits_available: Condvar,
 }
 
-/// Picks channel depths so the frames held in flight stay near
-/// [`FRAME_MEMORY_BUDGET_BYTES`].
-///
-/// Small frames keep the maximum depths. Large frames scale both depths
-/// down together, never below their floors.
-fn channel_budget(layout: FrameLayout, workers: usize) -> ChannelBudget {
-    let frame_bytes = layout.luma_bytes() + 2 * layout.chroma_bytes();
-    let max_frames = workers * FRAME_CHANNEL_DEPTH_MAX + OUTPUT_CHANNEL_DEPTH_MAX;
+impl FrameMemorySemaphore {
+    fn for_layout(layout: FrameLayout) -> Arc<Self> {
+        let frame_bytes = layout.luma_bytes() + 2 * layout.chroma_bytes();
+        let permits = (FRAME_MEMORY_BUDGET_BYTES / frame_bytes.max(1)).max(1);
 
-    let affordable = FRAME_MEMORY_BUDGET_BYTES / frame_bytes.max(1);
+        Arc::new(Self {
+            available: Mutex::new(permits),
+            permits_available: Condvar::new(),
+        })
+    }
 
-    let (frame_depth, output_depth) = if max_frames <= affordable {
-        (FRAME_CHANNEL_DEPTH_MAX, OUTPUT_CHANNEL_DEPTH_MAX)
-    } else {
-        let scale = affordable as f64 / max_frames as f64;
-        let frame_depth =
-            ((FRAME_CHANNEL_DEPTH_MAX as f64 * scale).floor() as usize).max(FRAME_CHANNEL_DEPTH_MIN);
-        let output_depth =
-            ((OUTPUT_CHANNEL_DEPTH_MAX as f64 * scale).floor() as usize).max(OUTPUT_CHANNEL_DEPTH_MIN);
-        (frame_depth, output_depth)
-    };
+    fn acquire(self: &Arc<Self>) -> FrameMemoryPermit {
+        let mut available = self.available.lock().expect("frame memory lock poisoned");
 
-    ChannelBudget {
-        frame_depth,
-        output_depth,
+        while *available == 0 {
+            available = self
+                .permits_available
+                .wait(available)
+                .expect("frame memory lock poisoned");
+        }
+
+        *available -= 1;
+
+        FrameMemoryPermit {
+            semaphore: Arc::clone(self),
+        }
+    }
+}
+
+struct FrameMemoryPermit {
+    semaphore: Arc<FrameMemorySemaphore>,
+}
+
+impl Drop for FrameMemoryPermit {
+    fn drop(&mut self) {
+        let mut available = self
+            .semaphore
+            .available
+            .lock()
+            .expect("frame memory lock poisoned");
+        *available += 1;
+        self.semaphore.permits_available.notify_one();
     }
 }
 
@@ -129,9 +134,9 @@ fn encode_scenes(
     workers: usize,
     visible: bool,
 ) -> Result<(), anyhow::Error> {
-    let budget = channel_budget(video.layout, workers);
+    let frame_memory = FrameMemorySemaphore::for_layout(video.layout);
 
-    let (worker_txs, worker_handles, out_rx) = spawn_workers(opts, video.layout, workers, budget);
+    let (worker_txs, worker_handles, out_rx) = spawn_workers(opts, video.layout, workers);
     let (dispatch_count_tx, dispatch_count_rx) = sync_channel(1);
     let coordinator = spawn_coordinator(
         video.layout,
@@ -148,6 +153,7 @@ fn encode_scenes(
             video.layout,
             phantom_frames,
             &worker_txs,
+            &frame_memory,
             planes_from_v_frame_u8,
         ),
         Depth::Ten | Depth::Twelve => dispatch_frames::<u16, _>(
@@ -155,6 +161,7 @@ fn encode_scenes(
             video.layout,
             phantom_frames,
             &worker_txs,
+            &frame_memory,
             planes_from_v_frame_u16,
         ),
     };
@@ -193,22 +200,17 @@ fn encode_scenes(
 
 type WorkerJoin = thread::JoinHandle<Result<(), anyhow::Error>>;
 
-/// Spawns `workers` worker threads.
-///
-/// Returns their input channels, their join handles, and the shared
-/// output channel they emit denoised frames on.
 fn spawn_workers(
     opts: &PlaneOptions,
     layout: FrameLayout,
     workers: usize,
-    budget: ChannelBudget,
-) -> (Vec<SyncSender<WorkerMsg>>, Vec<WorkerJoin>, Receiver<OutputMsg>) {
-    let mut worker_txs: Vec<SyncSender<WorkerMsg>> = Vec::with_capacity(workers);
-    let (out_tx, out_rx) = sync_channel::<OutputMsg>(budget.output_depth);
+) -> (Vec<Sender<WorkerMsg>>, Vec<WorkerJoin>, Receiver<OutputMsg>) {
+    let mut worker_txs: Vec<Sender<WorkerMsg>> = Vec::with_capacity(workers);
+    let (out_tx, out_rx) = channel::<OutputMsg>();
     let mut worker_handles: Vec<WorkerJoin> = Vec::with_capacity(workers);
 
     for _ in 0..workers {
-        let (frame_tx, frame_rx) = sync_channel::<WorkerMsg>(budget.frame_depth);
+        let (frame_tx, frame_rx) = channel::<WorkerMsg>();
         let opts = opts.clone();
         let out_tx = out_tx.clone();
 
@@ -216,8 +218,6 @@ fn spawn_workers(
         worker_handles.push(thread::spawn(move || run_worker(opts, layout, frame_rx, out_tx)));
     }
 
-    // Drop the original sender so the channel closes once every worker
-    // clone has terminated.
     drop(out_tx);
 
     (worker_txs, worker_handles, out_rx)
@@ -238,7 +238,8 @@ fn dispatch_frames<T, F>(
     decoder: &mut Decoder,
     layout: FrameLayout,
     phantom_frames: &BTreeSet<usize>,
-    worker_txs: &[SyncSender<WorkerMsg>],
+    worker_txs: &[Sender<WorkerMsg>],
+    frame_memory: &Arc<FrameMemorySemaphore>,
     to_planes: F,
 ) -> Result<usize, anyhow::Error>
 where
@@ -275,10 +276,12 @@ where
             if frame_no == 0
                 && let Some(frame) = frames.front()
             {
+                let permit = frame_memory.acquire();
                 worker_txs[0]
                     .send(WorkerMsg::Frame {
                         global_idx: 0,
                         planes: to_planes(frame, layout),
+                        permit,
                     })
                     .map_err(|_| anyhow::anyhow!("worker 0 disconnected"))?;
                 frame_no = 1;
@@ -286,17 +289,15 @@ where
             break;
         }
 
-        let (cut, planes) = {
+        let cut = {
             let frame_set = frames.iter().take(detector_window).collect::<Vec<_>>();
-            let cut = if frame_no == 0 {
+            if frame_no == 0 {
                 false
             } else {
                 detector
                     .analyze_next_frame(&frame_set, frame_no, previous_keyframe)
                     .0
-            };
-            let frame_offset = usize::from(frame_no > 0);
-            (cut, to_planes(frame_set[frame_offset], layout))
+            }
         };
 
         if cut {
@@ -309,11 +310,15 @@ where
         }
 
         let target = scene_idx % workers;
+        let frame_offset = usize::from(frame_no > 0);
+        let permit = frame_memory.acquire();
+        let planes = to_planes(&frames[frame_offset], layout);
 
         worker_txs[target]
             .send(WorkerMsg::Frame {
                 global_idx: frame_no as u64,
                 planes,
+                permit,
             })
             .map_err(|_| anyhow::anyhow!("worker {target} disconnected"))?;
 
@@ -335,29 +340,43 @@ where
 }
 
 enum WorkerMsg {
-    Frame { global_idx: u64, planes: Planes },
+    Frame {
+        global_idx: u64,
+        planes: Planes,
+        permit: FrameMemoryPermit,
+    },
     EndScene,
     Eof,
+}
+
+struct PendingFrame {
+    global_idx: u64,
+    permit: FrameMemoryPermit,
 }
 
 struct OutputMsg {
     global_idx: u64,
     planes: Planes,
+    permit: FrameMemoryPermit,
 }
 
 fn run_worker(
     opts: PlaneOptions,
     layout: FrameLayout,
     rx: Receiver<WorkerMsg>,
-    tx: SyncSender<OutputMsg>,
+    tx: Sender<OutputMsg>,
 ) -> Result<(), anyhow::Error> {
     let mut active_scene = false;
     let mut wd: Option<PlanarDenoiser> = None;
-    let mut pending: VecDeque<u64> = Default::default();
+    let mut pending: VecDeque<PendingFrame> = Default::default();
 
     loop {
         match rx.recv() {
-            Ok(WorkerMsg::Frame { global_idx, planes }) => {
+            Ok(WorkerMsg::Frame {
+                global_idx,
+                planes,
+                permit,
+            }) => {
                 if !active_scene {
                     if wd.is_none() {
                         wd = Some(PlanarDenoiser::create(&opts, layout)?);
@@ -366,7 +385,7 @@ fn run_worker(
                 }
 
                 let denoiser = wd.as_mut().expect("denoiser exists after new-scene init");
-                push_with_drain(denoiser, &mut pending, global_idx, &planes, &tx)?;
+                push_with_drain(denoiser, &mut pending, global_idx, permit, &planes, &tx)?;
             },
             Ok(WorkerMsg::EndScene) => {
                 if active_scene {
@@ -388,39 +407,43 @@ fn run_worker(
     Ok(())
 }
 
-/// Push one frame, draining any pending output first if the queue is full.
 fn push_with_drain(
     denoiser: &mut PlanarDenoiser,
-    pending: &mut VecDeque<u64>,
+    pending: &mut VecDeque<PendingFrame>,
     global_idx: u64,
+    permit: FrameMemoryPermit,
     planes: &Planes,
-    tx: &SyncSender<OutputMsg>,
+    tx: &Sender<OutputMsg>,
 ) -> Result<(), anyhow::Error> {
-    pending.push_back(global_idx);
+    pending.push_back(PendingFrame { global_idx, permit });
 
-    if push_needs_retry(denoiser.push(planes))? {
-        if let Some(out) = denoiser.recv()? {
-            let g = pending
-                .pop_front()
-                .expect("pending has at least one entry on QueueFull recv");
-            send_output(tx, g, out)?;
-        }
-
-        denoiser.push(planes)?;
+    if denoiser.push_would_block()
+        && let Some(out) = denoiser.recv()?
+    {
+        let pending_frame = pending
+            .pop_front()
+            .expect("pending has at least one entry on QueueFull recv");
+        send_output(tx, pending_frame, out)?;
     }
+
+    denoiser.push(planes)?;
 
     Ok(())
 }
 
-fn send_output(tx: &SyncSender<OutputMsg>, global_idx: u64, planes: Planes) -> Result<(), anyhow::Error> {
-    tx.send(OutputMsg { global_idx, planes })
-        .map_err(|_| anyhow::anyhow!("coordinator disconnected"))
+fn send_output(tx: &Sender<OutputMsg>, pending: PendingFrame, planes: Planes) -> Result<(), anyhow::Error> {
+    tx.send(OutputMsg {
+        global_idx: pending.global_idx,
+        planes,
+        permit: pending.permit,
+    })
+    .map_err(|_| anyhow::anyhow!("coordinator disconnected"))
 }
 
 fn flush_worker(
     wd: &mut PlanarDenoiser,
-    pending: &mut VecDeque<u64>,
-    tx: &SyncSender<OutputMsg>,
+    pending: &mut VecDeque<PendingFrame>,
+    tx: &Sender<OutputMsg>,
 ) -> Result<(), anyhow::Error> {
     let mut disconnected = false;
 
@@ -429,17 +452,16 @@ fn flush_worker(
             return;
         }
 
-        if let Some(g) = pending.pop_front() {
+        if let Some(pending_frame) = pending.pop_front() {
             let msg = OutputMsg {
-                global_idx: g,
+                global_idx: pending_frame.global_idx,
                 planes: out,
+                permit: pending_frame.permit,
             };
             let did_send = tx.send(msg).is_ok();
             if !did_send {
                 disconnected = true;
             }
-        } else {
-            tracing::warn!("worker emitted flushed frame with no pending global index");
         }
     })?;
 
@@ -461,9 +483,6 @@ fn run_coordinator(
     let stdout = stdout();
     let lock = stdout.lock();
 
-    // No `XCOLORRANGE=` tag is emitted here. `av_decoders::VideoDetails`
-    // doesn't surface the source's color range for any of its backends
-    // (ffms2 included), so there's nothing to forward.
     let mut encoder = y4m::encode(
         layout.width as usize,
         layout.height as usize,
@@ -492,15 +511,16 @@ fn emit_frames<W>(
 where
     W: std::io::Write,
 {
-    let mut pending: BTreeMap<u64, Planes> = BTreeMap::new();
+    let mut pending: BTreeMap<u64, OutputMsg> = BTreeMap::new();
     let mut next_emit: u64 = 0;
 
     while let Ok(msg) = rx.recv() {
-        pending.insert(msg.global_idx, msg.planes);
+        pending.insert(msg.global_idx, msg);
 
-        while let Some(planes) = pending.remove(&next_emit) {
+        while let Some(OutputMsg { planes, permit, .. }) = pending.remove(&next_emit) {
             let frame = Y4mFrame::new([&planes.y, &planes.u, &planes.v], None);
             encoder.write_frame(&frame)?;
+            drop(permit);
             next_emit += 1;
         }
 

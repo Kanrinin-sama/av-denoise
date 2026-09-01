@@ -394,6 +394,14 @@ impl PlanarDenoiser {
         self.temporal_radius
     }
 
+    pub fn push_would_block(&self) -> bool {
+        self.yuv
+            .as_ref()
+            .or(self.luma.as_ref())
+            .or(self.chroma.as_ref())
+            .is_some_and(Denoiser::push_would_block)
+    }
+
     /// Pushes one planar frame.
     ///
     /// On `QueueFull` the caller should receive one frame and then retry

@@ -809,6 +809,10 @@ impl Denoiser {
         }
     }
 
+    pub fn push_would_block(&self) -> bool {
+        self.frames_pushed > self.temporal_radius && self.pending.len() >= MAX_PENDING
+    }
+
     /// Uploads one frame into the temporal window.
     ///
     /// `frame` holds `width * height * channels` `f32` values in
@@ -826,8 +830,7 @@ impl Denoiser {
         // After `temporal_radius` real pushes the leading-edge mirror
         // has primed the window, so the next push produces a pending
         // frame. From then on every push takes a pending slot.
-        let window_full = self.frames_pushed > self.temporal_radius;
-        if window_full && self.pending.len() >= MAX_PENDING {
+        if self.push_would_block() {
             return Err(DenoiserError::QueueFull);
         }
 
