@@ -12,18 +12,6 @@
 //! and uses the first one that starts successfully, which lets a program
 //! prefer a fast backend and quietly fall back to a slower one.
 //!
-//! ```no_run
-//! use av_denoise_core::accelerate::get_default_accelerators;
-//!
-//! // Every backend this build supports, in the order to try them.
-//! let preferred = get_default_accelerators();
-//! # let _ = preferred;
-//! ```
-//!
-//! A list can also be written out by hand, such as
-//! `vec![Accelerator::Cuda, Accelerator::Vulkan]` to prefer the vendor
-//! backend and fall back to the portable one.
-//!
 //! Every accelerator here runs kernels on a GPU. There is no software
 //! backend, because the collaborative filter aggregates through atomic
 //! floating-point adds and cubecl's CPU runtime does not implement

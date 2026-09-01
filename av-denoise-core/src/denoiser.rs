@@ -2,12 +2,11 @@ use std::collections::VecDeque;
 
 use cubecl::Runtime;
 use cubecl::prelude::ComputeClient;
+use cubecl::stream_id::StreamId;
 
 use crate::accelerate::Accelerator;
 use crate::device::Device;
 use crate::nl4d::{Nl4dDenoiser, Nl4dParams};
-#[cfg(test)]
-use crate::nlmeans::MotionEstimation;
 use crate::nlmeans::{
     ChannelMode,
     HqParams,
@@ -414,9 +413,6 @@ impl DenoiserOptions {
     /// Whichever default `strength` applies is folded in here. For the
     /// HQ algorithm that comes from
     /// [`crate::nlmeans::hq_default_strength`].
-    ///
-    /// This is public so callers building per-plane options, and tests,
-    /// can read the resolved values without building a real `Denoiser`.
     #[doc(hidden)]
     pub fn to_nlm_params(&self) -> NlmParams {
         let temporal_radius = match self.mode {
@@ -683,44 +679,6 @@ impl WindowSpan {
 ///
 /// Frames are `f32` values in `[0, 1]`, laid out as
 /// `width * height * channels`.
-///
-/// ```no_run
-/// use av_denoise_core::accelerate::Accelerator;
-/// use av_denoise_core::{ChannelMode, Denoiser, DenoiserOptions, DenoisingMode, Device};
-///
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let options = DenoiserOptions::builder()
-///     .channel_mode(ChannelMode::Luma)
-///     .mode(DenoisingMode::Temporal { radius: 2 })
-///     .build();
-///
-/// let mut denoiser = Denoiser::create(
-///     &[Accelerator::Vulkan],
-///     &Device::Default,
-///     1920,
-///     1080,
-///     options,
-/// )?;
-///
-/// let frames: Vec<Vec<f32>> = read_my_frames();
-/// let mut cleaned: Vec<Vec<f32>> = Vec::new();
-///
-/// for frame in &frames {
-///     denoiser.push_frame(frame)?;
-///
-///     // Temporal denoising runs a few frames behind the input, so
-///     // there is not always one ready to collect.
-///     if let Some(out) = denoiser.recv_frame()? {
-///         cleaned.push(out);
-///     }
-/// }
-///
-/// // Drain the frames still inside the temporal window.
-/// denoiser.flush(|out| cleaned.push(out))?;
-/// # Ok(())
-/// # }
-/// # fn read_my_frames() -> Vec<Vec<f32>> { Vec::new() }
-/// ```
 pub struct Denoiser {
     backend: Backend,
     pending: VecDeque<BackendPending>,
@@ -752,19 +710,23 @@ impl Denoiser {
     /// Callers using a `search_radius` above 4 should set
     /// `RUST_MIN_STACK` to at least 16 MiB before any cubecl thread
     /// spawns, usually right at the top of `main`.
-    ///
-    /// ```no_run
-    /// if std::env::var_os("RUST_MIN_STACK").is_none() {
-    ///     // SAFETY: single-threaded at startup.
-    ///     unsafe { std::env::set_var("RUST_MIN_STACK", "16777216") };
-    /// }
-    /// ```
     pub fn create(
         accelerators: &[Accelerator],
         device: &Device,
         width: u32,
         height: u32,
         options: DenoiserOptions,
+    ) -> Result<Self, DenoiserError> {
+        Self::create_on_stream(accelerators, device, width, height, options, StreamId::current())
+    }
+
+    pub(crate) fn create_on_stream(
+        accelerators: &[Accelerator],
+        device: &Device,
+        width: u32,
+        height: u32,
+        options: DenoiserOptions,
+        stream_id: StreamId,
     ) -> Result<Self, DenoiserError> {
         let accelerator =
             sniff_best_accelerator(accelerators, device).ok_or(DenoiserError::NoAcceleratorAvailable)?;
@@ -775,7 +737,15 @@ impl Denoiser {
 
         let channels = params.channels.count();
         let temporal_radius = params.temporal_radius;
-        let backend = build_backend(accelerator, device, &options.algorithm, params, width, height)?;
+        let backend = build_backend(
+            accelerator,
+            device,
+            &options.algorithm,
+            params,
+            width,
+            height,
+            stream_id,
+        )?;
 
         Ok(Self {
             backend,
@@ -1010,12 +980,13 @@ fn build_backend(
     params: NlmParams,
     width: u32,
     height: u32,
+    stream_id: StreamId,
 ) -> Result<Backend, DenoiserError> {
     match accel {
         #[cfg(feature = "cuda")]
         Accelerator::Cuda => {
             let dev = device.to_cuda()?;
-            let client = <cubecl::cuda::CudaRuntime as Runtime>::client(&dev);
+            let client = client_on_stream::<cubecl::cuda::CudaRuntime>(&dev, stream_id);
             Ok(Backend::Cuda(build_engine(
                 &client, algorithm, params, width, height,
             )?))
@@ -1023,7 +994,7 @@ fn build_backend(
         #[cfg(feature = "rocm")]
         Accelerator::Rocm => {
             let dev = device.to_amd()?;
-            let client = <cubecl::hip::HipRuntime as Runtime>::client(&dev);
+            let client = client_on_stream::<cubecl::hip::HipRuntime>(&dev, stream_id);
             Ok(Backend::Rocm(build_engine(
                 &client, algorithm, params, width, height,
             )?))
@@ -1031,7 +1002,7 @@ fn build_backend(
         #[cfg(feature = "vulkan")]
         Accelerator::Vulkan => {
             let dev = device.to_wgpu()?;
-            let client = <cubecl::wgpu::WgpuRuntime as Runtime>::client(&dev);
+            let client = client_on_stream::<cubecl::wgpu::WgpuRuntime>(&dev, stream_id);
             Ok(Backend::Wgpu(build_engine(
                 &client, algorithm, params, width, height,
             )?))
@@ -1039,7 +1010,7 @@ fn build_backend(
         #[cfg(feature = "metal")]
         Accelerator::Metal => {
             let dev = device.to_wgpu()?;
-            let client = <cubecl::wgpu::WgpuRuntime as Runtime>::client(&dev);
+            let client = client_on_stream::<cubecl::wgpu::WgpuRuntime>(&dev, stream_id);
             Ok(Backend::Wgpu(build_engine(
                 &client, algorithm, params, width, height,
             )?))
@@ -1053,817 +1024,8 @@ fn build_backend(
     }
 }
 
-#[cfg(test)]
-mod options_tests {
-    use super::*;
-
-    /// `Algorithm::NlmeansHq` with `hq` overridden and everything else
-    /// left at its default.
-    fn hq(hq: HqParams) -> Algorithm {
-        Algorithm::NlmeansHq(NlmeansHqOptions {
-            hq,
-            ..NlmeansHqOptions::default()
-        })
-    }
-
-    /// `Algorithm::Nlmeans` with `tuning` overridden.
-    fn fast_tuned(tuning: NlmTuning) -> Algorithm {
-        Algorithm::Nlmeans(NlmeansOptions {
-            tuning,
-            ..NlmeansOptions::default()
-        })
-    }
-
-    #[test]
-    fn nl4d_default_lambda_ht_differs_between_luma_and_chroma() {
-        let luma = nl4d_default_lambda_ht(ChannelMode::Luma);
-        let chroma = nl4d_default_lambda_ht(ChannelMode::Chroma);
-
-        assert!((luma - 5.3).abs() < f32::EPSILON);
-        assert!((chroma - 4.2).abs() < f32::EPSILON);
-        assert!(
-            (chroma - luma).abs() > f32::EPSILON,
-            "the two planes should not resolve to the same default"
-        );
-    }
-
-    #[test]
-    fn nl4d_default_lambda_ht_yuv_reads_the_luma_value() {
-        let yuv = nl4d_default_lambda_ht(ChannelMode::Yuv);
-        let luma = nl4d_default_lambda_ht(ChannelMode::Luma);
-
-        assert!((yuv - luma).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn resolve_lambda_ht_unset_uses_the_per_plane_default() {
-        let opts = Nl4dOptions::default();
-
-        let luma = resolve_lambda_ht(&opts, ChannelMode::Luma).expect("the default scale is in range");
-        let chroma = resolve_lambda_ht(&opts, ChannelMode::Chroma).expect("the default scale is in range");
-
-        assert!((luma - 5.3).abs() < f32::EPSILON, "got {luma}");
-        assert!((chroma - 4.2).abs() < f32::EPSILON, "got {chroma}");
-    }
-
-    #[test]
-    fn resolve_lambda_ht_explicit_value_overrides_every_plane() {
-        let opts = Nl4dOptions {
-            lambda_ht: Some(4.4),
-            ..Nl4dOptions::default()
-        };
-
-        for channels in [ChannelMode::Luma, ChannelMode::Chroma, ChannelMode::Yuv] {
-            let got = resolve_lambda_ht(&opts, channels).expect("the default scale is in range");
-            assert!(
-                (got - 4.4).abs() < f32::EPSILON,
-                "channels {channels:?} got {got}"
-            );
-        }
-    }
-
-    #[test]
-    fn resolve_lambda_ht_default_scale_leaves_the_value_alone() {
-        let opts = Nl4dOptions::default();
-
-        for channels in [ChannelMode::Luma, ChannelMode::Chroma, ChannelMode::Yuv] {
-            let got = resolve_lambda_ht(&opts, channels).expect("the default scale is in range");
-            let want = nl4d_default_lambda_ht(channels);
-            assert!(
-                (got - want).abs() < f32::EPSILON,
-                "channels {channels:?} got {got}"
-            );
-        }
-    }
-
-    #[test]
-    fn resolve_lambda_ht_scale_multiplies_the_per_plane_default() {
-        let opts = Nl4dOptions {
-            lambda_ht_scale: 1.1,
-            ..Nl4dOptions::default()
-        };
-
-        for channels in [ChannelMode::Luma, ChannelMode::Chroma, ChannelMode::Yuv] {
-            let got = resolve_lambda_ht(&opts, channels).expect("1.1 is in range");
-            let want = nl4d_default_lambda_ht(channels) * 1.1;
-            assert!(
-                (got - want).abs() < 1e-5,
-                "channels {channels:?} got {got}, want {want}"
-            );
-        }
-    }
-
-    /// The scale is not limited to the defaults. Pinning one plane and
-    /// scaling both is the combination this exists for.
-    #[test]
-    fn resolve_lambda_ht_scale_multiplies_an_explicit_value() {
-        let opts = Nl4dOptions {
-            lambda_ht: Some(5.0),
-            lambda_ht_scale: 0.9,
-            ..Nl4dOptions::default()
-        };
-
-        let got = resolve_lambda_ht(&opts, ChannelMode::Luma).expect("0.9 is in range");
-        assert!((got - 4.5).abs() < 1e-5, "got {got}");
-    }
-
-    #[test]
-    fn resolve_lambda_ht_rejects_an_out_of_range_scale() {
-        for bad in [0.0, -1.0, 0.05, 10.5, f32::NAN, f32::INFINITY] {
-            let opts = Nl4dOptions {
-                lambda_ht_scale: bad,
-                ..Nl4dOptions::default()
-            };
-            let err = resolve_lambda_ht(&opts, ChannelMode::Luma).unwrap_err();
-            assert!(
-                err.contains("lambda_ht_scale"),
-                "lambda_ht_scale={bad} should be rejected, got {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_default_algorithm_is_the_fast_nlmeans_path() {
-        let opts = DenoiserOptions::builder().build();
-        assert_eq!(opts.algorithm, Algorithm::Nlmeans(NlmeansOptions::default()));
-    }
-
-    #[test]
-    fn spatial_mode_maps_to_zero_temporal_radius() {
-        let opts = DenoiserOptions::builder()
-            .channel_mode(ChannelMode::Yuv)
-            .mode(DenoisingMode::Spacial)
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert_eq!(params.temporal_radius, 0);
-        assert_eq!(params.channels, ChannelMode::Yuv);
-    }
-
-    #[test]
-    fn temporal_mode_propagates_radius() {
-        let opts = DenoiserOptions::builder()
-            .mode(DenoisingMode::Temporal { radius: 3 })
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert_eq!(params.temporal_radius, 3);
-    }
-
-    #[test]
-    fn prefilter_passthrough() {
-        let opts = DenoiserOptions::builder()
-            .algorithm(Algorithm::Nlmeans(NlmeansOptions {
-                prefilter: PrefilterMode::Bilateral {
-                    sigma_s: 3.0,
-                    sigma_r: 0.02,
-                },
-                ..NlmeansOptions::default()
-            }))
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert!(matches!(params.prefilter, PrefilterMode::Bilateral { .. }));
-    }
-
-    #[test]
-    fn hq_unset_prefilter_defaults_to_none() {
-        let opts = DenoiserOptions::builder()
-            .algorithm(hq(HqParams::default()))
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert!(matches!(params.prefilter, PrefilterMode::None));
-    }
-
-    #[test]
-    fn fast_unset_prefilter_defaults_to_none() {
-        let opts = DenoiserOptions::builder()
-            .algorithm(Algorithm::Nlmeans(NlmeansOptions::default()))
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert!(matches!(params.prefilter, PrefilterMode::None));
-    }
-
-    #[test]
-    fn hq_unset_strength_defaults_to_hq_default_strength() {
-        // Default channel_mode is Yuv, default mode is Spacial (radius 0).
-        let opts = DenoiserOptions::builder()
-            .algorithm(hq(HqParams::default()))
-            .build();
-        let params = opts.to_nlm_params();
-
-        let expected = hq_default_strength(ChannelMode::Yuv, 0);
-        assert!((params.strength - expected).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn hq_no_auto_strength_falls_back_to_the_legacy_absolute_default() {
-        // `effective_strength_with` only reads `strength` as a
-        // multiplier on the measured sigma when `auto_strength` is true.
-        // With it false, `strength` is an FFmpeg-style absolute value,
-        // so the fallback has to be the fast path's absolute default
-        // rather than a calibrated multiplier from
-        // `hq_default_strength`.
-        let opts = DenoiserOptions::builder()
-            .algorithm(hq(HqParams {
-                auto_strength: false,
-                ..HqParams::default()
-            }))
-            .build();
-        let params = opts.to_nlm_params();
-
-        let expected = NlmParams::default().strength;
-        assert!(
-            (params.strength - expected).abs() < f32::EPSILON,
-            "expected the legacy absolute default {expected}, got {}, which looks like the \
-             auto-strength multiplier table leaking through",
-            params.strength
-        );
-    }
-
-    #[test]
-    fn hq_luma_r4_uses_measured_table_value() {
-        let opts = DenoiserOptions::builder()
-            .channel_mode(ChannelMode::Luma)
-            .mode(DenoisingMode::Temporal { radius: 4 })
-            .algorithm(hq(HqParams::default()))
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert!((params.strength - 0.35).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn hq_chroma_r4_uses_measured_table_value() {
-        let opts = DenoiserOptions::builder()
-            .channel_mode(ChannelMode::Chroma)
-            .mode(DenoisingMode::Temporal { radius: 4 })
-            .algorithm(hq(HqParams::default()))
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert!((params.strength - 0.70).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn hq_yuv_r8_uses_measured_table_value() {
-        let opts = DenoiserOptions::builder()
-            .channel_mode(ChannelMode::Yuv)
-            .mode(DenoisingMode::Temporal { radius: 8 })
-            .algorithm(hq(HqParams::default()))
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert!((params.strength - 0.30).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn hq_spacial_mode_uses_radius_zero_table_values() {
-        for channels in [ChannelMode::Luma, ChannelMode::Chroma, ChannelMode::Yuv] {
-            let opts = DenoiserOptions::builder()
-                .channel_mode(channels)
-                .mode(DenoisingMode::Spacial)
-                .algorithm(hq(HqParams::default()))
-                .build();
-            let params = opts.to_nlm_params();
-
-            let expected = hq_default_strength(channels, 0);
-            assert!(
-                (params.strength - expected).abs() < f32::EPSILON,
-                "for channels {channels:?} expected {expected}, got {}",
-                params.strength
-            );
-        }
-    }
-
-    #[test]
-    fn hq_explicit_strength_wins_over_the_table_for_every_plane() {
-        for channels in [ChannelMode::Luma, ChannelMode::Chroma, ChannelMode::Yuv] {
-            let opts = DenoiserOptions::builder()
-                .channel_mode(channels)
-                .mode(DenoisingMode::Temporal { radius: 4 })
-                .algorithm(Algorithm::NlmeansHq(NlmeansHqOptions {
-                    nlm: NlmeansOptions {
-                        tuning: NlmTuning {
-                            strength: Some(0.99),
-                            ..NlmTuning::default()
-                        },
-                        ..NlmeansOptions::default()
-                    },
-                    hq: HqParams::default(),
-                }))
-                .build();
-            let params = opts.to_nlm_params();
-
-            assert!(
-                (params.strength - 0.99).abs() < f32::EPSILON,
-                "for channels {channels:?} the explicit strength was overridden by the table"
-            );
-        }
-    }
-
-    #[test]
-    fn fast_unset_strength_defaults_to_legacy_default() {
-        let opts = DenoiserOptions::builder()
-            .algorithm(Algorithm::Nlmeans(NlmeansOptions::default()))
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert!((params.strength - 1.2).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn nl4d_options_default_matches_nl4d_params_default() {
-        let opts = Nl4dOptions::default();
-        let params = crate::nl4d::Nl4dParams::default();
-
-        assert_eq!(opts.refine, params.refine);
-        assert_eq!(opts.spatial_radius, params.spatial_radius);
-        assert!((opts.c_min - params.c_min).abs() < f32::EPSILON);
-        assert_eq!(opts.confidence_variance, params.confidence_variance);
-        // The two `lambda_ht` fields hold different things, so they are
-        // not compared. `opts.lambda_ht` stays `None` and is deferred to
-        // `nl4d_default_lambda_ht` once the plane is known (see
-        // `resolve_lambda_ht_unset_uses_the_per_plane_default` above),
-        // while `params.lambda_ht` is a concrete default mirroring the
-        // Luma/Yuv value.
-        assert_eq!(opts.lambda_ht, None);
-        assert!((params.lambda_ht - nl4d_default_lambda_ht(ChannelMode::Yuv)).abs() < f32::EPSILON);
-    }
-
-    /// nl4d takes its own noise and confidence knobs rather than a whole
-    /// [`HqParams`], so the three it does take have to reach the front
-    /// end and the rest have to arrive at their defaults.
-    #[test]
-    fn nl4d_builds_the_front_ends_hq_params_from_its_own_fields() {
-        let opts = DenoiserOptions::builder()
-            .mode(DenoisingMode::Temporal { radius: 2 })
-            .algorithm(Algorithm::Nl4d(Nl4dOptions {
-                sigma: Some(0.02),
-                sigma_scale: 1.3,
-                thsad_scale: 0.8,
-                ..Nl4dOptions::default()
-            }))
-            .build();
-        let params = opts.to_nlm_params();
-
-        let hq = params.hq.expect("nl4d always runs the hq front end");
-        assert_eq!(hq.sigma_override, Some(0.02));
-        assert!((hq.sigma_scale - 1.3).abs() < f32::EPSILON);
-        assert!((hq.thsad_scale - 0.8).abs() < f32::EPSILON);
-        assert!(
-            hq.temporal_confidence,
-            "the grouping kernel reads the confidence scores, so this cannot be off"
-        );
-    }
-
-    /// The temporal radius has one source now, `mode`, so nl4d cannot
-    /// disagree with the front end's ring about how wide the window is.
-    #[test]
-    fn nl4d_reads_its_temporal_radius_from_the_denoising_mode() {
-        for radius in [1u32, 4, 8] {
-            let opts = DenoiserOptions::builder()
-                .mode(DenoisingMode::Temporal { radius })
-                .algorithm(Algorithm::Nl4d(Nl4dOptions::default()))
-                .build();
-
-            assert_eq!(opts.to_nlm_params().temporal_radius, radius);
-        }
-    }
-
-    /// nl4d never runs an NLM weighting pass, so a prefilter would cost
-    /// a GPU pass per frame producing a reference image nothing reads.
-    #[test]
-    fn nl4d_never_builds_a_prefilter() {
-        let opts = DenoiserOptions::builder()
-            .mode(DenoisingMode::Temporal { radius: 2 })
-            .algorithm(Algorithm::Nl4d(Nl4dOptions::default()))
-            .build();
-
-        assert!(matches!(opts.to_nlm_params().prefilter, PrefilterMode::None));
-    }
-
-    /// Nothing in the nl4d path reads `strength`, so it stays at the
-    /// library default rather than picking up HQ's calibrated table.
-    #[test]
-    fn nl4d_leaves_the_nlm_weighting_knobs_at_their_defaults() {
-        let defaults = NlmParams::default();
-        let opts = DenoiserOptions::builder()
-            .channel_mode(ChannelMode::Luma)
-            .mode(DenoisingMode::Temporal { radius: 4 })
-            .algorithm(Algorithm::Nl4d(Nl4dOptions::default()))
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert!((params.strength - defaults.strength).abs() < f32::EPSILON);
-        assert_eq!(params.search_radius, defaults.search_radius);
-        assert_eq!(params.patch_radius, defaults.patch_radius);
-        assert!((params.self_weight - defaults.self_weight).abs() < f32::EPSILON);
-    }
-
-    /// nl4d always tracks motion, so its `MotionSearch` reaches the
-    /// front end as an active `Mvtools` mode.
-    #[test]
-    fn nl4d_motion_search_becomes_an_active_mvtools_mode() {
-        let opts = DenoiserOptions::builder()
-            .mode(DenoisingMode::Temporal { radius: 2 })
-            .algorithm(Algorithm::Nl4d(Nl4dOptions {
-                motion: MotionSearch {
-                    blksize: 32,
-                    overlap: 16,
-                    search_radius: 6,
-                    pyramid_levels: 1,
-                    estimation: MotionEstimation::Direct,
-                },
-                ..Nl4dOptions::default()
-            }))
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert!(matches!(
-            params.motion_compensation,
-            MotionCompensationMode::Mvtools {
-                blksize: 32,
-                overlap: 16,
-                search_radius: 6,
-                pyramid_levels: 1,
-                estimation: MotionEstimation::Direct,
-            }
-        ));
-    }
-
-    #[test]
-    fn nl4d_motion_search_defaults_match_the_front_ends_own_defaults() {
-        let opts = DenoiserOptions::builder()
-            .mode(DenoisingMode::Temporal { radius: 2 })
-            .algorithm(Algorithm::Nl4d(Nl4dOptions::default()))
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert_eq!(
-            params.motion_compensation,
-            crate::nl4d::Nl4dParams::default().nlm.motion_compensation
-        );
-    }
-
-    #[test]
-    fn motion_compensation_passthrough() {
-        let opts = DenoiserOptions::builder()
-            .mode(DenoisingMode::Temporal { radius: 1 })
-            .algorithm(Algorithm::Nlmeans(NlmeansOptions {
-                motion_compensation: MotionCompensationMode::Mvtools {
-                    blksize: 16,
-                    overlap: 8,
-                    search_radius: 4,
-                    pyramid_levels: 2,
-                    estimation: MotionEstimation::Direct,
-                },
-                ..NlmeansOptions::default()
-            }))
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert!(matches!(
-            params.motion_compensation,
-            MotionCompensationMode::Mvtools {
-                blksize: 16,
-                overlap: 8,
-                search_radius: 4,
-                pyramid_levels: 2,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn motion_compensation_defaults_to_none() {
-        let opts = DenoiserOptions::builder().build();
-        let params = opts.to_nlm_params();
-        assert!(matches!(params.motion_compensation, MotionCompensationMode::None));
-    }
-
-    #[test]
-    fn nlm_tuning_overrides_individual_fields() {
-        let defaults = NlmParams::default();
-        let opts = DenoiserOptions::builder()
-            .algorithm(fast_tuned(NlmTuning {
-                search_radius: Some(7),
-                patch_radius: None,
-                strength: Some(2.5),
-                self_weight: None,
-            }))
-            .build();
-        let params = opts.to_nlm_params();
-
-        assert_eq!(params.search_radius, 7);
-        assert_eq!(params.patch_radius, defaults.patch_radius);
-        assert!((params.strength - 2.5).abs() < f32::EPSILON);
-        assert!((params.self_weight - defaults.self_weight).abs() < f32::EPSILON);
-    }
-}
-
-#[cfg(all(test, feature = "vulkan"))]
-mod tests {
-    use super::*;
-
-    fn opts(mode: DenoisingMode) -> DenoiserOptions {
-        DenoiserOptions::builder()
-            .channel_mode(ChannelMode::Luma)
-            .mode(mode)
-            .build()
-    }
-
-    fn frame(w: u32, h: u32) -> Vec<f32> {
-        vec![0.5f32; (w * h) as usize]
-    }
-
-    #[test]
-    fn spatial_denoise_roundtrip() {
-        let mut d = Denoiser::create(
-            &[Accelerator::Vulkan],
-            &Device::Default,
-            16,
-            16,
-            opts(DenoisingMode::Spacial),
-        )
-        .expect("denoiser construction failed");
-        assert_eq!(d.selected_accelerator(), Accelerator::Vulkan);
-
-        d.push_frame(&frame(16, 16)).expect("push failed");
-        let out = d.recv_frame().expect("recv failed").expect("no frame");
-        assert_eq!(out.len(), 16 * 16);
-    }
-
-    #[test]
-    fn nl4d_algorithm_round_trips_through_the_facade() {
-        let opts = DenoiserOptions::builder()
-            .channel_mode(ChannelMode::Luma)
-            .mode(DenoisingMode::Temporal { radius: 2 })
-            .algorithm(Algorithm::Nl4d(Nl4dOptions::default()))
-            .build();
-        let mut d = Denoiser::create(&[Accelerator::Vulkan], &Device::Default, 16, 16, opts)
-            .expect("nl4d denoiser construction failed");
-        assert_eq!(d.selected_accelerator(), Accelerator::Vulkan);
-
-        // temporal_radius is 2, so a single push does not fill the
-        // window yet, the same convention every temporal algorithm here
-        // follows.
-        d.push_frame(&frame(16, 16)).expect("push failed");
-        assert!(d.recv_frame().expect("recv failed").is_none());
-
-        let mut out = Vec::new();
-        d.flush(|f| out.push(f)).expect("flush failed");
-        assert_eq!(out.len(), 1, "expected exactly one output for one pushed frame");
-        assert_eq!(out[0].len(), 16 * 16);
-    }
-
-    /// nl4d groups patches across neighbouring frames, so a spatial
-    /// mode leaves it nothing to do. The temporal radius has one source
-    /// now, `mode`, so this is the only way to ask for that.
-    #[test]
-    fn nl4d_rejects_a_spatial_denoising_mode() {
-        let opts = DenoiserOptions::builder()
-            .channel_mode(ChannelMode::Luma)
-            .mode(DenoisingMode::Spacial)
-            .algorithm(Algorithm::Nl4d(Nl4dOptions::default()))
-            .build();
-        let result = Denoiser::create(&[Accelerator::Vulkan], &Device::Default, 16, 16, opts);
-
-        match result {
-            Err(DenoiserError::Other(e)) => assert!(
-                e.to_string().contains("temporal window"),
-                "unexpected error message: {e}"
-            ),
-            Err(other) => panic!("expected DenoiserError::Other, got {other:?}"),
-            Ok(_) => panic!("expected a rejection, got Ok"),
-        }
-    }
-
-    /// Both NLM algorithms only need a symmetric `2r+1` window, so
-    /// `window_span` must report the same radius on both sides.
-    #[test]
-    fn window_span_is_symmetric_for_nlmeans() {
-        let opts = DenoiserOptions::builder()
-            .channel_mode(ChannelMode::Luma)
-            .mode(DenoisingMode::Temporal { radius: 3 })
-            .algorithm(Algorithm::Nlmeans(NlmeansOptions::default()))
-            .build();
-        let d = Denoiser::create(&[Accelerator::Vulkan], &Device::Default, 16, 16, opts)
-            .expect("denoiser construction failed");
-
-        let span = d.window_span();
-        assert_eq!(span.behind, 3, "behind should equal the temporal radius");
-        assert_eq!(span.ahead, 3, "ahead should equal the temporal radius");
-    }
-
-    /// nl4d's cross-frame accumulator needs the target's own `radius`
-    /// neighbourhood doubled on both sides, so both `behind` and
-    /// `ahead` must come out to `2 * radius`.
-    #[test]
-    fn window_span_is_doubled_on_both_sides_for_nl4d() {
-        let opts = DenoiserOptions::builder()
-            .channel_mode(ChannelMode::Luma)
-            .mode(DenoisingMode::Temporal { radius: 3 })
-            .algorithm(Algorithm::Nl4d(Nl4dOptions::default()))
-            .build();
-        let d = Denoiser::create(&[Accelerator::Vulkan], &Device::Default, 16, 16, opts)
-            .expect("nl4d denoiser construction failed");
-
-        let span = d.window_span();
-        assert_eq!(span.behind, 6, "behind should equal 2 * the temporal radius");
-        assert_eq!(span.ahead, 6, "ahead should equal 2 * the temporal radius");
-    }
-
-    #[test]
-    fn invalid_params_surface_as_error() {
-        let bad = DenoiserOptions::builder()
-            .algorithm(Algorithm::Nlmeans(NlmeansOptions {
-                tuning: NlmTuning {
-                    strength: Some(0.0),
-                    ..NlmTuning::default()
-                },
-                ..NlmeansOptions::default()
-            }))
-            .build();
-        let result = Denoiser::create(&[Accelerator::Vulkan], &Device::Default, 16, 16, bad);
-
-        match result {
-            Err(DenoiserError::Other(_)) => {},
-            Err(other) => panic!("expected DenoiserError::Other, got {other:?}"),
-            Ok(_) => panic!("expected validation error, got Ok"),
-        }
-    }
-
-    #[test]
-    fn tiny_frame_dimensions_surface_as_error() {
-        let result = Denoiser::create(
-            &[Accelerator::Vulkan],
-            &Device::Default,
-            2,
-            2,
-            opts(DenoisingMode::Spacial),
-        );
-
-        match result {
-            Err(DenoiserError::Other(e)) => {
-                assert!(
-                    e.to_string().contains("supported minimum"),
-                    "unexpected error message: {e}"
-                );
-            },
-            Err(other) => panic!("expected DenoiserError::Other, got {other:?}"),
-            Ok(_) => panic!("expected dimension validation error, got Ok"),
-        }
-    }
-
-    #[test]
-    fn push_after_pending_returns_queue_full() {
-        let mut d = Denoiser::create(
-            &[Accelerator::Vulkan],
-            &Device::Default,
-            16,
-            16,
-            opts(DenoisingMode::Spacial),
-        )
-        .unwrap();
-
-        // The pipeline is two deep because the output handles are
-        // double-buffered, so the first two pushes both submit. The
-        // third would overwrite the oldest pending frame's output slot,
-        // so it is rejected with QueueFull.
-        d.push_frame(&frame(16, 16)).unwrap();
-        d.push_frame(&frame(16, 16)).unwrap();
-        let err = d.push_frame(&frame(16, 16)).expect_err("expected QueueFull");
-        assert!(matches!(err, DenoiserError::QueueFull));
-
-        let out = d.recv_frame().unwrap().unwrap();
-        assert_eq!(out.len(), 16 * 16);
-
-        // After draining one slot the next push must succeed.
-        d.push_frame(&frame(16, 16)).expect("push after drain failed");
-    }
-
-    fn frame_filled(w: u32, h: u32, value: f32) -> Vec<f32> {
-        vec![value; (w * h) as usize]
-    }
-
-    /// Pushes `n` frames of the given value, receiving along the way to
-    /// keep the in-flight pipeline below `MAX_PENDING`.
-    fn push_n_with_drain(d: &mut Denoiser, n: usize, value: f32, out: &mut Vec<Vec<f32>>) {
-        for _ in 0..n {
-            loop {
-                match d.push_frame(&frame_filled(16, 16, value)) {
-                    Ok(()) => break,
-                    Err(DenoiserError::QueueFull) => {
-                        let f = d
-                            .recv_frame()
-                            .expect("recv ok")
-                            .expect("queue full but recv yielded none");
-                        out.push(f);
-                    },
-                    Err(e) => panic!("unexpected push error: {e:?}"),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn flush_leaves_denoiser_reusable_spatial() {
-        let mut d = Denoiser::create(
-            &[Accelerator::Vulkan],
-            &Device::Default,
-            16,
-            16,
-            opts(DenoisingMode::Spacial),
-        )
-        .unwrap();
-
-        let mut batch_a = Vec::new();
-        push_n_with_drain(&mut d, 5, 0.25, &mut batch_a);
-        d.flush(|f| batch_a.push(f)).expect("first flush failed");
-        assert_eq!(batch_a.len(), 5);
-
-        // After flush the pipeline must be empty.
-        assert!(d.recv_frame().unwrap().is_none());
-
-        let mut batch_b = Vec::new();
-        push_n_with_drain(&mut d, 5, 0.75, &mut batch_b);
-        d.flush(|f| batch_b.push(f)).expect("second flush failed");
-        assert_eq!(batch_b.len(), 5);
-
-        for v in batch_b.iter().flatten() {
-            assert!((v - 0.75).abs() < 0.1, "batch_b carried state from batch_a: {v}");
-        }
-        for v in batch_a.iter().flatten() {
-            assert!((v - 0.25).abs() < 0.1, "batch_a value unexpectedly drifted: {v}");
-        }
-    }
-
-    #[test]
-    fn flush_leaves_denoiser_reusable_temporal() {
-        let mut d = Denoiser::create(
-            &[Accelerator::Vulkan],
-            &Device::Default,
-            16,
-            16,
-            opts(DenoisingMode::Temporal { radius: 1 }),
-        )
-        .unwrap();
-
-        let mut batch_a = Vec::new();
-        push_n_with_drain(&mut d, 5, 0.25, &mut batch_a);
-        d.flush(|f| batch_a.push(f)).expect("first flush failed");
-        assert_eq!(batch_a.len(), 5, "expected 5 frames from first batch");
-
-        // The temporal window must be empty after a flush, so the first
-        // push of the new stream should not produce a pending frame.
-        // With r=1 the window needs 3 frames before `denoise_submit`
-        // fires.
-        assert!(d.recv_frame().unwrap().is_none());
-        d.push_frame(&frame_filled(16, 16, 0.75)).unwrap();
-        assert!(
-            d.recv_frame().unwrap().is_none(),
-            "first push of new temporal stream should not produce output yet"
-        );
-
-        // Push 4 more frames (5 total in batch B) with drain.
-        let mut batch_b = Vec::new();
-        push_n_with_drain(&mut d, 4, 0.75, &mut batch_b);
-        d.flush(|f| batch_b.push(f)).expect("second flush failed");
-        assert_eq!(batch_b.len(), 5, "expected 5 frames from second batch");
-
-        for v in batch_b.iter().flatten() {
-            assert!((v - 0.75).abs() < 0.1, "batch_b carried state from batch_a: {v}");
-        }
-    }
-
-    #[test]
-    fn flush_emits_exactly_n_outputs_for_small_n() {
-        // With temporal radius R=2 the window is 5 frames. Pushing fewer
-        // than R+1 frames means the window never fills while pushing, so
-        // flush must still emit one output per pushed frame rather than
-        // R+1 of them.
-        for n in 1..=5usize {
-            let mut d = Denoiser::create(
-                &[Accelerator::Vulkan],
-                &Device::Default,
-                16,
-                16,
-                opts(DenoisingMode::Temporal { radius: 2 }),
-            )
-            .unwrap();
-
-            let mut out = Vec::new();
-            push_n_with_drain(&mut d, n, 0.5, &mut out);
-            d.flush(|f| out.push(f)).expect("flush failed");
-            assert_eq!(
-                out.len(),
-                n,
-                "expected {n} outputs for {n} pushes, got {}",
-                out.len()
-            );
-        }
-    }
+fn client_on_stream<R: Runtime>(device: &R::Device, stream_id: StreamId) -> ComputeClient<R> {
+    let mut client = R::client(device);
+    unsafe { client.set_stream(stream_id) };
+    client
 }

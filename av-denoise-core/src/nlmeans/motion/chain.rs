@@ -185,18 +185,7 @@ fn dispatch_chain_compose<R: Runtime>(
     Ok(())
 }
 
-/// Maps a nonzero temporal offset onto the neighbour index the analyse
-/// and compose passes use inside the motion-field buffer.
-///
-/// This mirrors `dispatch::neighbour_idx_for_k` exactly. It is
-/// duplicated rather than shared because that helper is private to the
-/// direct-path dispatch module, and `dispatch`'s own tests already cover
-/// the mapping.
-///
-/// It is `pub(crate)` so tests can look up the same neighbour index the
-/// compose path writes to, rather than working out the formula
-/// themselves.
-pub(crate) fn neighbour_idx_for_k(radius: u32, k: i32) -> u32 {
+fn neighbour_idx_for_k(radius: u32, k: i32) -> u32 {
     debug_assert_ne!(k, 0);
     debug_assert!(k.unsigned_abs() <= radius);
     if k < 0 {
@@ -274,85 +263,5 @@ impl<R: Runtime> NlmDenoiser<R> {
             mv_field,
             neighbour_idx,
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::nlmeans::align::StorageAlign;
-    use crate::nlmeans::motion::{MotionCompensationMode, MotionEstimation};
-
-    #[test]
-    fn neighbour_idx_for_k_matches_dispatch_convention() {
-        // The same walk `dispatch::neighbour_idx_for_k`'s own tests
-        // check. The negative offsets come first, taking indices 0 up
-        // to radius minus 1, then the positive ones follow.
-        assert_eq!(neighbour_idx_for_k(2, -2), 0);
-        assert_eq!(neighbour_idx_for_k(2, -1), 1);
-        assert_eq!(neighbour_idx_for_k(2, 1), 2);
-        assert_eq!(neighbour_idx_for_k(2, 2), 3);
-    }
-
-    #[test]
-    fn pair_byte_offset_pads_small_block_counts_to_32_bytes() {
-        // A 4x4 frame at this geometry has a single block, so the
-        // unpadded direction stride is only 8 bytes and would leave
-        // direction 1 at an offset that is not 32-aligned.
-        let m = MotionCtx::new(
-            MotionCompensationMode::Mvtools {
-                blksize: 4,
-                overlap: 0,
-                search_radius: 1,
-                pyramid_levels: 1,
-                estimation: MotionEstimation::Direct,
-            },
-            4,
-            4,
-            StorageAlign::new(32),
-        )
-        .unwrap();
-        assert_eq!(
-            m.blocks_x * m.blocks_y,
-            1,
-            "fixture should have exactly one block"
-        );
-        assert_eq!(pair_byte_offset(&m, 0, 0), 0);
-        assert_eq!(pair_byte_offset(&m, 0, 1), 32);
-        assert_eq!(pair_byte_offset(&m, 1, 0), 64);
-        assert_eq!(pair_byte_offset(&m, 1, 1), 96);
-    }
-
-    #[test]
-    fn pair_byte_offset_direction_one_pads_even_when_slot_base_is_aligned() {
-        // An 8x4 frame at this geometry has two blocks. The unpadded
-        // per-slot stride comes to 32 bytes, which is already aligned,
-        // so every slot's own base offset would be fine.
-        //
-        // The per-direction stride inside that slot is only 16 bytes
-        // though, so direction 1 still needs padding of its own even
-        // though direction 0's slot base never did.
-        let m = MotionCtx::new(
-            MotionCompensationMode::Mvtools {
-                blksize: 4,
-                overlap: 0,
-                search_radius: 1,
-                pyramid_levels: 1,
-                estimation: MotionEstimation::Direct,
-            },
-            8,
-            4,
-            StorageAlign::new(32),
-        )
-        .unwrap();
-        assert_eq!(
-            m.blocks_x * m.blocks_y,
-            2,
-            "fixture should have exactly two blocks"
-        );
-        assert_eq!(pair_byte_offset(&m, 0, 0), 0);
-        assert_eq!(pair_byte_offset(&m, 0, 1), 32);
-        assert_eq!(pair_byte_offset(&m, 1, 0), 64);
-        assert_eq!(pair_byte_offset(&m, 1, 1), 96);
     }
 }

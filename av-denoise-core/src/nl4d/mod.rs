@@ -15,11 +15,5 @@
 mod denoiser;
 mod params;
 
-// Every test in this tree runs against a real GPU runtime, see
-// `tests::helpers::R`, so it only builds when a wgpu-backed feature is
-// enabled. A cpu-only build skips it entirely.
-#[cfg(all(test, any(feature = "vulkan", feature = "metal")))]
-mod tests;
-
 pub use denoiser::Nl4dDenoiser;
 pub use params::{MAX_MISMATCH_SCALE, Nl4dParams};

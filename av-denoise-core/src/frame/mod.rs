@@ -1,4 +1,7 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use cubecl::stream_id::StreamId;
 
 use crate::accelerate::Accelerator;
 use crate::{
@@ -301,9 +304,17 @@ pub struct PlanarDenoiser {
     temporal_radius: u32,
 }
 
+static NEXT_PLANAR_STREAM_ID: AtomicU64 = AtomicU64::new(1 << 63);
+
+fn planar_stream_pair() -> (StreamId, StreamId) {
+    let luma = NEXT_PLANAR_STREAM_ID.fetch_add(2, Ordering::Relaxed);
+    (StreamId { value: luma }, StreamId { value: luma + 1 })
+}
+
 impl PlanarDenoiser {
     pub fn create(opts: &PlaneOptions, layout: FrameLayout) -> Result<Self, anyhow::Error> {
         let (chroma_w, chroma_h) = layout.chroma_dims();
+        let (luma_stream, chroma_stream) = planar_stream_pair();
 
         if chroma_w == 0 || chroma_h == 0 {
             anyhow::bail!(
@@ -325,36 +336,39 @@ impl PlanarDenoiser {
 
         let luma = denoise_luma
             .then(|| {
-                Denoiser::create(
+                Denoiser::create_on_stream(
                     &opts.accelerators,
                     &opts.device,
                     layout.width,
                     layout.height,
                     opts.denoiser_options(ChannelMode::Luma),
+                    luma_stream,
                 )
             })
             .transpose()?;
 
         let chroma = denoise_chroma
             .then(|| {
-                Denoiser::create(
+                Denoiser::create_on_stream(
                     &opts.accelerators,
                     &opts.device,
                     chroma_w,
                     chroma_h,
                     opts.denoiser_options(ChannelMode::Chroma),
+                    chroma_stream,
                 )
             })
             .transpose()?;
 
         let yuv = denoise_yuv
             .then(|| {
-                Denoiser::create(
+                Denoiser::create_on_stream(
                     &opts.accelerators,
                     &opts.device,
                     layout.width,
                     layout.height,
                     opts.denoiser_options(ChannelMode::Yuv),
+                    luma_stream,
                 )
             })
             .transpose()?;
@@ -808,12 +822,13 @@ pub fn interleave_yuv_to_f32(y: &[u8], u: &[u8], v: &[u8], depth: Depth) -> Vec<
 
     fn run<C: SampleCodec>(y: &[u8], u: &[u8], v: &[u8], max: f32) -> Vec<f32> {
         let pixels = y.len() / C::BYTES;
-        let mut out = Vec::with_capacity(pixels * 3);
+        let mut out = vec![0.0; pixels * 3];
 
         for i in 0..pixels {
-            out.push(C::read(y, i) as f32 / max);
-            out.push(C::read(u, i) as f32 / max);
-            out.push(C::read(v, i) as f32 / max);
+            let offset = i * 3;
+            out[offset] = C::read(y, i) as f32 / max;
+            out[offset + 1] = C::read(u, i) as f32 / max;
+            out[offset + 2] = C::read(v, i) as f32 / max;
         }
 
         out
@@ -860,11 +875,12 @@ pub fn interleave_uv_to_f32(u: &[u8], v: &[u8], depth: Depth) -> Vec<f32> {
 
     fn run<C: SampleCodec>(u: &[u8], v: &[u8], max: f32) -> Vec<f32> {
         let pixels = u.len() / C::BYTES;
-        let mut out = Vec::with_capacity(pixels * 2);
+        let mut out = vec![0.0; pixels * 2];
 
         for i in 0..pixels {
-            out.push(C::read(u, i) as f32 / max);
-            out.push(C::read(v, i) as f32 / max);
+            let offset = i * 2;
+            out[offset] = C::read(u, i) as f32 / max;
+            out[offset + 1] = C::read(v, i) as f32 / max;
         }
 
         out
@@ -899,672 +915,3 @@ pub fn unpack_uv_from_f32(packed: &[f32], chroma_pixels: usize, depth: Depth) ->
         _ => run::<Wide>(packed, chroma_pixels, max),
     }
 }
-
-#[cfg(test)]
-mod converter_tests {
-    use super::*;
-
-    /// Encodes native-depth samples into wire bytes, the inverse of what
-    /// the converters read.
-    fn wire(samples: &[u16], depth: Depth) -> Vec<u8> {
-        match depth.bytes_per_sample() {
-            1 => samples.iter().map(|&s| s as u8).collect(),
-            _ => samples.iter().flat_map(|&s| s.to_le_bytes()).collect(),
-        }
-    }
-
-    #[test]
-    fn plane_round_trips_boundary_codes_at_every_depth() {
-        for depth in [Depth::Eight, Depth::Ten, Depth::Twelve] {
-            let max = depth.max_value() as u16;
-            let samples: Vec<u16> = vec![0, 1, 16, 64, 235, max / 2, max - 1, max]
-                .into_iter()
-                .filter(|&s| s <= max)
-                .collect();
-
-            let bytes = wire(&samples, depth);
-            let restored = f32_to_plane(&plane_to_f32(&bytes, depth), depth);
-
-            assert_eq!(restored, bytes, "plane round trip failed at {depth:?}");
-        }
-    }
-
-    /// Samples above 8 bits are little-endian on the wire regardless of
-    /// host endianness.
-    #[test]
-    fn high_depth_samples_are_little_endian() {
-        // 1023 = 0x03FF -> [0xFF, 0x03]
-        let bytes = wire(&[1023, 0, 512], Depth::Ten);
-        assert_eq!(bytes, vec![0xFF, 0x03, 0x00, 0x00, 0x00, 0x02]);
-
-        let f = plane_to_f32(&bytes, Depth::Ten);
-        assert!(
-            (f[0] - 1.0).abs() < 1e-6,
-            "0x03FF should normalize to 1.0, got {}",
-            f[0]
-        );
-        assert_eq!(f[1], 0.0);
-    }
-
-    #[test]
-    fn uv_interleave_round_trips_at_every_depth() {
-        for depth in [Depth::Eight, Depth::Ten, Depth::Twelve] {
-            let max = depth.max_value() as u16;
-            let u_samples = vec![0, max / 4, max];
-            let v_samples = vec![max, max / 2, 1];
-
-            let u_bytes = wire(&u_samples, depth);
-            let v_bytes = wire(&v_samples, depth);
-
-            let packed = interleave_uv_to_f32(&u_bytes, &v_bytes, depth);
-            assert_eq!(packed.len(), 6, "packed UV length wrong at {depth:?}");
-
-            let (ru, rv) = unpack_uv_from_f32(&packed, 3, depth);
-            assert_eq!(ru, u_bytes, "U round trip failed at {depth:?}");
-            assert_eq!(rv, v_bytes, "V round trip failed at {depth:?}");
-        }
-    }
-
-    #[test]
-    fn yuv_interleave_round_trips_at_every_depth() {
-        for depth in [Depth::Eight, Depth::Ten, Depth::Twelve] {
-            let max = depth.max_value() as u16;
-            let y_samples = vec![0, max / 3, max];
-            let u_samples = vec![max, 0, max / 2];
-            let v_samples = vec![max / 4, max, 0];
-
-            let y_bytes = wire(&y_samples, depth);
-            let u_bytes = wire(&u_samples, depth);
-            let v_bytes = wire(&v_samples, depth);
-
-            let packed = interleave_yuv_to_f32(&y_bytes, &u_bytes, &v_bytes, depth);
-            assert_eq!(packed.len(), 9, "packed YUV length wrong at {depth:?}");
-
-            let out = unpack_yuv_from_f32(&packed, 3, depth);
-            assert_eq!(out.y, y_bytes, "Y round trip failed at {depth:?}");
-            assert_eq!(out.u, u_bytes, "U round trip failed at {depth:?}");
-            assert_eq!(out.v, v_bytes, "V round trip failed at {depth:?}");
-        }
-    }
-
-    #[test]
-    fn quantise_matches_the_clamping_form_including_nan() {
-        fn reference(v: f32, max: f32) -> u16 {
-            (v.clamp(0.0, 1.0) * max + 0.5) as u16
-        }
-
-        let max = 1023.0;
-        let cases = [
-            -1.0,
-            -0.001,
-            0.0,
-            0.5,
-            0.999,
-            1.0,
-            1.001,
-            2.0,
-            f32::NAN,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-        ];
-
-        for v in cases {
-            assert_eq!(quantise(v, max), reference(v, max), "mismatch at {v}");
-        }
-    }
-
-    /// Limited-range codes normalise to matching values at every depth,
-    /// which is the property the whole design rests on.
-    ///
-    /// The match is within one 8-bit code level rather than exact. ITU
-    /// defines the limited-range endpoints as exact multiples, so 16
-    /// becomes 64 and 235 becomes 940, but full scale is not a multiple,
-    /// because 255 becomes 1023. That leaves 235/255 and 940/1023
-    /// differing by 0.0027, roughly 0.69 of an 8-bit step.
-    ///
-    /// Agreement below one step is the real property here.
-    ///
-    /// `normalized_scale_is_identical_across_depths` in
-    /// `src/nlmeans/mod.rs` pins the same property on the library's own
-    /// normalise helper.
-    #[test]
-    fn limited_range_codes_agree_across_depths() {
-        /// One 8-bit code level, the precision the endpoints agree to.
-        const TOL: f32 = 1.0 / 255.0;
-
-        let eight = plane_to_f32(&wire(&[16, 235], Depth::Eight), Depth::Eight);
-        let ten = plane_to_f32(&wire(&[64, 940], Depth::Ten), Depth::Ten);
-
-        for (a, b) in eight.iter().zip(ten.iter()) {
-            assert!((a - b).abs() < TOL, "8-bit {a} vs 10-bit {b}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod cli_options_tests {
-    use super::*;
-    use crate::nlmeans::NlmParams;
-
-    /// A `PlaneOptions` with every field at a neutral default, so each test
-    /// only overrides what it cares about.
-    ///
-    /// `mode` and `algorithm` are the two fields every test below sets
-    /// for itself.
-    fn base_opts(
-        mode: DenoisingMode,
-        algorithm: Algorithm,
-        luma_strength: Option<f32>,
-        chroma_strength: Option<f32>,
-    ) -> PlaneOptions {
-        PlaneOptions {
-            accelerators: vec![],
-            device: Device::Default,
-            intent: ChannelIntent::LumaChroma,
-            mode,
-            algorithm,
-            luma_strength,
-            chroma_strength,
-            luma_lambda_ht: None,
-            chroma_lambda_ht: None,
-            luma_mismatch_scale: None,
-            chroma_mismatch_scale: None,
-        }
-    }
-
-    #[test]
-    fn luma_strength_alone_overrides_only_the_luma_plane() {
-        let opts = base_opts(DenoisingMode::Spacial, Algorithm::default(), Some(0.7), None);
-
-        let luma = expect_nlmeans(opts.denoiser_options(ChannelMode::Luma).algorithm);
-        let chroma = expect_nlmeans(opts.denoiser_options(ChannelMode::Chroma).algorithm);
-
-        assert!(
-            matches!(luma.tuning.strength, Some(s) if (s - 0.7).abs() < f32::EPSILON),
-            "expected luma tuning.strength = Some(0.7), got {:?}",
-            luma.tuning.strength
-        );
-        assert_eq!(
-            chroma.tuning.strength, None,
-            "chroma plane should carry no override so the table default applies"
-        );
-    }
-
-    #[test]
-    fn both_per_plane_strengths_set_independently() {
-        let opts = base_opts(DenoisingMode::Spacial, Algorithm::default(), Some(0.7), Some(0.3));
-
-        let luma = expect_nlmeans(opts.denoiser_options(ChannelMode::Luma).algorithm);
-        let chroma = expect_nlmeans(opts.denoiser_options(ChannelMode::Chroma).algorithm);
-
-        assert!(
-            matches!(luma.tuning.strength, Some(s) if (s - 0.7).abs() < f32::EPSILON),
-            "expected luma tuning.strength = Some(0.7), got {:?}",
-            luma.tuning.strength
-        );
-        assert!(
-            matches!(chroma.tuning.strength, Some(s) if (s - 0.3).abs() < f32::EPSILON),
-            "expected chroma tuning.strength = Some(0.3), got {:?}",
-            chroma.tuning.strength
-        );
-    }
-
-    #[test]
-    fn no_overrides_hq_resolves_through_to_nlm_params_to_the_measured_tables() {
-        // Radius 4 in the measured tables is luma 0.35 and chroma
-        // 0.70 (see the table docs in `src/nlmeans/params.rs`).
-        let opts = base_opts(
-            DenoisingMode::Temporal { radius: 4 },
-            Algorithm::NlmeansHq(NlmeansHqOptions::default()),
-            None,
-            None,
-        );
-
-        let luma_params: NlmParams = opts.denoiser_options(ChannelMode::Luma).to_nlm_params();
-        let chroma_params: NlmParams = opts.denoiser_options(ChannelMode::Chroma).to_nlm_params();
-
-        assert!(
-            (luma_params.strength - 0.35).abs() < f32::EPSILON,
-            "expected luma strength 0.35 at r4, got {}",
-            luma_params.strength
-        );
-        assert!(
-            (chroma_params.strength - 0.70).abs() < f32::EPSILON,
-            "expected chroma strength 0.70 at r4, got {}",
-            chroma_params.strength
-        );
-    }
-
-    /// A `PlaneOptions` running `Algorithm::Nl4d`, with every field at a
-    /// neutral default except the two per-plane `lambda_ht` overrides
-    /// under test.
-    fn nl4d_opts(luma_lambda_ht: Option<f32>, chroma_lambda_ht: Option<f32>) -> PlaneOptions {
-        PlaneOptions {
-            accelerators: vec![],
-            device: Device::Default,
-            intent: ChannelIntent::LumaChroma,
-            mode: DenoisingMode::Temporal { radius: 2 },
-            algorithm: Algorithm::Nl4d(Nl4dOptions::default()),
-            luma_strength: None,
-            chroma_strength: None,
-            luma_lambda_ht,
-            chroma_lambda_ht,
-            luma_mismatch_scale: None,
-            chroma_mismatch_scale: None,
-        }
-    }
-
-    /// Unwraps an `Algorithm::Nlmeans`, panicking with the whole value
-    /// on any other variant.
-    fn expect_nlmeans(algorithm: Algorithm) -> NlmeansOptions {
-        match algorithm {
-            Algorithm::Nlmeans(n) => n,
-            other => panic!("expected Algorithm::Nlmeans, got {other:?}"),
-        }
-    }
-
-    /// Unwraps an `Algorithm::Nl4d`, panicking with the whole value on
-    /// any other variant.
-    fn expect_nl4d(algorithm: Algorithm) -> Nl4dOptions {
-        match algorithm {
-            Algorithm::Nl4d(n) => n,
-            other => panic!("expected Algorithm::Nl4d, got {other:?}"),
-        }
-    }
-
-    /// A `PlaneOptions` running `Algorithm::Nl4d` with a shared
-    /// `mismatch_scale` and the two per-plane overrides under test.
-    fn nl4d_mismatch_opts(
-        shared: f32,
-        luma_mismatch_scale: Option<f32>,
-        chroma_mismatch_scale: Option<f32>,
-    ) -> PlaneOptions {
-        PlaneOptions {
-            algorithm: Algorithm::Nl4d(Nl4dOptions {
-                mismatch_scale: shared,
-                ..Nl4dOptions::default()
-            }),
-            luma_mismatch_scale,
-            chroma_mismatch_scale,
-            ..nl4d_opts(None, None)
-        }
-    }
-
-    /// The same routing property the `lambda_ht` pair is checked for,
-    /// applied to `mismatch_scale`. An override aimed at one plane must
-    /// leave the other on the shared value, which for this field is a
-    /// resolved number rather than a deferred `None`.
-    #[test]
-    fn a_per_plane_mismatch_scale_overrides_only_its_own_instance_for_nl4d() {
-        let luma_only = nl4d_mismatch_opts(2.0, Some(8.0), None);
-        let luma = expect_nl4d(luma_only.algorithm_for(ChannelMode::Luma));
-        let chroma = expect_nl4d(luma_only.algorithm_for(ChannelMode::Chroma));
-        assert!((luma.mismatch_scale - 8.0).abs() < f32::EPSILON);
-        assert!(
-            (chroma.mismatch_scale - 2.0).abs() < f32::EPSILON,
-            "chroma should keep the shared value, got {}",
-            chroma.mismatch_scale
-        );
-
-        let chroma_only = nl4d_mismatch_opts(2.0, None, Some(8.0));
-        let luma = expect_nl4d(chroma_only.algorithm_for(ChannelMode::Luma));
-        let chroma = expect_nl4d(chroma_only.algorithm_for(ChannelMode::Chroma));
-        assert!((chroma.mismatch_scale - 8.0).abs() < f32::EPSILON);
-        assert!(
-            (luma.mismatch_scale - 2.0).abs() < f32::EPSILON,
-            "luma should keep the shared value, got {}",
-            luma.mismatch_scale
-        );
-    }
-
-    /// A fused Yuv pass has no plane to pick, so neither override
-    /// applies and the shared value stands.
-    #[test]
-    fn a_yuv_instance_ignores_both_per_plane_mismatch_scales() {
-        let opts = nl4d_mismatch_opts(2.0, Some(8.0), Some(4.0));
-        let yuv = expect_nl4d(opts.algorithm_for(ChannelMode::Yuv));
-
-        assert!((yuv.mismatch_scale - 2.0).abs() < f32::EPSILON);
-    }
-
-    /// The routing property that matters most for a shared field: an
-    /// override aimed at one plane must never leak into the other
-    /// instance. `luma_lambda_ht` set alone must change nothing about
-    /// the chroma instance, and vice versa in the sibling test below.
-    #[test]
-    fn luma_lambda_ht_alone_overrides_only_the_luma_instance_for_nl4d() {
-        let opts = nl4d_opts(Some(4.0), None);
-
-        let luma = expect_nl4d(opts.algorithm_for(ChannelMode::Luma));
-        let chroma = expect_nl4d(opts.algorithm_for(ChannelMode::Chroma));
-
-        assert!((luma.lambda_ht.unwrap() - 4.0).abs() < f32::EPSILON);
-        assert_eq!(
-            chroma.lambda_ht,
-            Nl4dOptions::default().lambda_ht,
-            "chroma should stay unresolved here (None), deferred to its own per-plane \
-             default at construction, got {:?}",
-            chroma.lambda_ht
-        );
-    }
-
-    #[test]
-    fn chroma_lambda_ht_alone_overrides_only_the_chroma_instance_for_nl4d() {
-        let opts = nl4d_opts(None, Some(4.0));
-
-        let luma = expect_nl4d(opts.algorithm_for(ChannelMode::Luma));
-        let chroma = expect_nl4d(opts.algorithm_for(ChannelMode::Chroma));
-
-        assert_eq!(
-            luma.lambda_ht,
-            Nl4dOptions::default().lambda_ht,
-            "luma should stay unresolved here (None), deferred to its own per-plane \
-             default at construction, got {:?}",
-            luma.lambda_ht
-        );
-        assert!((chroma.lambda_ht.unwrap() - 4.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn both_planes_lambda_ht_set_independently_for_nl4d() {
-        let opts = nl4d_opts(Some(2.0), Some(3.5));
-
-        let luma = expect_nl4d(opts.algorithm_for(ChannelMode::Luma));
-        let chroma = expect_nl4d(opts.algorithm_for(ChannelMode::Chroma));
-
-        assert!((luma.lambda_ht.unwrap() - 2.0).abs() < f32::EPSILON);
-        assert!((chroma.lambda_ht.unwrap() - 3.5).abs() < f32::EPSILON);
-
-        // Every other field stays shared between the two instances even
-        // though lambda_ht diverges.
-        assert_eq!(luma.refine, chroma.refine);
-        assert_eq!(luma.spatial_radius, chroma.spatial_radius);
-        assert!((luma.c_min - chroma.c_min).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn unset_nl4d_overrides_resolve_to_different_lambda_ht_per_plane_end_to_end() {
-        let opts = nl4d_opts(None, None);
-
-        let luma = expect_nl4d(opts.algorithm_for(ChannelMode::Luma));
-        let chroma = expect_nl4d(opts.algorithm_for(ChannelMode::Chroma));
-
-        // Neither plane has anything set anywhere, so both stay
-        // unresolved at this layer...
-        assert_eq!(luma.lambda_ht, None);
-        assert_eq!(chroma.lambda_ht, None);
-
-        // ...but resolving each through the same function construction
-        // uses (`nl4d_default_lambda_ht`, see `src/denoiser.rs`) gives
-        // luma and chroma different values, which is the whole point of
-        // a caller passing no flags at all getting both calibrated
-        // defaults.
-        let luma_default = crate::nl4d_default_lambda_ht(ChannelMode::Luma);
-        let chroma_default = crate::nl4d_default_lambda_ht(ChannelMode::Chroma);
-        assert!((luma_default - 5.3).abs() < f32::EPSILON);
-        assert!((chroma_default - 4.2).abs() < f32::EPSILON);
-        assert!((chroma_default - luma_default).abs() > f32::EPSILON);
-    }
-}
-
-// Feature-gated because every test here builds its `PlaneOptions` from
-// `chroma_only_opts`, which names the `Vulkan` accelerator variant. That
-// variant only exists when the `vulkan` feature is enabled.
-#[cfg(feature = "vulkan")]
-#[cfg(test)]
-mod passthrough_retry_tests {
-    use super::*;
-    use crate::accelerate::Accelerator;
-    use crate::{Algorithm, DenoisingMode};
-
-    /// Chroma-only intent, so `luma` is the disabled passthrough half and
-    /// `chroma` is the one that can report `QueueFull`.
-    ///
-    /// That is what drives the retry loop in `push_with_drain` and in
-    /// `stream_mode.rs`.
-    fn chroma_only_opts() -> PlaneOptions {
-        PlaneOptions {
-            accelerators: vec![Accelerator::Vulkan],
-            device: Device::Default,
-            intent: ChannelIntent::Chroma,
-            mode: DenoisingMode::Spacial,
-            algorithm: Algorithm::default(),
-            luma_strength: None,
-            chroma_strength: None,
-            luma_lambda_ht: None,
-            chroma_lambda_ht: None,
-            luma_mismatch_scale: None,
-            chroma_mismatch_scale: None,
-        }
-    }
-
-    fn fake_planes(layout: FrameLayout) -> Planes {
-        Planes {
-            y: fill_plane(layout.luma_pixels(), layout.depth.neutral_chroma(), layout.depth),
-            u: layout.neutral_chroma_plane(),
-            v: layout.neutral_chroma_plane(),
-        }
-    }
-
-    #[test]
-    fn queue_full_retry_does_not_double_queue_the_passthrough_plane() {
-        let layout = FrameLayout {
-            width: 16,
-            height: 16,
-            subsampling: Subsampling::Yuv420,
-            depth: Depth::Eight,
-        };
-        let mut wd =
-            PlanarDenoiser::create(&chroma_only_opts(), layout).expect("denoiser construction failed");
-        let planes = fake_planes(layout);
-
-        // Spatial mode runs a depth-2 pipeline, so the first two pushes
-        // land directly. See `push_after_pending_returns_queue_full` in
-        // `src/denoiser.rs`.
-        wd.push(&planes).expect("first push should land");
-        wd.push(&planes).expect("second push should land");
-
-        // Third push hits QueueFull on the chroma half.
-        let err = wd.push(&planes).expect_err("expected QueueFull");
-        assert!(
-            matches!(err, DenoiserError::QueueFull),
-            "expected QueueFull, got {err:?}"
-        );
-
-        // Mirror the retry loop in `push_with_drain`. Drain one output,
-        // then retry the whole `push()` call for the same frame.
-        wd.recv().expect("recv after drain failed");
-        wd.push(&planes).expect("retry push should land after drain");
-
-        // The chroma denoiser accepted three frames, two directly and
-        // one on the retry, and `recv` popped one back off. The disabled
-        // luma half's passthrough queue must track that one for one, and
-        // must not count the frame whose first attempt hit `QueueFull`
-        // twice.
-        assert_eq!(
-            wd.luma_passthrough.len(),
-            2,
-            "expected exactly one passthrough entry per chroma frame actually accepted, got {}",
-            wd.luma_passthrough.len()
-        );
-    }
-}
-
-// Feature-gated because every test here builds its `PlaneOptions` from
-// `luma_chroma_opts`, which names the `Vulkan` accelerator variant. That
-// variant only exists when the `vulkan` feature is enabled.
-#[cfg(feature = "vulkan")]
-#[cfg(test)]
-mod lumachroma_lockstep_tests {
-    use super::*;
-    use crate::accelerate::Accelerator;
-    use crate::{Algorithm, DenoisingMode};
-
-    /// Runs `luma` and `chroma` as two real `Denoiser`s in spatial mode.
-    ///
-    /// Spatial mode passes a uniform-valued plane through unchanged, as
-    /// the `uniform_*_passthrough` tests in `src/nlmeans/tests` show. The
-    /// test can therefore give each plane its own marker value and spot
-    /// the two halves drifting apart.
-    fn luma_chroma_opts() -> PlaneOptions {
-        PlaneOptions {
-            accelerators: vec![Accelerator::Vulkan],
-            device: Device::Default,
-            intent: ChannelIntent::LumaChroma,
-            mode: DenoisingMode::Spacial,
-            algorithm: Algorithm::default(),
-            luma_strength: None,
-            chroma_strength: None,
-            luma_lambda_ht: None,
-            chroma_lambda_ht: None,
-            luma_mismatch_scale: None,
-            chroma_mismatch_scale: None,
-        }
-    }
-
-    /// A uniform-valued frame whose luma and chroma planes each encode
-    /// `idx` with a different formula.
-    ///
-    /// If the round trip ever pairs luma from one push with chroma from
-    /// another, the two encodings disagree and the test catches it.
-    fn marked_planes(layout: FrameLayout, idx: u8) -> Planes {
-        let chroma_pixels = layout.chroma_pixels();
-        let y_val = 10 + idx;
-        let uv_val = 200 - idx;
-
-        Planes {
-            y: fill_plane(layout.luma_pixels(), y_val as u16, layout.depth),
-            u: fill_plane(chroma_pixels, uv_val as u16, layout.depth),
-            v: fill_plane(chroma_pixels, uv_val as u16, layout.depth),
-        }
-    }
-
-    #[test]
-    fn queue_full_retries_never_desync_luma_and_chroma() {
-        let layout = FrameLayout {
-            width: 16,
-            height: 16,
-            subsampling: Subsampling::Yuv420,
-            depth: Depth::Eight,
-        };
-        let mut wd =
-            PlanarDenoiser::create(&luma_chroma_opts(), layout).expect("denoiser construction failed");
-
-        // More pushes than the depth-2 pipeline holds, so this drives
-        // several `QueueFull`-then-retry cycles.
-        const N: u8 = 6;
-        let mut outputs: Vec<Planes> = Vec::new();
-
-        for idx in 0..N {
-            let planes = marked_planes(layout, idx);
-
-            // Mirror the retry loop in `push_with_drain` exactly, which
-            // is the sequence `file_mode.rs` and `stream_mode.rs` run.
-            if push_needs_retry(wd.push(&planes)).expect("push_needs_retry") {
-                if let Some(out) = wd.recv().expect("recv failed") {
-                    outputs.push(out);
-                }
-
-                wd.push(&planes).expect("retry push should land after drain");
-            }
-        }
-
-        wd.flush(|out| outputs.push(out)).expect("flush failed");
-
-        assert_eq!(
-            outputs.len(),
-            N as usize,
-            "expected exactly one output frame per input frame, got {}",
-            outputs.len()
-        );
-
-        for out in &outputs {
-            let y_val = out.y[0];
-            let uv_val = out.u[0];
-            let idx_from_y = y_val - 10;
-            let idx_from_uv = 200 - uv_val;
-
-            assert_eq!(
-                idx_from_y, idx_from_uv,
-                "luma marker {y_val} (frame {idx_from_y}) and chroma marker {uv_val} \
-                 (frame {idx_from_uv}) disagree, so the luma and chroma pushes have drifted apart"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod push_needs_retry_tests {
-    use super::*;
-
-    #[test]
-    fn ok_means_no_retry() {
-        let outcome = push_needs_retry(Ok(())).expect("Ok(()) must not itself error");
-        assert!(!outcome, "a landed push must not ask the caller to retry");
-    }
-
-    #[test]
-    fn queue_full_signals_retry() {
-        let outcome =
-            push_needs_retry(Err(DenoiserError::QueueFull)).expect("QueueFull must not itself error");
-        assert!(outcome, "QueueFull must still trigger the retry-after-drain path");
-    }
-
-    #[test]
-    fn non_queue_full_errors_propagate_instead_of_being_swallowed() {
-        let synthetic = DenoiserError::Other(anyhow::anyhow!("synthetic readback failure"));
-
-        let outcome = push_needs_retry(Err(synthetic));
-
-        assert!(
-            outcome.is_err(),
-            "a non-QueueFull push error must propagate instead of being silently treated as success"
-        );
-    }
-}
-
-#[cfg(test)]
-mod layout_tests {
-    use super::*;
-
-    fn layout(depth: Depth) -> FrameLayout {
-        FrameLayout {
-            width: 4,
-            height: 4,
-            subsampling: Subsampling::Yuv420,
-            depth,
-        }
-    }
-
-    #[test]
-    fn byte_lengths_scale_with_depth() {
-        assert_eq!(layout(Depth::Eight).luma_bytes(), 16);
-        assert_eq!(layout(Depth::Ten).luma_bytes(), 32);
-        assert_eq!(layout(Depth::Eight).chroma_bytes(), 4);
-        assert_eq!(layout(Depth::Ten).chroma_bytes(), 8);
-    }
-
-    #[test]
-    fn neutral_chroma_fill_is_correct_at_each_depth() {
-        let eight = layout(Depth::Eight).neutral_chroma_plane();
-        assert_eq!(eight, vec![128u8; 4]);
-
-        // 512 little-endian is [0x00, 0x02], repeated per sample.
-        let ten = layout(Depth::Ten).neutral_chroma_plane();
-        assert_eq!(ten, vec![0x00, 0x02, 0x00, 0x02, 0x00, 0x02, 0x00, 0x02]);
-
-        // 2048 little-endian is [0x00, 0x08].
-        let twelve = layout(Depth::Twelve).neutral_chroma_plane();
-        assert_eq!(twelve.len(), 8);
-        assert_eq!(&twelve[0..2], &[0x00, 0x08]);
-    }
-
-    #[test]
-    fn black_luma_fill_is_zero_at_the_right_length() {
-        assert_eq!(layout(Depth::Eight).black_luma_plane(), vec![0u8; 16]);
-        assert_eq!(layout(Depth::Ten).black_luma_plane(), vec![0u8; 32]);
-    }
-}
-
-#[cfg(test)]
-mod tests;

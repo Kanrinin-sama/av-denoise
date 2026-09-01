@@ -3,43 +3,6 @@
 # requires-python = ">=3.11"
 # dependencies = ["numpy"]
 # ///
-"""Measures NLM's residual noise correlation on real footage.
-
-`src/nlmeans/tests/residual_correlation.rs` measures this on synthetic
-flat and sine-wave content, generated inside the crate. This script
-repeats the same measurement on `data/clean-1080p.mkv`, a genuine
-lossless clean source, so the synthetic table can be checked against
-real fine texture instead of only a smooth periodic stand-in.
-
-Method, matched to the Rust test file's `measure_diff`:
-
-1. Extract a short run of clean frames from the source (lossless, so
-   they are exact ground truth).
-2. Add two independently-seeded synthetic noise realisations to the
-   *same* clean frames with ffmpeg's `noise` filter, the same filter
-   and `allf=t` (temporal, no persistent spatial pattern) mode
-   `scripts/quality_runs.py` uses.
-3. Denoise both noisy copies with the real `av-denoise nlmeans` CLI,
-   `--variant hq`, pinning `--hq-sigma` to the true injected sigma
-   measured directly from the two clips (not trusted from ffmpeg's
-   `alls` value, which is an amplitude knob, not a calibrated sigma).
-4. Difference the two denoised outputs. For two i.i.d. copies of the
-   same underlying process, `Corr(A - B) == Corr(A)` exactly, because
-   the shared deterministic structural response to the clean image
-   (which is not noise, and would corrupt a correlation measurement
-   built on `output - clean` alone on textured content) cancels out of
-   the difference. This is exactly what `measure_diff` in
-   `residual_correlation.rs` does, generalised from a synthetic frame
-   to a real one.
-
-Regions: `--flat-region` and `--texture-region` (each `x0,y0,x1,y1`)
-let the correlation be measured separately over a flat patch and a
-genuinely fine-detail patch of the same real frame, which the sine
-generator in the Rust tests cannot exercise (it is smooth and
-periodic relative to the ~9x9 window a `search_radius=4` run looks
-at; real footage is not).
-"""
-
 from __future__ import annotations
 
 import argparse

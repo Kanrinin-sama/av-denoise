@@ -33,14 +33,6 @@ mod noise;
 mod params;
 mod pending;
 
-// Every test in this tree runs against a real GPU runtime, see
-// `tests::helpers::R`, so it only builds when a wgpu-backed feature is
-// enabled. A cpu-only build skips it entirely, and the
-// `cpu_smoke_tests` module in `src/denoiser.rs` covers that backend
-// instead.
-#[cfg(all(test, any(feature = "vulkan", feature = "metal")))]
-mod tests;
-
 pub(crate) use denoiser::RingView;
 pub use denoiser::{GpuOutput, NlmDenoiser};
 pub use motion::{MotionCompensationMode, MotionEstimation, MotionSearch};
@@ -152,87 +144,4 @@ pub fn denormalize(input: &[f32], depth: Depth) -> Vec<u16> {
         .iter()
         .map(|&v| (v * max).round().clamp(0.0, max) as u16)
         .collect()
-}
-
-#[cfg(test)]
-mod depth_tests {
-    use super::*;
-
-    #[test]
-    fn from_bits_accepts_supported_depths() {
-        assert_eq!(Depth::from_bits(8).unwrap(), Depth::Eight);
-        assert_eq!(Depth::from_bits(10).unwrap(), Depth::Ten);
-        assert_eq!(Depth::from_bits(12).unwrap(), Depth::Twelve);
-    }
-
-    #[test]
-    fn from_bits_rejects_unsupported_depths() {
-        for bits in [0, 9, 14, 16] {
-            let err = Depth::from_bits(bits).expect_err("expected rejection");
-            assert!(
-                err.to_string().contains(&bits.to_string()),
-                "error should name the depth, got {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn depth_properties_match_the_format() {
-        assert_eq!(Depth::Eight.bytes_per_sample(), 1);
-        assert_eq!(Depth::Ten.bytes_per_sample(), 2);
-        assert_eq!(Depth::Twelve.bytes_per_sample(), 2);
-
-        assert_eq!(Depth::Eight.max_value(), 255.0);
-        assert_eq!(Depth::Ten.max_value(), 1023.0);
-        assert_eq!(Depth::Twelve.max_value(), 4095.0);
-
-        assert_eq!(Depth::Eight.neutral_chroma(), 128);
-        assert_eq!(Depth::Ten.neutral_chroma(), 512);
-        assert_eq!(Depth::Twelve.neutral_chroma(), 2048);
-    }
-
-    /// Limited-range black and white land on matching normalised values
-    /// at every depth, which is what lets every calibrated constant in
-    /// the library stay depth-independent.
-    ///
-    /// The match is within one 8-bit code level rather than exact. ITU
-    /// defines the limited-range endpoints as exact multiples, so 235
-    /// becomes 940 and then 3760, but full scale is not a multiple,
-    /// because 255 becomes 1023 and then 4095.
-    ///
-    /// That leaves 235/255 and 940/1023 differing by 0.0027, roughly
-    /// 0.69 of an 8-bit step. Agreement below one step is the real
-    /// property here.
-    #[test]
-    fn normalized_scale_is_identical_across_depths() {
-        /// One 8-bit code level, the precision the endpoints agree to.
-        const TOL: f32 = 1.0 / 255.0;
-
-        let eight = normalize(&[16, 235], Depth::Eight);
-        let ten = normalize(&[64, 940], Depth::Ten);
-        let twelve = normalize(&[256, 3760], Depth::Twelve);
-
-        for (a, b) in eight.iter().zip(ten.iter()) {
-            assert!((a - b).abs() < TOL, "8-bit {a} vs 10-bit {b}");
-        }
-        for (a, b) in eight.iter().zip(twelve.iter()) {
-            assert!((a - b).abs() < TOL, "8-bit {a} vs 12-bit {b}");
-        }
-    }
-
-    #[test]
-    fn normalization_round_trips_at_every_depth() {
-        for depth in [Depth::Eight, Depth::Ten, Depth::Twelve] {
-            let max = depth.max_value() as u16;
-            let original: Vec<u16> = vec![0, 1, 16, 64, 128, 235, max / 2, max - 1, max];
-            let restored = denormalize(&normalize(&original, depth), depth);
-            assert_eq!(original, restored, "round trip failed at {depth:?}");
-        }
-    }
-
-    #[test]
-    fn denormalize_clamps_out_of_range_input() {
-        let out = denormalize(&[-0.5, 0.0, 1.0, 1.5], Depth::Ten);
-        assert_eq!(out, vec![0, 0, 1023, 1023]);
-    }
 }

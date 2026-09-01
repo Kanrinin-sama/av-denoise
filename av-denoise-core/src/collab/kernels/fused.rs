@@ -514,14 +514,6 @@ pub fn collab_fused<N: Size>(
     for m in 0..MAX_K {
         let packed = plane_shuffle(best_pos, base + m);
         let mt = unpack_t(packed);
-        // Clamped so the read below stays in range for a centre-frame
-        // member, whose value `select` then discards. The clamp lands on
-        // index 0, so it needs `neighbour_slots` to hold at least one
-        // entry. That is what every caller actually supplies, including
-        // `radius = 0` launches such as `Setup::spatial_only` and the
-        // standalone launch documented at `nl4d::tests::pipeline`,
-        // which still pass a one-element `neighbour_slots` even though
-        // there is no real neighbour to read.
         let n = u32::max(mt, 1u32) - 1u32;
         member_pos[m as usize] = packed;
         member_slot[m as usize] = select(mt > 0u32, neighbour_slots[n as usize], centre_slot);

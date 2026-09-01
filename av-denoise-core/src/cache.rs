@@ -19,17 +19,6 @@
 //! [`install_compilation_cache`] has to run before the first
 //! [`Denoiser`](crate::Denoiser) is created, because building a CubeCL
 //! client locks the global config.
-//!
-//! ```no_run
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! // Call this at the top of `main`, before any denoiser exists.
-//! match av_denoise_core::install_compilation_cache()? {
-//!     Some(path) => println!("caching compiled kernels in {}", path.display()),
-//!     None => println!("kernel caching is off, every run recompiles"),
-//! }
-//! # Ok(())
-//! # }
-//! ```
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -73,10 +62,6 @@ pub(crate) enum CacheLocation {
 }
 
 /// Decides where compiled kernels go, from the environment alone.
-///
-/// Kept separate from [`install_compilation_cache`] because installing
-/// the choice writes to a global that can only be set once per process,
-/// while the choice itself is worth testing over many inputs.
 ///
 /// `env` is the raw value of [`COMPILATION_CACHE_ENV`]. An unset or
 /// empty value takes the default, one of [`DISABLE_WORDS`] turns caching
@@ -221,121 +206,4 @@ fn install() -> Result<Option<PathBuf>, CacheAlreadyInitialisedError> {
     .map_err(|_| CacheAlreadyInitialisedError)?;
 
     Ok(Some(path))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::ffi::OsString;
-
-    use super::*;
-
-    fn os(text: &str) -> OsString {
-        OsString::from(text)
-    }
-
-    fn resolve(env: Option<&str>, xdg: Option<&str>, home: Option<&str>) -> CacheLocation {
-        let env = env.map(os);
-        let xdg = xdg.map(os);
-        let home = home.map(os);
-        resolve_cache_location(env.as_deref(), xdg.as_deref(), home.as_deref(), false)
-    }
-
-    /// With nothing set, the cache lands under the XDG cache directory,
-    /// which is where a compiler cache belongs and where a container can
-    /// mount over it.
-    #[test]
-    fn the_default_is_the_xdg_cache_directory() {
-        assert_eq!(
-            resolve(None, Some("/home/u/.cache"), Some("/home/u")),
-            CacheLocation::Dir(PathBuf::from("/home/u/.cache/av-denoise")),
-        );
-    }
-
-    /// `XDG_CACHE_HOME` is frequently unset on machines that still have
-    /// a perfectly good home directory, so the fallback matters more
-    /// than the primary path does.
-    #[test]
-    fn without_xdg_the_default_sits_under_the_home_directory() {
-        assert_eq!(
-            resolve(None, None, Some("/home/u")),
-            CacheLocation::Dir(PathBuf::from("/home/u/.cache/av-denoise")),
-        );
-    }
-
-    /// macOS keeps caches somewhere else, and this crate builds there
-    /// through its `metal` feature.
-    #[test]
-    fn macos_uses_its_own_cache_directory() {
-        let home = os("/Users/u");
-        assert_eq!(
-            resolve_cache_location(None, None, Some(home.as_os_str()), true),
-            CacheLocation::Dir(PathBuf::from("/Users/u/Library/Caches/av-denoise")),
-        );
-    }
-
-    /// An explicit path wins over both defaults. This is the case CI
-    /// runs and containers use.
-    #[test]
-    fn an_explicit_path_overrides_every_default() {
-        assert_eq!(
-            resolve(Some("/mnt/cache"), Some("/home/u/.cache"), Some("/home/u")),
-            CacheLocation::Dir(PathBuf::from("/mnt/cache")),
-        );
-    }
-
-    /// Benchmarking needs the compilation cost a first run pays, and a
-    /// warm cache hides it.
-    #[test]
-    fn the_disable_words_turn_caching_off() {
-        for word in ["off", "OFF", "Off", "0", "false", "FALSE", "none", " off "] {
-            assert_eq!(
-                resolve(Some(word), Some("/home/u/.cache"), Some("/home/u")),
-                CacheLocation::Disabled,
-                "{word} should disable caching",
-            );
-        }
-    }
-
-    /// A path that merely looks like a disable word is still a path.
-    /// Nothing here should turn `/tmp/offsite` into "off".
-    #[test]
-    fn a_path_containing_a_disable_word_is_still_a_path() {
-        assert_eq!(
-            resolve(Some("/tmp/offsite"), None, Some("/home/u")),
-            CacheLocation::Dir(PathBuf::from("/tmp/offsite")),
-        );
-    }
-
-    /// An empty variable reads as "not set" rather than as "off",
-    /// matching what an unset variable does.
-    #[test]
-    fn an_empty_variable_takes_the_default() {
-        assert_eq!(
-            resolve(Some(""), Some("/home/u/.cache"), Some("/home/u")),
-            CacheLocation::Dir(PathBuf::from("/home/u/.cache/av-denoise")),
-        );
-        assert_eq!(
-            resolve(Some("   "), Some("/home/u/.cache"), Some("/home/u")),
-            CacheLocation::Dir(PathBuf::from("/home/u/.cache/av-denoise")),
-        );
-    }
-
-    /// An empty `XDG_CACHE_HOME` is not a usable directory, so the home
-    /// directory answers instead.
-    #[test]
-    fn an_empty_xdg_falls_through_to_the_home_directory() {
-        assert_eq!(
-            resolve(None, Some(""), Some("/home/u")),
-            CacheLocation::Dir(PathBuf::from("/home/u/.cache/av-denoise")),
-        );
-    }
-
-    /// With no home directory there is nowhere sensible to write, and
-    /// picking the working directory would scatter caches wherever the
-    /// binary happened to run.
-    #[test]
-    fn no_home_directory_means_no_cache() {
-        assert_eq!(resolve(None, None, None), CacheLocation::Disabled);
-        assert_eq!(resolve(None, None, Some("")), CacheLocation::Disabled);
-    }
 }

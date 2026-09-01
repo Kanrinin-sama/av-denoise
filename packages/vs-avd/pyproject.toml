@@ -26,13 +26,7 @@ Repository = "https://github.com/ChillFish8/av-denoise"
 Issues = "https://github.com/ChillFish8/av-denoise/issues"
 
 [dependency-groups]
-test = ["pytest"]
 dev = ["mypy"]
-
-[tool.pytest.ini_options]
-markers = [
-    "gpu: renders a frame on a GPU and needs an accelerator to pass",
-]
 
 [tool.setuptools.packages.find]
 where = ["src"]

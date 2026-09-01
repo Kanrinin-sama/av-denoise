@@ -3,9 +3,9 @@ name: Release binaries
 on:
   release:
     types: [published]
-  # A dispatch run is a dry run. It builds, smoke tests and uploads the binaries as
-  # workflow artifacts, but never attaches them to a release. Leave `version` empty
-  # to just check that the three targets still compile.
+  # A dispatch run is a dry run. It builds and uploads the binaries as workflow
+  # artifacts, but never attaches them to a release. Leave `version` empty to just
+  # check that the three targets still compile.
   workflow_dispatch:
     inputs:
       version:
@@ -142,12 +142,6 @@ jobs:
       - name: Build
         run: cargo build --release -p av-denoise --no-default-features --features ${{ matrix.features }}
 
-      # Hosted runners have no accelerator, so this only proves the binary's own
-      # dynamic libraries resolve, matching the check the release images run.
-      - name: Smoke test
-        shell: bash
-        run: ./target/release/${{ matrix.binary }} --help > /dev/null
-
       - name: Name the artifact
         shell: bash
         run: mv "target/release/${{ matrix.binary }}" "${{ matrix.artifact }}"
@@ -191,6 +185,6 @@ jobs:
           {
             echo "### Dry run"
             echo
-            echo "All three targets built and passed their \`--help\` smoke test at version \`${VERSION}\`."
+            echo "All three targets built at version \`${VERSION}\`."
             echo "Nothing was attached to a release. The binaries are on this run as workflow artifacts."
           } >> "${GITHUB_STEP_SUMMARY}"

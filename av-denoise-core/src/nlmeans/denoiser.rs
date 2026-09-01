@@ -15,12 +15,13 @@ use super::noise::{
     correlation_factor,
     noise_partials_slot_stride_bytes,
     partials_len,
-    read_temporal_stats_slot,
     run_noise_estimate,
     run_temporal_noise_stats,
     sigma_block_p25_from_partials,
     sigma_from_abs_sum,
     temporal_stats_buf_bytes,
+    temporal_stats_slot_len,
+    temporal_stats_slot_stride_bytes,
     zero_temporal_stats_slot,
 };
 use super::params::{NlmParams, SEPARABLE_THRESHOLD, sigma_eff, validate_dimensions};
@@ -1028,23 +1029,15 @@ impl<R: Runtime> NlmDenoiser<R> {
         if self.frames_loaded != 0 {
             return;
         }
-        let Some(results_buf) = self.noise_results.as_ref() else {
+        if self.noise_results.is_none() {
             return;
-        };
-
-        let bytes = self
-            .client
-            .read_one(results_buf.clone())
-            .expect("noise-estimate seed readback failed");
-        let data = f32::from_bytes(&bytes);
+        }
 
         // The stream's first frame has no predecessor, so
         // `run_temporal_stats_for_slot` never ran for it and this
         // slot's stats region is unwritten. Seed from Immerkær alone.
-        let imm_low = self
-            .read_noise_partials_low(slot)
-            .expect("noise-partials seed readback failed");
-        self.fold_noise_estimate(data, slot as usize, None, imm_low);
+        self.read_and_fold_noise_estimate(slot, false)
+            .expect("noise-estimate seed readback failed");
     }
 
     /// Folds one ring slot's noise totals into both estimator chains and
@@ -1663,96 +1656,79 @@ impl<R: Runtime> NlmDenoiser<R> {
     /// finished, rather than stalling the pipeline behind a fresh
     /// dispatch.
     fn update_noise_estimate(&mut self) -> Result<(), anyhow::Error> {
+        let center_t = self.params.temporal_radius;
+        let center_slot = self.phys_frame(center_t as i32);
+        self.read_and_fold_noise_estimate(center_slot, true)
+    }
+
+    fn read_and_fold_noise_estimate(
+        &mut self,
+        slot: u32,
+        include_temporal: bool,
+    ) -> Result<(), anyhow::Error> {
         let results_buf = self
             .noise_results
             .as_ref()
             .expect("noise_results allocated when auto noise is active")
             .clone();
-
-        let bytes = self
-            .client
-            .read_one(results_buf)
-            .map_err(|e| anyhow::anyhow!("noise-estimate results readback failed: {e}"))?;
-        let data = f32::from_bytes(&bytes);
-
-        let center_t = self.params.temporal_radius;
-        let center_slot = self.phys_frame(center_t as i32) as usize;
-
-        let temporal = self.read_temporal_noise_sample(center_slot as u32)?;
-        let imm_low = self.read_noise_partials_low(center_slot as u32)?;
-
-        self.fold_noise_estimate(data, center_slot, temporal, imm_low);
-
-        Ok(())
-    }
-
-    /// Reads one ring slot's noise partials back and reduces them to the
-    /// low chain's per-channel estimate.
-    ///
-    /// The shared ring handle is sliced by byte offset, so the transfer
-    /// only covers one slot rather than the whole ring. This matches
-    /// [`read_temporal_stats_slot`].
-    fn read_noise_partials_low(&self, slot: u32) -> Result<[f32; 3], anyhow::Error> {
         let partials_buf = self
             .noise_partials
             .as_ref()
             .expect("noise_partials allocated when auto noise is active");
+        let stored_ch = self.params.channels.storage_count();
+        let frame_count = self.params.total_frames();
+        let partials_stride = noise_partials_slot_stride_bytes(self.width, self.height, self.align);
+        let partials_start = slot as u64 * partials_stride;
+        let partials_size = partials_len(self.width, self.height) as u64 * size_of::<f32>() as u64;
+        let partials_end = frame_count as u64 * partials_stride - partials_start - partials_size;
+        let partials = partials_buf
+            .clone()
+            .offset_start(partials_start)
+            .offset_end(partials_end);
 
-        let slot_len_bytes = partials_len(self.width, self.height) as u64 * size_of::<f32>() as u64;
-        let stride = noise_partials_slot_stride_bytes(self.width, self.height, self.align);
-        let total_bytes = self.params.total_frames() as u64 * stride;
-        let start = (slot as u64) * stride;
-        let end_trim = total_bytes - start - slot_len_bytes;
+        let temporal_stats = if include_temporal {
+            self.temporal_stats_buf.as_ref()
+        } else {
+            None
+        };
+        let mut handles = vec![results_buf];
+        let temporal_index = if let Some(stats_buf) = temporal_stats {
+            let stats_stride =
+                temporal_stats_slot_stride_bytes(self.width, self.height, stored_ch, self.align);
+            let stats_start = slot as u64 * stats_stride;
+            let stats_size =
+                temporal_stats_slot_len(self.width, self.height, stored_ch) as u64 * size_of::<f32>() as u64;
+            let stats_end = frame_count as u64 * stats_stride - stats_start - stats_size;
+            let index = handles.len();
+            handles.push(stats_buf.clone().offset_start(stats_start).offset_end(stats_end));
+            Some(index)
+        } else {
+            None
+        };
+        let partials_index = handles.len();
+        handles.push(partials);
 
-        let sliced = partials_buf.clone().offset_start(start).offset_end(end_trim);
-        let bytes = self
-            .client
-            .read_one(sliced)
-            .map_err(|e| anyhow::anyhow!("noise partials readback failed: {e}"))?;
-        let data = f32::from_bytes(&bytes);
-
-        Ok(sigma_block_p25_from_partials(
-            data,
+        let readbacks = cubecl::future::block_on(self.client.read_async(handles))
+            .map_err(|e| anyhow::anyhow!("noise-estimate readback failed: {e}"))?;
+        let results = f32::from_bytes(&readbacks[0]);
+        let temporal = temporal_index.and_then(|index| {
+            aggregate_temporal_noise_stats(
+                f32::from_bytes(&readbacks[index]),
+                self.params.channels.count(),
+                stored_ch,
+                self.width,
+                self.height,
+            )
+        });
+        let imm_low = sigma_block_p25_from_partials(
+            f32::from_bytes(&readbacks[partials_index]),
             self.params.channels.count(),
             self.width,
             self.height,
-        ))
-    }
+        );
 
-    /// Reads the centre slot's temporal residual statistics back and
-    /// combines them into one sample.
-    ///
-    /// Returns `None` when the temporal estimator is inactive, which
-    /// happens at a temporal radius of 0 or with a fixed sigma, and also
-    /// when the combining step itself declines to produce a sample. See
-    /// [`aggregate_temporal_noise_stats`].
-    fn read_temporal_noise_sample(&self, slot: u32) -> Result<Option<TemporalNoiseSample>, anyhow::Error> {
-        let Some(stats_buf) = self.temporal_stats_buf.as_ref() else {
-            return Ok(None);
-        };
-
-        let stored_ch = self.params.channels.storage_count();
-        let channels = self.params.channels.count();
-        let frame_count = self.params.total_frames();
-
-        let records = read_temporal_stats_slot::<R>(
-            &self.client,
-            stats_buf,
-            self.width,
-            self.height,
-            stored_ch,
-            frame_count,
-            slot,
-            self.align,
-        )?;
-
-        Ok(aggregate_temporal_noise_stats(
-            &records,
-            channels,
-            stored_ch,
-            self.width,
-            self.height,
-        ))
+        self.fold_noise_estimate(results, slot as usize, temporal, imm_low);
+        Ok(())
     }
 
     /// Rebuilds `spatial_offset_lut` from the current `noise_offset` and
