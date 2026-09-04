@@ -5,10 +5,10 @@
 //! every run recompiles from scratch unless something points it at a
 //! directory.
 //!
-//! [`install_compilation_cache`] points it at one. By default that is
-//! `av-denoise` inside the user's cache directory, which turns the ten
-//! seconds into a cost paid once per machine rather than once per run.
-//! A warm cache takes the 53-frame reference clip from 11.8 s to 1.3 s.
+//! [`install_compilation_cache`] points it at one. By default, that is
+//! [`default_cache_dir`], `av-denoise` inside the platform's cache
+//! directory, which turns the ten seconds into a cost paid once per
+//! machine rather than once per run.
 //!
 //! The `AV_DENOISE_COMPILATION_CACHE` environment variable overrides the
 //! location, which is what CI runs and containers use to put the cache
@@ -19,6 +19,20 @@
 //! [`install_compilation_cache`] has to run before the first
 //! [`Denoiser`](crate::Denoiser) is created, because building a CubeCL
 //! client locks the global config.
+//!
+//! If using `av-denoise` as a library you may want to specify the cache directory
+//! path yourself via [`install_compilation_cache_at`] instead.
+//!
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Call this at the top of `main`, before any denoiser exists.
+//! match av_denoise_core::install_compilation_cache()? {
+//!     Some(path) => println!("caching compiled kernels in {}", path.display()),
+//!     None => println!("kernel caching is off, every run recompiles"),
+//! }
+//! # Ok(())
+//! # }
+//! ```
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -26,6 +40,7 @@ use std::sync::{Once, OnceLock};
 
 use cubecl::config::cache::CacheConfig;
 use cubecl::config::{CubeClRuntimeConfig, RuntimeConfig};
+use etcetera::base_strategy::{BaseStrategy, choose_base_strategy};
 
 /// The environment variable that overrides where compiled kernels are
 /// cached, or turns caching off.
@@ -44,15 +59,27 @@ const CACHE_DIR_NAME: &str = "av-denoise";
 /// create a directory named `0`.
 const DISABLE_WORDS: [&str; 4] = ["off", "0", "false", "none"];
 
-/// The CubeCL global config was already set up before this helper ran,
-/// so the override can no longer be installed.
+/// Something went wrong installing the kernel cache.
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "CubeCL global config already initialized. Call install_compilation_cache() before any Denoiser::create"
-)]
-pub struct CacheAlreadyInitialisedError;
+pub enum CacheError {
+    /// The CubeCL global config was already set up before this helper
+    /// ran, so the cache directory can no longer be installed.
+    #[error("CubeCL global config already initialized. Install the cache before any Denoiser::create")]
+    AlreadyInitialised,
+    /// The cache directory does not exist and could not be created.
+    #[error("cannot create the kernel cache directory {path}", path = path.display())]
+    Create {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
 
 /// Where compiled kernels go.
+///
+/// [`Disabled`](CacheLocation::Disabled) is reachable only when
+/// [`COMPILATION_CACHE_ENV`] names one of [`DISABLE_WORDS`]. Every
+/// platform has a default directory, so nothing else produces it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CacheLocation {
     /// Nothing is cached and every run recompiles.
@@ -61,21 +88,24 @@ pub(crate) enum CacheLocation {
     Dir(PathBuf),
 }
 
-/// Decides where compiled kernels go, from the environment alone.
-///
-/// `env` is the raw value of [`COMPILATION_CACHE_ENV`]. An unset or
-/// empty value takes the default, one of [`DISABLE_WORDS`] turns caching
-/// off, and anything else is used as the directory.
-///
-/// The default is `$XDG_CACHE_HOME/av-denoise`, or the platform's cache
-/// directory under `$HOME` when `XDG_CACHE_HOME` is unset. With no home
-/// directory to fall back on there is nowhere sensible to write, so
-/// caching is off.
+/// The directory compiled kernels are cached in when nothing overrides it.
+pub fn default_cache_dir() -> PathBuf {
+    let platform_cache = choose_base_strategy().ok().map(|s| s.cache_dir());
+    if platform_cache.is_none() {
+        tracing::warn!("no platform cache directory available, falling back to the temporary directory");
+    }
+    resolve_default_dir(platform_cache, std::env::temp_dir())
+}
+
+fn resolve_default_dir(platform_cache: Option<PathBuf>, temp: PathBuf) -> PathBuf {
+    platform_cache.unwrap_or(temp).join(CACHE_DIR_NAME)
+}
+
+/// Decides where compiled kernels go, from a default and the environment
+/// override alone.
 pub(crate) fn resolve_cache_location(
     env: Option<&OsStr>,
-    xdg_cache_home: Option<&OsStr>,
-    home: Option<&OsStr>,
-    is_macos: bool,
+    default: impl FnOnce() -> PathBuf,
 ) -> CacheLocation {
     if let Some(raw) = env {
         let text = raw.to_string_lossy();
@@ -84,51 +114,74 @@ pub(crate) fn resolve_cache_location(
             if DISABLE_WORDS.iter().any(|w| trimmed.eq_ignore_ascii_case(w)) {
                 return CacheLocation::Disabled;
             }
-            return CacheLocation::Dir(PathBuf::from(raw));
+            // `raw.to_str()` fails only when the value is not UTF-8, in
+            // which case it cannot be trimmed portably, so it is used
+            // unchanged rather than dropped.
+            let dir = match raw.to_str() {
+                Some(s) => PathBuf::from(s.trim()),
+                None => PathBuf::from(raw),
+            };
+            return CacheLocation::Dir(dir);
         }
     }
 
-    if let Some(xdg) = xdg_cache_home.filter(|x| !x.is_empty()) {
-        return CacheLocation::Dir(PathBuf::from(xdg).join(CACHE_DIR_NAME));
-    }
-
-    let Some(home) = home.filter(|h| !h.is_empty()) else {
-        return CacheLocation::Disabled;
-    };
-    let base = if is_macos {
-        PathBuf::from(home).join("Library").join("Caches")
-    } else {
-        PathBuf::from(home).join(".cache")
-    };
-    CacheLocation::Dir(base.join(CACHE_DIR_NAME))
+    CacheLocation::Dir(default())
 }
 
-/// Points CubeCL's compilation and autotune caches at a directory.
+/// Points CubeCL's compilation and autotune caches at `dir`, creating it
+/// if it does not exist.
 ///
-/// Returns `Ok(Some(path))` with the directory in use, or `Ok(None)`
-/// when caching is off. Caching is off when
-/// [`COMPILATION_CACHE_ENV`] says so, when there is no home directory to
-/// derive a default from, or when the directory cannot be created.
-///
-/// A directory that cannot be created is reported through `tracing` and
-/// then ignored. Denoising works without a cache, so failing to write
-/// one is not a reason to refuse to run.
-///
-/// Returns `Err` if something else has already read the global config,
-/// which usually means a CubeCL client was created first.
-pub fn install_compilation_cache() -> Result<Option<PathBuf>, CacheAlreadyInitialisedError> {
-    let path = install()?;
-
-    // Only an install that reached the config has a directory worth
-    // recording. `install` also answers `Ok(None)` for a directory it
-    // could not create, and latching that would leave
-    // `compilation_cache_dir` saying `None` for the rest of the process
-    // even if a later call succeeded.
-    if let Some(path) = &path {
-        let _ = CACHE_DIR.set(Some(path.clone()));
+/// This is the entry point for a caller using this crate directly.
+pub fn install_compilation_cache_at(dir: &Path) -> Result<(), CacheError> {
+    if let Err(source) = std::fs::create_dir_all(dir) {
+        return Err(CacheError::Create {
+            path: dir.to_path_buf(),
+            source,
+        });
     }
 
-    Ok(path)
+    set_runtime_config(dir)?;
+    let _ = CACHE_DIR.set(Some(dir.to_path_buf()));
+    Ok(())
+}
+
+/// Installs the cache at [`default_cache_dir`], or the directory
+/// [`COMPILATION_CACHE_ENV`] names, unless that variable turns caching off.
+///
+/// Returns `Ok(None)` only when the variable disables caching.
+///
+/// A directory that cannot be created is reported through `tracing` logs and then
+/// ignored, because denoising works without a cache. A caller that wants a
+/// creation failure reported should use [`install_compilation_cache_at`].
+pub fn install_compilation_cache() -> Result<Option<PathBuf>, CacheError> {
+    let location = resolve_cache_location(
+        std::env::var_os(COMPILATION_CACHE_ENV).as_deref(),
+        default_cache_dir,
+    );
+
+    let CacheLocation::Dir(path) = location else {
+        return Ok(None);
+    };
+
+    if let Err(err) = std::fs::create_dir_all(&path) {
+        tracing::warn!(
+            ?path,
+            %err,
+            "cannot create the kernel cache directory, continuing without a cache"
+        );
+        return Ok(None);
+    }
+
+    set_runtime_config(&path)?;
+
+    // Only an install that reached the config has a directory worth
+    // recording. A directory that could not be created has already
+    // answered `Ok(None)` above, and latching that would leave
+    // `compilation_cache_dir` saying `None` for the rest of the process
+    // even if a later call succeeded.
+    let _ = CACHE_DIR.set(Some(path.clone()));
+
+    Ok(Some(path))
 }
 
 /// Points CubeCL at a cache the first time it runs, and reports where.
@@ -168,32 +221,14 @@ pub fn compilation_cache_dir() -> Option<&'static Path> {
     CACHE_DIR.get()?.as_deref()
 }
 
-/// The install itself, split from the bookkeeping that records where
-/// the cache landed.
-fn install() -> Result<Option<PathBuf>, CacheAlreadyInitialisedError> {
-    let location = resolve_cache_location(
-        std::env::var_os(COMPILATION_CACHE_ENV).as_deref(),
-        std::env::var_os("XDG_CACHE_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-        cfg!(target_os = "macos"),
-    );
-
-    let CacheLocation::Dir(path) = location else {
-        return Ok(None);
-    };
-
-    if let Err(err) = std::fs::create_dir_all(&path) {
-        tracing::warn!(
-            ?path,
-            %err,
-            "cannot create the kernel cache directory, continuing without a cache"
-        );
-        return Ok(None);
-    }
-
+/// Points the CubeCL global config at `path`.
+///
+/// Split out because both entry points build the same config once they
+/// have settled on a directory that exists.
+fn set_runtime_config(path: &Path) -> Result<(), CacheError> {
     let mut cfg = CubeClRuntimeConfig::from_current_dir().override_from_env();
-    cfg.compilation.cache = Some(CacheConfig::File(path.clone()));
-    cfg.autotune.cache = CacheConfig::File(path.clone());
+    cfg.compilation.cache = Some(CacheConfig::File(path.to_path_buf()));
+    cfg.autotune.cache = CacheConfig::File(path.to_path_buf());
 
     // `RuntimeConfig::set` panics if the singleton is already set up.
     // Catching that turns an abort into a typed error for the caller.
@@ -203,7 +238,5 @@ fn install() -> Result<Option<PathBuf>, CacheAlreadyInitialisedError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         CubeClRuntimeConfig::set(cfg);
     }))
-    .map_err(|_| CacheAlreadyInitialisedError)?;
-
-    Ok(Some(path))
+    .map_err(|_| CacheError::AlreadyInitialised)
 }

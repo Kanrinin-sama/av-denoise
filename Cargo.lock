@@ -181,13 +181,15 @@ dependencies = [
 
 [[package]]
 name = "av-denoise"
-version = "0.4.0-alpha4"
+version = "0.4.0-alpha5"
 dependencies = [
  "anyhow",
  "av-decoders",
  "av-denoise-core",
  "av-scenechange",
+ "bytesize",
  "clap",
+ "crossbeam-channel",
  "ffms2-sys",
  "indicatif",
  "mimalloc",
@@ -202,12 +204,13 @@ dependencies = [
 
 [[package]]
 name = "av-denoise-core"
-version = "0.4.0-alpha4"
+version = "0.4.0-alpha5"
 dependencies = [
  "anyhow",
  "bon",
  "clap",
  "cubecl",
+ "etcetera",
  "futures",
  "strum",
  "strum_macros",
@@ -217,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "av-denoise-vs"
-version = "0.4.0-alpha4"
+version = "0.4.0-alpha5"
 dependencies = [
  "anyhow",
  "av-denoise-core",
@@ -411,6 +414,12 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+
+[[package]]
+name = "bytesize"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7354288c522e7e980fafd2075d63d1285794c3a6a16cdd492f189ea406e5f18b"
 
 [[package]]
 name = "c2rust-bitfields"
@@ -662,6 +671,15 @@ name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
+]
 
 [[package]]
 name = "crossbeam-deque"
@@ -1350,6 +1368,16 @@ name = "error-chain"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9435d864e017c3c6afeac1654189b06cdb491cf2ff73dbf0d73b0f292f42ff8"
+
+[[package]]
+name = "etcetera"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de48cc4d1c1d97a20fd819def54b890cadde72ed3ad0c614822a0a433361be96"
+dependencies = [
+ "cfg-if",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "event-listener"

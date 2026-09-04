@@ -2,7 +2,7 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use super::align::StorageAlign;
-use super::kernels::gpu_copy;
+use super::kernels::{gpu_copy, gpu_unpack_wire};
 use super::motion::{self, MotionCtx, MotionEstimation, build_pyramid_for_slot, run_pyramid_build};
 use super::noise::{
     EMA_ALPHA,
@@ -25,10 +25,10 @@ use super::noise::{
     zero_temporal_stats_slot,
 };
 use super::params::{NlmParams, SEPARABLE_THRESHOLD, sigma_eff, validate_dimensions};
-use super::pending::{Pending, unpack_frame};
+use super::pending::{Pending, empty_output, start_readback};
 use super::prefilter::{PrefilterCtx, PrefilterMode, run_prefilter};
-use super::{BLOCK_1D, MAX_GRID_1D};
-use crate::denoiser::DenoiserError;
+use super::{BLOCK_1D, Depth, MAX_GRID_1D};
+use crate::denoiser::{DenoiserError, FrameOutput, OutputFormat};
 
 /// A denoised frame that has finished its kernels but is still resident
 /// on the GPU.
@@ -119,6 +119,10 @@ pub struct NlmDenoiser<R: Runtime> {
     /// CPU scratch for repacking 3-channel YUV into 4 lanes. Empty when
     /// no padding is needed.
     pub(super) padding_scratch: Vec<f32>,
+    /// CPU scratch the wire push concatenates its planes into, so one
+    /// push costs one transfer whatever the channel mode. Reused, so it
+    /// allocates nothing after the first frame.
+    pub(super) upload_scratch: Vec<u8>,
     /// The weighted-pixel accumulator, one entry per stored channel per
     /// pixel.
     pub(super) accum: Handle,
@@ -144,9 +148,18 @@ pub struct NlmDenoiser<R: Runtime> {
     pub(super) outputs: [Handle; 2],
     /// Which output slot the next submit writes into.
     pub(super) next_output_slot: usize,
-    /// CPU scratch the blocking `denoise()` path reuses through
-    /// `Pending::wait_into`, so it does not allocate per frame.
-    pub(super) output_scratch: Vec<f32>,
+    /// The format every readback this denoiser starts comes back in.
+    pub(super) output_format: OutputFormat,
+    /// Packed-word destinations, one per entry of `outputs`, allocated
+    /// only in wire mode. They rotate on the same slot counter, so each
+    /// is free again exactly when the `f32` slot it is packed from is.
+    pub(super) wire_outputs: Option<[Handle; 2]>,
+    /// CPU scratch the blocking `denoise()` and `flush()` paths reuse
+    /// through `Pending::wait_into`, so they do not allocate per frame.
+    ///
+    /// It holds `output_format`'s variant, so `wait_into` keeps its
+    /// allocation rather than replacing it.
+    pub(super) output_scratch: FrameOutput,
 
     pub(super) h2_inv_norm: f32,
     /// The distance floor the main pass subtracts before weighting.
@@ -357,6 +370,26 @@ impl<R: Runtime> NlmDenoiser<R> {
     /// reports them as a `Result`, so most callers should use that
     /// instead.
     pub fn new(client: &ComputeClient<R>, params: NlmParams, width: u32, height: u32) -> Self {
+        Self::with_output_format(client, params, width, height, OutputFormat::F32)
+    }
+
+    /// Builds a new denoiser whose readbacks come back in
+    /// `output_format`.
+    ///
+    /// [`OutputFormat::Wire`] gives the denoiser a packed-word buffer
+    /// per output slot, so a readback quantises on the GPU and only the
+    /// wire bytes cross the bus.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Self::new`].
+    pub fn with_output_format(
+        client: &ComputeClient<R>,
+        params: NlmParams,
+        width: u32,
+        height: u32,
+        output_format: OutputFormat,
+    ) -> Self {
         params
             .validate()
             .expect("invalid NlmParams, call params.validate() first to get this as a Result");
@@ -392,6 +425,17 @@ impl<R: Runtime> NlmDenoiser<R> {
         let tmp_hsum = client.empty(scalar_bytes);
         let tmp_hsum_bwd = client.empty(scalar_bytes);
         let outputs = [client.empty(frame_bytes), client.empty(frame_bytes)];
+        let wire_outputs = match output_format {
+            OutputFormat::F32 => None,
+            OutputFormat::Wire { depth } => {
+                let samples = pixels as u32 * params.channels.count();
+                let words = samples.div_ceil(depth.wire_pack().samples_per_word()) as usize;
+                Some([
+                    client.empty(words * size_of::<u32>()),
+                    client.empty(words * size_of::<u32>()),
+                ])
+            },
+        };
 
         let h2_inv_norm = params.h2_inv_norm();
         let input_noise_offset = params.noise_offset();
@@ -404,9 +448,9 @@ impl<R: Runtime> NlmDenoiser<R> {
             PrefilterMode::NlmSpatial { .. } => 0.0,
             _ => input_noise_offset,
         };
+        let output_scratch = empty_output(pixels, params.channels.count(), output_format);
         let use_separable = params.patch_radius > SEPARABLE_THRESHOLD;
         let use_reference = params.prefilter.needs_reference_buf();
-        let output_scratch_cap = pixels * params.channels.count() as usize;
 
         // This stays unset until the first temporal sample lands, so
         // the initial table matches the flat `noise_offset` scalar it
@@ -574,6 +618,7 @@ impl<R: Runtime> NlmDenoiser<R> {
             input_buf,
             reference_buf,
             padding_scratch,
+            upload_scratch: Vec::new(),
             accum,
             weight_sum,
             max_weight,
@@ -584,7 +629,9 @@ impl<R: Runtime> NlmDenoiser<R> {
             tmp_hsum_bwd,
             outputs,
             next_output_slot: 0,
-            output_scratch: Vec::with_capacity(output_scratch_cap),
+            output_format,
+            wire_outputs,
+            output_scratch,
             h2_inv_norm,
             noise_offset,
             input_noise_offset,
@@ -630,7 +677,30 @@ impl<R: Runtime> NlmDenoiser<R> {
         );
 
         let slot = self.upload_into(&self.input_buf.clone(), frame);
+        self.run_post_upload_stages(slot);
+    }
 
+    /// Pushes a new frame held as wire bytes, one slice per channel.
+    ///
+    /// Each plane holds `width * height` samples at `depth`, and the GPU
+    /// normalises them and interleaves the planes. `planes` runs Y, U, V
+    /// for a fused frame and U, V for a chroma pair.
+    ///
+    /// For `PrefilterMode::External` use
+    /// [`Self::push_frame_with_reference`] instead.
+    pub fn push_frame_wire(&mut self, planes: &[&[u8]], depth: Depth) {
+        assert!(
+            !matches!(self.params.prefilter, PrefilterMode::External),
+            "push_frame_with_reference is required when prefilter == External"
+        );
+
+        let slot = self.upload_wire_into(&self.input_buf.clone(), planes, depth);
+        self.run_post_upload_stages(slot);
+    }
+
+    /// The work every push runs once its frame is in `slot`, from the
+    /// noise estimate through to the ring advance.
+    fn run_post_upload_stages(&mut self, slot: usize) {
         self.run_noise_estimate_for_slot(slot as u32);
         self.run_temporal_stats_for_slot(slot as u32);
         self.seed_noise_estimate_if_first_frame(slot as u32);
@@ -722,6 +792,95 @@ impl<R: Runtime> NlmDenoiser<R> {
         };
 
         self.copy_frame_into_slot(dst, slot, &staging, 0, 1);
+    }
+
+    /// Uploads one wire-byte frame into the next ring slot of `dst` and
+    /// returns the physical slot it wrote.
+    ///
+    /// The planes are concatenated into `upload_scratch` and uploaded as
+    /// one buffer, so a push costs one transfer whatever the channel
+    /// mode. The scratch is reused, so the concatenation allocates
+    /// nothing after the first frame.
+    fn upload_wire_into(&mut self, dst: &Handle, planes: &[&[u8]], depth: Depth) -> usize {
+        let total_frames = self.params.total_frames() as usize;
+        let slot = self.ring_head % total_frames;
+        self.upload_wire_into_slot(dst, planes, depth, slot);
+        slot
+    }
+
+    fn upload_wire_into_slot(&mut self, dst: &Handle, planes: &[&[u8]], depth: Depth, slot: usize) {
+        let channels = self.params.channels.count();
+        let stored_ch = self.params.channels.storage_count();
+        let pixels = self.width * self.height;
+        let plane_bytes = pixels as usize * depth.bytes_per_sample();
+
+        assert_eq!(
+            planes.len(),
+            channels as usize,
+            "plane count mismatch: expected {channels}, got {}",
+            planes.len()
+        );
+
+        // Ten and Twelve share a byte width, so the plane-length check
+        // below cannot tell them apart. A wrong depth here divides by the
+        // wrong maximum and darkens the whole frame without failing
+        // anything else, so it is pinned against the depth this denoiser
+        // returns frames in.
+        if let OutputFormat::Wire { depth: out_depth } = self.output_format {
+            assert_eq!(
+                depth, out_depth,
+                "wire push depth {depth:?} does not match the denoiser's output depth {out_depth:?}"
+            );
+        }
+
+        self.upload_scratch.clear();
+        for plane in planes {
+            assert_eq!(
+                plane.len(),
+                plane_bytes,
+                "plane size mismatch: expected {plane_bytes}, got {}",
+                plane.len()
+            );
+            debug_assert!(
+                wire_samples_in_range(plane, depth),
+                "a sample is larger than {depth:?} can express"
+            );
+            self.upload_scratch.extend_from_slice(plane);
+        }
+
+        // The kernel reads whole words, so a plane that ends mid-word
+        // needs its last word backed by real storage.
+        let words = self.upload_scratch.len().div_ceil(size_of::<u32>());
+        self.upload_scratch.resize(words * size_of::<u32>(), 0);
+
+        let src = self.client.create_from_slice(&self.upload_scratch);
+
+        let elements = pixels * stored_ch;
+        let total_frames = self.params.total_frames() as usize;
+        let grid = elements.div_ceil(BLOCK_1D).clamp(1, MAX_GRID_1D);
+        let total_threads = grid * BLOCK_1D;
+
+        // One `wire_pack` for both, since a hand-paired maximum and lane
+        // width decode the wrong bits.
+        let pack = depth.wire_pack();
+
+        unsafe {
+            gpu_unpack_wire::launch_unchecked::<R>(
+                &self.client,
+                CubeCount::new_1d(grid),
+                CubeDim::new_1d(BLOCK_1D),
+                ArrayArg::from_raw_parts(src, words),
+                ArrayArg::from_raw_parts(dst.clone(), total_frames * elements as usize),
+                pack.max(),
+                slot as u32 * elements,
+                pixels,
+                channels,
+                stored_ch,
+                pack.samples_per_word(),
+                elements,
+                total_threads,
+            )
+        };
     }
 
     fn run_prefilter_for_slot(&self, slot: usize) {
@@ -1510,6 +1669,11 @@ impl<R: Runtime> NlmDenoiser<R> {
     /// [`crate::Denoiser`] holds callers to that limit through its
     /// `MAX_PENDING` constant.
     ///
+    /// The frame comes back in the [`OutputFormat`] this denoiser was
+    /// built with. [`OutputFormat::Wire`] quantises and packs the frame
+    /// on the GPU before the readback, so only the wire bytes cross the
+    /// bus.
+    ///
     /// Returns `Ok(None)` while the temporal window is still filling.
     pub fn denoise_submit(&mut self) -> Result<Option<Pending<R>>, anyhow::Error> {
         let Some(output) = self.denoise_submit_gpu()? else {
@@ -1518,21 +1682,15 @@ impl<R: Runtime> NlmDenoiser<R> {
 
         // Start the readback right away, so the GPU-side copy is queued
         // before the caller dispatches the next frame's kernels.
-        //
-        // The future is wrapped in an `async move` that owns a cloned
-        // `ComputeClient`, which is cheap because it shares its
-        // internals. That owned client lives inside the future, so the
-        // future is genuinely `'static` and the `Pending` can outlive
-        // the denoiser without any lifetime tricks.
-        let client = self.client.clone();
-        let fut = Box::pin(async move { client.read_async(vec![output.handle]).await });
-
         let pixels = (self.width * self.height) as usize;
-        Ok(Some(Pending::new(
-            fut,
+        Ok(Some(start_readback(
+            &self.client,
+            output.handle,
+            self.wire_outputs.as_ref().map(|w| &w[output.slot]),
             self.params.channels.count(),
             self.params.channels.storage_count(),
             pixels,
+            self.output_format,
         )))
     }
 
@@ -1556,44 +1714,18 @@ impl<R: Runtime> NlmDenoiser<R> {
         sigmas
     }
 
-    /// The smoothed per-channel sigma estimate from the low chain.
-    ///
-    /// This is `sigma_override` broadcast to every channel when HQ
-    /// pinned a fixed sigma, the same as [`Self::current_sigmas`]. There
-    /// is only one sigma once a fixed value is pinned, so the two chains
-    /// are indistinguishable in that case. Otherwise it is the low
-    /// chain's smoothed estimate once one has landed, and zeros before
-    /// that first estimate and on the fast path where no estimate ever
-    /// runs.
-    ///
-    /// See the "The estimator chains" section of [`Self::fold_noise_estimate`]
-    /// for why a consumer would want this instead of
-    /// [`Self::current_sigmas`].
-    pub fn current_sigmas_low(&self) -> [f32; 3] {
-        if let Some(sigma) = self.params.hq.and_then(|hq| hq.sigma_override) {
-            return [sigma; 3];
-        }
-
-        let channels = self.params.channels.count() as usize;
-        let mut sigmas = [0.0f32; 3];
-        if let Some(smoothed) = self.noise_estimator_low.current() {
-            sigmas[..channels].copy_from_slice(&smoothed[..channels]);
-        }
-        sigmas
-    }
-
     /// The smoothed per-channel sigma estimate from the low chain, with
     /// the correlation boost left out of its temporal reading.
     ///
     /// This is `sigma_override` broadcast to every channel when HQ
-    /// pinned a fixed sigma, the same as [`Self::current_sigmas_low`].
+    /// pinned a fixed sigma, the same as [`Self::current_sigmas`].
     /// Otherwise it is `noise_estimator_low_unboosted`'s smoothed
     /// estimate once one has landed, and zeros before that first
     /// estimate and on the fast path where no estimate ever runs.
     ///
     /// See the "The estimator chains" section of [`Self::fold_noise_estimate`]
     /// for why a consumer would want this instead of
-    /// [`Self::current_sigmas_low`].
+    /// [`Self::current_sigmas`].
     pub fn current_sigmas_low_unboosted(&self) -> [f32; 3] {
         if let Some(sigma) = self.params.hq.and_then(|hq| hq.sigma_override) {
             return [sigma; 3];
@@ -1756,15 +1888,19 @@ impl<R: Runtime> NlmDenoiser<R> {
     ///
     /// Returns `Ok(None)` while not enough frames have been pushed.
     ///
-    /// On success the returned slice borrows a reusable internal buffer.
-    /// Copy it out if the data has to survive another call into the
-    /// denoiser.
-    pub fn denoise(&mut self) -> Result<Option<&[f32]>, anyhow::Error> {
+    /// The frame comes back in the [`OutputFormat`] this denoiser was
+    /// built with.
+    ///
+    /// On success the return borrows a reusable internal buffer. Copy it
+    /// out if the data has to survive another call into the denoiser.
+    pub fn denoise(&mut self) -> Result<Option<&FrameOutput>, anyhow::Error> {
         let Some(pending) = self.denoise_submit()? else {
             return Ok(None);
         };
+        // The scratch already holds this denoiser's format, so
+        // `wait_into` refills it and it keeps its allocation.
         pending.wait_into(&mut self.output_scratch)?;
-        Ok(Some(self.output_scratch.as_slice()))
+        Ok(Some(&self.output_scratch))
     }
 
     /// How many tail frames a call to [`Self::flush`] must emit for the
@@ -1835,28 +1971,32 @@ impl<R: Runtime> NlmDenoiser<R> {
     /// For the last few frames the temporal window is kept full by
     /// repeating the final frame.
     ///
-    /// `sink` is called once per frame produced, and the slice it
-    /// receives is only valid for that call.
-    pub fn flush(&mut self, mut sink: impl FnMut(&[f32])) -> Result<(), anyhow::Error> {
+    /// `sink` is called once per frame produced, and the frame it
+    /// receives is only valid for that call. It arrives in the
+    /// [`OutputFormat`] this denoiser was built with, quantised by the
+    /// same pack kernel as every streaming frame.
+    pub fn flush(&mut self, mut sink: impl FnMut(&FrameOutput)) -> Result<(), anyhow::Error> {
         let target = self.flush_target();
         let mut emitted = 0usize;
+        let pixels = (self.width * self.height) as usize;
 
+        // Every output slot is free here. A caller reaches a flush only
+        // once its streaming readbacks have landed, and the readback
+        // below blocks, so no other readback is ever reading the slot
+        // this step is handed.
         while emitted < target {
             if let Some(output) = self.flush_step_gpu()? {
-                let bytes = self
-                    .client
-                    .read_one(output.handle)
-                    .map_err(|e| anyhow::anyhow!("flush readback failed: {e}"))?;
-                let data = f32::from_bytes(&bytes);
-                let pixels = (self.width * self.height) as usize;
-                unpack_frame(
-                    data,
+                let pending = start_readback(
+                    &self.client,
+                    output.handle,
+                    self.wire_outputs.as_ref().map(|w| &w[output.slot]),
+                    self.params.channels.count(),
+                    self.params.channels.storage_count(),
                     pixels,
-                    self.params.channels.count() as usize,
-                    self.params.channels.storage_count() as usize,
-                    &mut self.output_scratch,
+                    self.output_format,
                 );
-                sink(self.output_scratch.as_slice());
+                pending.wait_into(&mut self.output_scratch)?;
+                sink(&self.output_scratch);
                 emitted += 1;
             }
         }
@@ -1938,4 +2078,24 @@ impl<R: Runtime> NlmDenoiser<R> {
         let n = 2 * radius;
         ((self.ring_head as i32 + gap_index).rem_euclid(n)) as u32
     }
+}
+
+/// True when every sample in `plane` fits the range `depth` expresses.
+///
+/// `gpu_unpack_wire` is branch-free and divides every sample by the
+/// depth's maximum, so a larger sample normalises above 1.0 and reaches
+/// the filter as a value no clean frame can hold. Only 10 and 12-bit can
+/// carry one, in the unused high bits of a 16-bit lane, so 8-bit is
+/// always in range.
+fn wire_samples_in_range(plane: &[u8], depth: Depth) -> bool {
+    if depth.bytes_per_sample() == 1 {
+        return true;
+    }
+
+    let max = depth.max_value() as u32;
+    plane
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .all(|&s| u32::from(u16::from_le_bytes(s)) <= max)
 }

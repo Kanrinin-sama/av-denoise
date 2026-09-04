@@ -346,6 +346,38 @@ pub(super) fn zero_temporal_stats_slot<R: Runtime>(
     }
 }
 
+/// Reads exactly one ring slot's temporal-stats region back as owned
+/// values.
+///
+/// The shared ring handle is sliced by byte offset, so the transfer only
+/// covers one slot rather than the whole ring.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dispatch threads through every buffer and shape the kernel binds"
+)]
+pub(super) fn read_temporal_stats_slot<R: Runtime>(
+    client: &ComputeClient<R>,
+    stats_buf: &Handle,
+    width: u32,
+    height: u32,
+    stored_ch: u32,
+    frame_count: u32,
+    slot: u32,
+    align: StorageAlign,
+) -> Result<Vec<f32>, anyhow::Error> {
+    let slot_len_bytes = temporal_stats_slot_len(width, height, stored_ch) as u64 * size_of::<f32>() as u64;
+    let stride = temporal_stats_slot_stride_bytes(width, height, stored_ch, align);
+    let total_bytes = frame_count as u64 * stride;
+    let start = (slot as u64) * stride;
+    let end_trim = total_bytes - start - slot_len_bytes;
+
+    let sliced = stats_buf.clone().offset_start(start).offset_end(end_trim);
+    let bytes = client
+        .read_one(sliced)
+        .map_err(|e| anyhow::anyhow!("temporal noise stats readback failed: {e}"))?;
+    Ok(f32::from_bytes(&bytes).to_vec())
+}
+
 /// One centre slot's aggregated temporal-residual noise measurement.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct TemporalNoiseSample {

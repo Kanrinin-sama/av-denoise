@@ -7,6 +7,19 @@
 //!
 //! [`Device`] implements `FromStr`, so it can be taken straight from a
 //! command-line flag or a config file.
+//!
+//! ```
+//! use av_denoise_core::Device;
+//!
+//! // Let the backend decide.
+//! assert_eq!("default".parse::<Device>().unwrap(), Device::Default);
+//!
+//! // Or name the second discrete GPU in the machine.
+//! assert_eq!(
+//!     "discrete:1".parse::<Device>().unwrap(),
+//!     Device::Discrete { index: 1 },
+//! );
+//! ```
 
 use std::fmt;
 use std::str::FromStr;
@@ -46,21 +59,39 @@ impl FromStr for Device {
 
     /// Accepts the same spellings as the bench CLI.
     ///
-    /// - `default`
-    /// - `discrete[:N]`, `integrated[:N]`, and `virtual[:N]`, where `N`
-    ///   defaults to 0
-    /// - `cpu`
+    /// - `default`, which takes no index
+    /// - `discrete[:N]`, `integrated[:N]`, and `virtual[:N]`, where `N` defaults to 0
+    /// - `cpu`, which takes no index
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (kind, idx) = s.split_once(':').unwrap_or((s, "0"));
-        let index: usize = idx
-            .parse()
-            .map_err(|_| format!("invalid device index '{idx}' in '{s}'"))?;
+        let (kind, suffix) = match s.split_once(':') {
+            Some((kind, idx)) => (kind, Some(idx)),
+            None => (s, None),
+        };
+
+        if matches!(kind, "default" | "cpu") && suffix.is_some() {
+            return Err(format!(
+                "device kind '{kind}' takes no index, got '{s}'. Only discrete, integrated, and virtual take an index"
+            ));
+        }
+
+        let parse_index = |idx: &str| -> Result<usize, String> {
+            idx.parse()
+                .map_err(|_| format!("invalid device index '{idx}' in '{s}'"))
+        };
+        let idx = suffix.unwrap_or("0");
+
         match kind {
             "default" => Ok(Device::Default),
-            "discrete" => Ok(Device::Discrete { index }),
-            "integrated" => Ok(Device::Integrated { index }),
-            "virtual" => Ok(Device::Virtual { index }),
             "cpu" => Ok(Device::Cpu),
+            "discrete" => Ok(Device::Discrete {
+                index: parse_index(idx)?,
+            }),
+            "integrated" => Ok(Device::Integrated {
+                index: parse_index(idx)?,
+            }),
+            "virtual" => Ok(Device::Virtual {
+                index: parse_index(idx)?,
+            }),
             other => Err(format!(
                 "unknown device kind '{other}', expected default, discrete[:N], integrated[:N], virtual[:N], or cpu"
             )),

@@ -6,6 +6,7 @@ mod file_mode;
 mod frame_index;
 mod progress;
 mod stream_mode;
+mod warm_start;
 mod y4m_format;
 
 use cli::{Args, Command, InputSource, RunOptions, run_list_devices};
@@ -16,16 +17,33 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Scene workers used when `--workers` is not given.
 const DEFAULT_WORKERS: usize = 2;
 
+/// Frame budget in bytes used when `--frame-budget` is not given. (1GB)
+const DEFAULT_FRAME_BUDGET_BYTES: u64 = 1 << 30;
+
 /// Routes an input source to the pipeline that fits it.
 ///
 /// A path is opened with ffms2 and split across scenes. Anything piped
 /// streams y4m frame by frame with no scene detection.
-fn run_input(opts: &RunOptions, input: &InputSource, workers: Option<usize>) -> Result<(), anyhow::Error> {
+fn run_input(
+    opts: &RunOptions,
+    input: &InputSource,
+    workers: Option<usize>,
+    frame_budget: Option<u64>,
+) -> Result<(), anyhow::Error> {
     match input {
-        InputSource::File(path) => file_mode::run_file(opts, path, workers.unwrap_or(DEFAULT_WORKERS)),
+        InputSource::File(path) => file_mode::run_file(
+            opts,
+            path,
+            workers.unwrap_or(DEFAULT_WORKERS),
+            frame_budget.unwrap_or(DEFAULT_FRAME_BUDGET_BYTES),
+        ),
         stream @ (InputSource::Stdin | InputSource::Fd(_)) => {
             if workers.is_some() {
                 tracing::warn!("--workers is ignored for piped input, which cannot be split by scene");
+            }
+
+            if frame_budget.is_some() {
+                tracing::warn!("--frame-budget is ignored for piped input, which holds one frame at a time");
             }
 
             tracing::info!(input = %stream, "reading a y4m stream");
@@ -36,18 +54,8 @@ fn run_input(opts: &RunOptions, input: &InputSource, workers: Option<usize>) -> 
 }
 
 fn main() -> anyhow::Result<()> {
-    // cubecl spawns its per-device worker thread without asking for a
-    // stack size, so it gets Rust's default 2 MiB. GPU kernel codegen
-    // runs on that thread, and at a large --search-radius the (2R+1)^2
-    // unrolled body of the windowed NLM kernels in
-    // src/nlmeans/kernels/fused.rs overflows that stack.
-    //
-    // RUST_MIN_STACK is cached the first time it is read, so it has to
-    // be set here, before any GPU thread spawns.
-    if std::env::var_os("RUST_MIN_STACK").is_none() {
-        // SAFETY: still single-threaded, no other thread can race the env mutation.
-        unsafe { std::env::set_var("RUST_MIN_STACK", "16777216") };
-    }
+    // SAFETY: still single-threaded, no other thread can race the env mutation.
+    unsafe { av_denoise_core::raise_codegen_stack_limit() };
 
     let args = Args::parse();
 
@@ -83,19 +91,19 @@ fn main() -> anyhow::Result<()> {
             "kernel caching is off, every run recompiles. Unset {} to turn it back on.",
             av_denoise::COMPILATION_CACHE_ENV,
         ),
-        Err(_) => anyhow::bail!("unable to install the kernel cache, this is a bug."),
+        Err(err) => return Err(anyhow::Error::new(err).context("unable to install the kernel cache")),
     }
 
-    let (opts, input, workers) = match &args.command {
-        Command::Nlmeans(nlm) => (nlm.build_options(&args)?, &nlm.common.input, nlm.common.workers),
+    let (opts, input, workers, frame_budget) = match &args.command {
         Command::Nl4d(nl4d) => (
             nl4d.build_options(&args)?,
             &nl4d.common.input,
             nl4d.common.workers,
+            nl4d.common.frame_budget,
         ),
         // Handled above, before any denoising options are built.
         Command::ListDevices => unreachable!(),
     };
 
-    run_input(&opts, input, workers)
+    run_input(&opts, input, workers, frame_budget)
 }

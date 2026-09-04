@@ -215,6 +215,11 @@ The project supports the following accelerators/gpus:
 Run `av-denoise list-devices` to see which of these your machine offers and what to pass to
 `--device`.
 
+Every global flag also reads an environment variable named after it with an `AVD_` prefix, so
+`AVD_DEVICE=discrete:1` pins a card for a whole shell. `AVD_ACCELERATORS`, `AVD_PRESET`,
+`AVD_CHANNEL_MODE` and `AVD_PROGRESS` work the same way. A flag given on the command line wins
+over its variable.
+
 There is no software backend. The collaborative filter aggregates its filtered patches through
 atomic floating-point adds, and CubeCL's CPU runtime does not implement atomics. A software
 *device* is still reachable with `--device cpu` where the platform provides one, such as lavapipe
@@ -245,8 +250,9 @@ backend for those devices. It should be more or less the same performance, witho
 Compiling the kernels takes about ten seconds when you first start the denoising pipeline. 
 These compiled kernels get cached on disk, which makes that a cost paid once per machine rather than once per run.
 
-By default, the cache lives in `$XDG_CACHE_HOME/av-denoise`, or `~/.cache/av-denoise` when `XDG_CACHE_HOME` is
-unset (`~/Library/Caches/av-denoise` on macOS).
+By default, the cache lives in `av-denoise` inside the platform cache directory, which is `$XDG_CACHE_HOME` or
+`~/.cache` on Linux and macOS, and `%LOCALAPPDATA%` on Windows. With no platform cache directory at all, it falls
+back to `av-denoise` inside the temporary directory and warns.
 
 - `AV_DENOISE_COMPILATION_CACHE=/some/dir` puts the compiled-kernel and autotune caches somewhere else, which is
   what CI runs and containers use to keep the cache on a mounted volume. It overrides whatever is in `cubecl.toml`.
@@ -257,4 +263,6 @@ If the cache directory cannot be created, `av-denoise` logs a warning and carrie
 
 Library users can call `av_denoise::install_compilation_cache()` before `Denoiser::create` to get the same
 behaviour in their own binary. It has to run before the first `Denoiser` exists, because building a CubeCL client
-locks the global config.
+locks the global config. An embedder that wants to choose the cache directory itself can call
+`av_denoise::default_cache_dir()` to get the same default this crate uses, and
+`av_denoise::install_compilation_cache_at()` to install it, or any other directory, directly.

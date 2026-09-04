@@ -12,8 +12,18 @@ use crate::collab::kernels::aggregate::{
 use crate::collab::kernels::fused::collab_fused;
 use crate::collab::kernels::transforms::dct_noise_profile;
 use crate::collab::{MAX_K, PATCH_SIZE};
-use crate::denoiser::DenoiserError;
-use crate::nlmeans::{BLOCK_X, BLOCK_Y, ChannelMode, MAX_GRID_1D, NlmDenoiser, Pending, RingView};
+use crate::denoiser::{DenoiserError, FrameOutput, OutputFormat};
+use crate::nlmeans::{
+    BLOCK_X,
+    BLOCK_Y,
+    ChannelMode,
+    Depth,
+    MAX_GRID_1D,
+    NlmDenoiser,
+    Pending,
+    RingView,
+    start_readback,
+};
 
 /// Groups similar 8x8 patches across a motion-compensated temporal
 /// window and denoises each group jointly.
@@ -88,6 +98,14 @@ pub struct Nl4dDenoiser<R: Runtime> {
     /// the previous frame's readback.
     outputs: [Handle; 2],
     next_output_slot: usize,
+    /// The format every readback this denoiser starts comes back in.
+    output_format: OutputFormat,
+    /// Packed-word destinations, one per entry of `outputs`, allocated
+    /// only in wire mode.
+    ///
+    /// These buffers rotate on the same slot counter, so each is free again exactly
+    /// when the `f32` slot it is packed from is free.
+    wire_outputs: Option<[Handle; 2]>,
     /// How many passes [`Self::run_collab_stage`] has run for the
     /// current stream.
     ///
@@ -116,9 +134,26 @@ impl<R: Runtime> Nl4dDenoiser<R> {
     /// frame smaller than one collaborative patch on either axis.
     pub fn new(
         client: &ComputeClient<R>,
+        params: Nl4dParams,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        Self::with_output_format(client, params, width, height, OutputFormat::F32)
+    }
+
+    /// Builds a new denoiser whose readbacks come back in `output_format`.
+    ///
+    /// [`OutputFormat::Wire`] gives the denoiser a packed-word buffer
+    /// per output slot, so a readback quantises on the GPU and only the
+    /// wire bytes cross the bus.
+    ///
+    /// Rejects the same `params` and dimensions [`Self::new`] does.
+    pub fn with_output_format(
+        client: &ComputeClient<R>,
         mut params: Nl4dParams,
         width: u32,
         height: u32,
+        output_format: OutputFormat,
     ) -> Result<Self, String> {
         params.validate()?;
 
@@ -137,7 +172,12 @@ impl<R: Runtime> Nl4dDenoiser<R> {
         params.nlm.temporal_radius = params.temporal_radius;
         params.nlm.validate().map_err(|e| e.to_string())?;
 
-        let front = NlmDenoiser::new(client, params.nlm.clone(), width, height);
+        // The front end only supplies the ring, motion field, and
+        // confidence scores the collaborative stage reads. Its own
+        // buffers never leave the GPU, so it stays in `f32` whatever
+        // format this denoiser hands back.
+        let front =
+            NlmDenoiser::with_output_format(client, params.nlm.clone(), width, height, OutputFormat::F32);
 
         let channels = params.nlm.channels;
         let stored_ch = channels.storage_count();
@@ -165,6 +205,17 @@ impl<R: Runtime> Nl4dDenoiser<R> {
             client.empty(frame_len * size_of::<f32>()),
             client.empty(frame_len * size_of::<f32>()),
         ];
+        let wire_outputs = match output_format {
+            OutputFormat::F32 => None,
+            OutputFormat::Wire { depth } => {
+                let samples = pixels as u32 * channels.count();
+                let words = samples.div_ceil(depth.wire_pack().samples_per_word()) as usize;
+                Some([
+                    client.empty(words * size_of::<u32>()),
+                    client.empty(words * size_of::<u32>()),
+                ])
+            },
+        };
 
         Ok(Self {
             front,
@@ -188,6 +239,8 @@ impl<R: Runtime> Nl4dDenoiser<R> {
             wsum,
             outputs,
             next_output_slot: 0,
+            output_format,
+            wire_outputs,
             passes_run: 0,
         })
     }
@@ -198,6 +251,15 @@ impl<R: Runtime> Nl4dDenoiser<R> {
     /// `[0, 1]`, matching [`NlmDenoiser::push_frame`].
     pub fn push_frame(&mut self, frame: &[f32]) {
         self.front.push_frame(frame);
+    }
+
+    /// Pushes a new frame held as wire bytes into the front end's ring
+    /// buffer.
+    ///
+    /// `planes` holds one `width * height` plane per channel at `depth`,
+    /// matching [`NlmDenoiser::push_frame_wire`].
+    pub fn push_frame_wire(&mut self, planes: &[&[u8]], depth: Depth) {
+        self.front.push_frame_wire(planes, depth);
     }
 
     /// Runs one submit's worth of grouping, filtering, and aggregation,
@@ -213,21 +275,30 @@ impl<R: Runtime> Nl4dDenoiser<R> {
     /// There are two output slots, so at most two [`Pending`]s from this
     /// denoiser may be outstanding at once. A third concurrent submit
     /// reuses the oldest one's slot and silently corrupts it.
+    ///
+    /// The frame comes back in the [`OutputFormat`] this denoiser was
+    /// built with. [`OutputFormat::Wire`] quantises and packs the frame
+    /// on the GPU before the readback, so only the wire bytes cross the
+    /// bus.
     pub fn denoise_submit(&mut self) -> Result<Option<Pending<R>>, DenoiserError> {
         let Some(view) = self.front.submit_machinery()? else {
             return Ok(None);
         };
-        let Some(handle) = self.run_collab_stage(&view)? else {
+        let Some((handle, slot)) = self.run_collab_stage(&view)? else {
             return Ok(None);
         };
-        Ok(Some(self.start_readback(handle)))
+        let wire_dst = self.wire_outputs.as_ref().map(|w| &w[slot]);
+        Ok(Some(self.start_readback(handle, wire_dst, self.output_format)))
     }
 
     /// Submits and waits for the result in one call.
     ///
     /// Prefer [`Self::denoise_submit`] when the caller can hold a frame
     /// in flight.
-    pub fn denoise(&mut self) -> Result<Option<Vec<f32>>, DenoiserError> {
+    ///
+    /// The frame comes back in the [`OutputFormat`] this denoiser was
+    /// built with.
+    pub fn denoise(&mut self) -> Result<Option<FrameOutput>, DenoiserError> {
         let Some(pending) = self.denoise_submit()? else {
             return Ok(None);
         };
@@ -239,7 +310,9 @@ impl<R: Runtime> Nl4dDenoiser<R> {
     /// For the last few frames the front end keeps its temporal window
     /// full by repeating the final pushed frame, exactly as
     /// [`NlmDenoiser::flush`] does. `sink` is called once per frame
-    /// produced, and the slice it receives is only valid for that call.
+    /// produced, and the frame it receives is only valid for that call.
+    /// It arrives in the [`OutputFormat`] this denoiser was built with,
+    /// quantised by the same pack kernel as every streaming frame.
     ///
     /// This drives [`NlmDenoiser::flush_step_machinery`] for
     /// [`Self::flush_target`] emissions, which is `2 * temporal_radius`
@@ -255,15 +328,20 @@ impl<R: Runtime> Nl4dDenoiser<R> {
     /// A call to [`NlmDenoiser::flush_step_machinery`] runs a pass
     /// whether or not it emits, so the loop below keeps calling it until
     /// enough passes have actually emitted.
-    pub fn flush(&mut self, mut sink: impl FnMut(&[f32])) -> Result<(), DenoiserError> {
+    pub fn flush(&mut self, mut sink: impl FnMut(&FrameOutput)) -> Result<(), DenoiserError> {
         let target = self.flush_target();
         let mut emitted = 0usize;
 
+        // Every output slot is free here. A caller reaches a flush only
+        // once its streaming readbacks have landed, and the readback
+        // below blocks, so no other readback is ever reading the slot
+        // this step is handed.
         while emitted < target {
             if let Some(view) = self.front.flush_step_machinery()?
-                && let Some(handle) = self.run_collab_stage(&view)?
+                && let Some((handle, slot)) = self.run_collab_stage(&view)?
             {
-                let pending = self.start_readback(handle);
+                let wire_dst = self.wire_outputs.as_ref().map(|w| &w[slot]);
+                let pending = self.start_readback(handle, wire_dst, self.output_format);
                 let frame = pending.wait()?;
                 sink(&frame);
                 emitted += 1;
@@ -310,7 +388,8 @@ impl<R: Runtime> Nl4dDenoiser<R> {
 
     /// Runs the grouping, filtering, and aggregation kernels for one
     /// pass, and returns the handle of whichever output slot the
-    /// completed frame landed in, once one has completed.
+    /// completed frame landed in along with that slot's index, once one
+    /// has completed.
     ///
     /// # Scheduling
     ///
@@ -348,7 +427,7 @@ impl<R: Runtime> Nl4dDenoiser<R> {
     /// returns `None` for the first `temporal_radius` passes of a
     /// stream, whose completed region is still short of contributions
     /// from passes that have not run yet.
-    fn run_collab_stage(&mut self, view: &RingView) -> Result<Option<Handle>, DenoiserError> {
+    fn run_collab_stage(&mut self, view: &RingView) -> Result<Option<(Handle, usize)>, DenoiserError> {
         // The frame-slot contract: `collab_fused`'s `centre_slot` and
         // the ring view's own centre must be the same physical slot, or
         // a member gets grouped against one frame and scattered as
@@ -542,15 +621,25 @@ impl<R: Runtime> Nl4dDenoiser<R> {
             );
         }
 
-        Ok(Some(self.outputs[slot].clone()))
+        Ok(Some((self.outputs[slot].clone(), slot)))
     }
 
     /// Starts an async readback of `handle`, wrapped in the same
     /// [`Pending`] type [`NlmDenoiser`] returns.
-    fn start_readback(&self, handle: Handle) -> Pending<R> {
-        let client = self.front.compute_client().clone();
-        let fut = Box::pin(async move { client.read_async(vec![handle]).await });
+    ///
+    /// `wire_dst` is the packed-word buffer belonging to the slot
+    /// `handle` came from, and is `None` for an `f32` readback.
+    fn start_readback(&self, handle: Handle, wire_dst: Option<&Handle>, format: OutputFormat) -> Pending<R> {
         let pixels = (self.width * self.height) as usize;
-        Pending::new(fut, self.channels.count(), self.channels.storage_count(), pixels)
+        start_readback(
+            self.front.compute_client(),
+            handle,
+            wire_dst,
+            self.channels.count(),
+            self.channels.storage_count(),
+            pixels,
+            format,
+        )
     }
+
 }

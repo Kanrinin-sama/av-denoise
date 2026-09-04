@@ -13,10 +13,12 @@ use crate::{
     DenoisingMode,
     Depth,
     Device,
+    FrameOutput,
     Nl4dOptions,
     NlmTuning,
     NlmeansHqOptions,
     NlmeansOptions,
+    OutputFormat,
     WindowSpan,
 };
 
@@ -28,10 +30,12 @@ pub enum Subsampling {
 }
 
 impl Subsampling {
+    /// Halved axes round up, so an odd dimension keeps the extra sample,
+    /// matching what y4m and ffmpeg do.
     pub fn chroma_dims(self, w: u32, h: u32) -> (u32, u32) {
         match self {
-            Subsampling::Yuv420 => (w / 2, h / 2),
-            Subsampling::Yuv422 => (w / 2, h),
+            Subsampling::Yuv420 => (w.div_ceil(2), h.div_ceil(2)),
+            Subsampling::Yuv422 => (w.div_ceil(2), h),
             Subsampling::Yuv444 => (w, h),
         }
     }
@@ -234,11 +238,14 @@ impl PlaneOptions {
         }
     }
 
-    fn denoiser_options(&self, channels: ChannelMode) -> DenoiserOptions {
+    /// `depth` is the source's wire depth, which every denoiser
+    /// quantises to on the GPU.
+    fn denoiser_options(&self, channels: ChannelMode, depth: Depth) -> DenoiserOptions {
         DenoiserOptions::builder()
             .channel_mode(channels)
             .mode(self.mode)
             .algorithm(self.algorithm_for(channels))
+            .output_format(OutputFormat::Wire { depth })
             .build()
     }
 }
@@ -280,6 +287,52 @@ pub fn push_needs_retry(result: Result<(), DenoiserError>) -> Result<bool, anyho
         Err(other) => Err(other.into()),
     }
 }
+
+/// Unwraps a denoised frame from one of the `Denoiser`s
+/// [`PlanarDenoiser`] builds.
+///
+/// Those are always built in [`crate::OutputFormat::Wire`], so the other
+/// variant never reaches here.
+fn expect_wire(out: FrameOutput) -> Vec<u8> {
+    out.into_wire()
+        .expect("PlanarDenoiser builds every Denoiser in wire output format")
+}
+
+/// Splits a fused YUV444 wire frame into its three planes.
+///
+/// The pack kernel leaves a three-channel frame interleaved, so this is
+/// the byte-level counterpart of the host converter it replaced. That one
+/// lives in `converter_tests` now, as the oracle this is checked against.
+fn split_yuv_wire(wire: &[u8], depth: Depth) -> Planes {
+    let bytes = depth.bytes_per_sample();
+    let pixels = wire.len() / (3 * bytes);
+
+    let mut y = Vec::with_capacity(pixels * bytes);
+    let mut u = Vec::with_capacity(pixels * bytes);
+    let mut v = Vec::with_capacity(pixels * bytes);
+
+    for pixel in wire.chunks_exact(3 * bytes) {
+        y.extend_from_slice(&pixel[..bytes]);
+        u.extend_from_slice(&pixel[bytes..2 * bytes]);
+        v.extend_from_slice(&pixel[2 * bytes..]);
+    }
+
+    Planes { y, u, v }
+}
+
+/// Splits a chroma wire frame into its U and V planes.
+///
+/// The pack kernel writes U's whole region first and V's after it, so
+/// each plane is one contiguous half of the buffer.
+fn split_uv_wire(wire: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let (u, v) = wire.split_at(wire.len() / 2);
+    (u.to_vec(), v.to_vec())
+}
+
+/// The push a [`PlanarDenoiser`] runs against each enabled half, either
+/// [`Denoiser::push_frame_wire`] or
+/// [`Denoiser::push_frame_wire_priming`].
+type WirePush = fn(&mut Denoiser, &[&[u8]], Depth) -> Result<(), DenoiserError>;
 
 /// Wraps the luma and chroma `Denoiser` instances needed for one
 /// subsampled YUV source.
@@ -341,7 +394,7 @@ impl PlanarDenoiser {
                     &opts.device,
                     layout.width,
                     layout.height,
-                    opts.denoiser_options(ChannelMode::Luma),
+                    opts.denoiser_options(ChannelMode::Luma, layout.depth),
                     luma_stream,
                 )
             })
@@ -354,7 +407,7 @@ impl PlanarDenoiser {
                     &opts.device,
                     chroma_w,
                     chroma_h,
-                    opts.denoiser_options(ChannelMode::Chroma),
+                    opts.denoiser_options(ChannelMode::Chroma, layout.depth),
                     chroma_stream,
                 )
             })
@@ -367,7 +420,7 @@ impl PlanarDenoiser {
                     &opts.device,
                     layout.width,
                     layout.height,
-                    opts.denoiser_options(ChannelMode::Yuv),
+                    opts.denoiser_options(ChannelMode::Yuv, layout.depth),
                     luma_stream,
                 )
             })
@@ -394,14 +447,6 @@ impl PlanarDenoiser {
         self.temporal_radius
     }
 
-    pub fn push_would_block(&self) -> bool {
-        self.yuv
-            .as_ref()
-            .or(self.luma.as_ref())
-            .or(self.chroma.as_ref())
-            .is_some_and(Denoiser::push_would_block)
-    }
-
     /// Pushes one planar frame.
     ///
     /// On `QueueFull` the caller should receive one frame and then retry
@@ -426,11 +471,11 @@ impl PlanarDenoiser {
     ///
     /// So the two halves always enter this function with the same frame
     /// count and the same pending depth, and the `QueueFull` check
-    /// inside `push_frame` answers the same way for each. If the luma
+    /// inside `push_frame_wire` answers the same way for each. If the luma
     /// push succeeds then the chroma push succeeds too, which makes the
     /// duplicate unreachable.
     pub fn push(&mut self, planes: &Planes) -> Result<(), DenoiserError> {
-        self.push_with(planes, Denoiser::push_frame)
+        self.push_with(planes, Denoiser::push_frame_wire)
     }
 
     /// Uploads one planar frame into the temporal window without starting
@@ -441,33 +486,31 @@ impl PlanarDenoiser {
     /// This is how [`Self::reseed`] fills the window from an explicit
     /// window of frames before the one real push that starts a denoise.
     fn push_priming(&mut self, planes: &Planes) -> Result<(), DenoiserError> {
-        self.push_with(planes, Denoiser::push_frame_priming)
+        self.push_with(planes, Denoiser::push_frame_wire_priming)
     }
 
     /// Shared body of [`Self::push`] and [`Self::push_priming`].
     ///
-    /// `push_frame` is [`Denoiser::push_frame`] for a real push or
-    /// [`Denoiser::push_frame_priming`] for a priming one, run against
-    /// whichever of `yuv`, `luma`, and `chroma` is enabled.
-    fn push_with(
-        &mut self,
-        planes: &Planes,
-        push_frame: fn(&mut Denoiser, &[f32]) -> Result<(), DenoiserError>,
-    ) -> Result<(), DenoiserError> {
+    /// `push_frame` is [`Denoiser::push_frame_wire`] for a real push or
+    /// [`Denoiser::push_frame_wire_priming`] for a priming one, run
+    /// against whichever of `yuv`, `luma`, and `chroma` is enabled.
+    ///
+    /// The planes go over as wire bytes, so the normalisation and the
+    /// channel interleave both happen on the GPU.
+    fn push_with(&mut self, planes: &Planes, push_frame: WirePush) -> Result<(), DenoiserError> {
+        let depth = self.layout.depth;
+
         if let Some(d) = self.yuv.as_mut() {
-            let buf = interleave_yuv_to_f32(&planes.y, &planes.u, &planes.v, self.layout.depth);
-            push_frame(d, &buf)?;
+            push_frame(d, &[&planes.y, &planes.u, &planes.v], depth)?;
             return Ok(());
         }
 
         if let Some(d) = self.luma.as_mut() {
-            let buf = plane_to_f32(&planes.y, self.layout.depth);
-            push_frame(d, &buf)?;
+            push_frame(d, &[&planes.y], depth)?;
         }
 
         if let Some(d) = self.chroma.as_mut() {
-            let buf = interleave_uv_to_f32(&planes.u, &planes.v, self.layout.depth);
-            push_frame(d, &buf)?;
+            push_frame(d, &[&planes.u, &planes.v], depth)?;
         }
 
         if self.luma.is_none() {
@@ -489,23 +532,26 @@ impl PlanarDenoiser {
     pub fn recv(&mut self) -> Result<Option<Planes>, anyhow::Error> {
         if let Some(d) = self.yuv.as_mut() {
             return match d.recv_frame()? {
-                Some(packed) => Ok(Some(unpack_yuv_from_f32(
-                    &packed,
-                    self.layout.luma_pixels(),
-                    self.layout.depth,
-                ))),
+                Some(packed) => Ok(Some(split_yuv_wire(&expect_wire(packed), self.layout.depth))),
                 None => Ok(None),
             };
         }
 
-        let luma_out = self.luma.as_mut().map(|d| d.recv_frame()).transpose()?.flatten();
+        let luma_out = self
+            .luma
+            .as_mut()
+            .map(|d| d.recv_frame())
+            .transpose()?
+            .flatten()
+            .map(expect_wire);
 
         let chroma_out = self
             .chroma
             .as_mut()
             .map(|d| d.recv_frame())
             .transpose()?
-            .flatten();
+            .flatten()
+            .map(expect_wire);
 
         // A disabled side has no Denoiser to query. When the enabled side
         // produced output, pop the matching source plane from the
@@ -536,23 +582,20 @@ impl PlanarDenoiser {
     /// `sink` is called once per emitted planar frame.
     pub fn flush(&mut self, mut sink: impl FnMut(Planes)) -> Result<(), anyhow::Error> {
         if let Some(d) = self.yuv.as_mut() {
-            let pixels = self.layout.luma_pixels();
             let depth = self.layout.depth;
-            d.flush(|packed| sink(unpack_yuv_from_f32(&packed, pixels, depth)))?;
+            d.flush(|packed| sink(split_yuv_wire(&expect_wire(packed), depth)))?;
             return Ok(());
         }
 
-        let chroma_pixels = self.layout.chroma_pixels();
-
-        let mut luma_buf: Vec<Vec<f32>> = Vec::new();
-        let mut chroma_buf: Vec<Vec<f32>> = Vec::new();
+        let mut luma_buf: Vec<Vec<u8>> = Vec::new();
+        let mut chroma_buf: Vec<Vec<u8>> = Vec::new();
 
         if let Some(d) = self.luma.as_mut() {
-            d.flush(|v| luma_buf.push(v))?;
+            d.flush(|v| luma_buf.push(expect_wire(v)))?;
         }
 
         if let Some(d) = self.chroma.as_mut() {
-            d.flush(|v| chroma_buf.push(v))?;
+            d.flush(|v| chroma_buf.push(expect_wire(v)))?;
         }
 
         // The two halves run in lockstep, so they flush the same number
@@ -562,8 +605,8 @@ impl PlanarDenoiser {
         let count = luma_buf.len().max(chroma_buf.len());
 
         for i in 0..count {
-            let y = if let Some(buf) = luma_buf.get(i) {
-                f32_to_plane(buf, self.layout.depth)
+            let y = if let Some(buf) = luma_buf.get_mut(i) {
+                std::mem::take(buf)
             } else if let Some(src) = self.luma_passthrough.pop_front() {
                 src
             } else {
@@ -571,7 +614,7 @@ impl PlanarDenoiser {
             };
 
             let (u, v) = if let Some(packed) = chroma_buf.get(i) {
-                unpack_uv_from_f32(packed, chroma_pixels, self.layout.depth)
+                split_uv_wire(packed)
             } else if let Some((src_u, src_v)) = self.chroma_passthrough.pop_front() {
                 (src_u, src_v)
             } else {
@@ -708,21 +751,19 @@ impl PlanarDenoiser {
 
     fn assemble(
         &self,
-        luma: Option<Vec<f32>>,
-        chroma: Option<Vec<f32>>,
+        luma: Option<Vec<u8>>,
+        chroma: Option<Vec<u8>>,
         luma_passthrough: Option<Vec<u8>>,
         chroma_passthrough: Option<(Vec<u8>, Vec<u8>)>,
     ) -> Planes {
-        let chroma_pixels = self.layout.chroma_pixels();
-
         let y = match (luma, luma_passthrough) {
-            (Some(v), _) => f32_to_plane(&v, self.layout.depth),
+            (Some(v), _) => v,
             (None, Some(src)) => src,
             (None, None) => self.layout.black_luma_plane(),
         };
 
         let (u, v) = match (chroma, chroma_passthrough) {
-            (Some(packed), _) => unpack_uv_from_f32(&packed, chroma_pixels, self.layout.depth),
+            (Some(packed), _) => split_uv_wire(&packed),
             (None, Some(src)) => src,
             (None, None) => (
                 self.layout.neutral_chroma_plane(),
@@ -786,6 +827,9 @@ fn quantise(v: f32, max: f32) -> u16 {
 }
 
 /// Converts one wire-byte plane to normalised f32.
+///
+/// `gpu_unpack_wire` does this on the device now. This host version is
+/// the oracle that kernel is checked against.
 pub fn plane_to_f32(plane: &[u8], depth: Depth) -> Vec<f32> {
     let max = depth.max_value();
 
@@ -822,6 +866,9 @@ pub fn f32_to_plane(plane: &[f32], depth: Depth) -> Vec<u8> {
 /// `[Y0, U0, V0, Y1, U1, V1, ...]` as f32 in `[0, 1]`.
 ///
 /// This is the layout the library's fused three-channel kernel expects.
+///
+/// `gpu_unpack_wire` does this on the device now. This host version is
+/// the oracle that kernel is checked against.
 pub fn interleave_yuv_to_f32(y: &[u8], u: &[u8], v: &[u8], depth: Depth) -> Vec<f32> {
     debug_assert_eq!(y.len(), u.len());
     debug_assert_eq!(u.len(), v.len());
@@ -830,13 +877,12 @@ pub fn interleave_yuv_to_f32(y: &[u8], u: &[u8], v: &[u8], depth: Depth) -> Vec<
 
     fn run<C: SampleCodec>(y: &[u8], u: &[u8], v: &[u8], max: f32) -> Vec<f32> {
         let pixels = y.len() / C::BYTES;
-        let mut out = vec![0.0; pixels * 3];
+        let mut out = Vec::with_capacity(pixels * 3);
 
         for i in 0..pixels {
-            let offset = i * 3;
-            out[offset] = C::read(y, i) as f32 / max;
-            out[offset + 1] = C::read(u, i) as f32 / max;
-            out[offset + 2] = C::read(v, i) as f32 / max;
+            out.push(C::read(y, i) as f32 / max);
+            out.push(C::read(u, i) as f32 / max);
+            out.push(C::read(v, i) as f32 / max);
         }
 
         out
@@ -848,34 +894,11 @@ pub fn interleave_yuv_to_f32(y: &[u8], u: &[u8], v: &[u8], depth: Depth) -> Vec<
     }
 }
 
-/// Reverse of [`interleave_yuv_to_f32`].
-pub fn unpack_yuv_from_f32(packed: &[f32], pixels: usize, depth: Depth) -> Planes {
-    debug_assert_eq!(packed.len(), 3 * pixels);
-
-    let max = depth.max_value();
-
-    fn run<C: SampleCodec>(packed: &[f32], pixels: usize, max: f32) -> Planes {
-        let mut y = vec![0u8; pixels * C::BYTES];
-        let mut u = vec![0u8; pixels * C::BYTES];
-        let mut v = vec![0u8; pixels * C::BYTES];
-
-        for (i, chunk) in packed.as_chunks::<3>().0.iter().enumerate() {
-            C::write(&mut y, i, quantise(chunk[0], max));
-            C::write(&mut u, i, quantise(chunk[1], max));
-            C::write(&mut v, i, quantise(chunk[2], max));
-        }
-
-        Planes { y, u, v }
-    }
-
-    match depth.bytes_per_sample() {
-        1 => run::<Narrow>(packed, pixels, max),
-        _ => run::<Wide>(packed, pixels, max),
-    }
-}
-
 /// Interleaves separate U and V planes into `[U, V, U, V, ...]` as f32
 /// in `[0, 1]`.
+///
+/// `gpu_unpack_wire` does this on the device now. This host version is
+/// the oracle that kernel is checked against.
 pub fn interleave_uv_to_f32(u: &[u8], v: &[u8], depth: Depth) -> Vec<f32> {
     debug_assert_eq!(u.len(), v.len());
 
@@ -883,12 +906,11 @@ pub fn interleave_uv_to_f32(u: &[u8], v: &[u8], depth: Depth) -> Vec<f32> {
 
     fn run<C: SampleCodec>(u: &[u8], v: &[u8], max: f32) -> Vec<f32> {
         let pixels = u.len() / C::BYTES;
-        let mut out = vec![0.0; pixels * 2];
+        let mut out = Vec::with_capacity(pixels * 2);
 
         for i in 0..pixels {
-            let offset = i * 2;
-            out[offset] = C::read(u, i) as f32 / max;
-            out[offset + 1] = C::read(v, i) as f32 / max;
+            out.push(C::read(u, i) as f32 / max);
+            out.push(C::read(v, i) as f32 / max);
         }
 
         out

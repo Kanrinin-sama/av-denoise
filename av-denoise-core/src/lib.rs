@@ -16,13 +16,16 @@ pub mod nl4d;
 pub mod nlmeans;
 mod probe;
 pub mod sniff;
+pub mod stack;
 pub mod warmup;
 
 pub use cache::{
     COMPILATION_CACHE_ENV,
-    CacheAlreadyInitialisedError,
+    CacheError,
     compilation_cache_dir,
+    default_cache_dir,
     install_compilation_cache,
+    install_compilation_cache_at,
     install_compilation_cache_once,
 };
 pub use denoiser::{
@@ -31,12 +34,14 @@ pub use denoiser::{
     DenoiserError,
     DenoiserOptions,
     DenoisingMode,
+    FrameOutput,
     MAX_PENDING,
     Nl4dOptions,
     NlmTuning,
     NlmeansHqOptions,
     NlmeansOptions,
     NlmeansVariant,
+    OutputFormat,
     Preset,
     WindowSpan,
     nl4d_default_lambda_ht,
@@ -66,8 +71,10 @@ pub use nlmeans::{
     MotionSearch,
     PrefilterMode,
     UnsupportedDepthError,
+    WirePack,
     denormalize,
     normalize,
     parse_prefilter,
 };
+pub use stack::{CODEGEN_STACK_BYTES, codegen_stack_is_sufficient, raise_codegen_stack_limit};
 pub use warmup::{WarmUp, kernel_key};

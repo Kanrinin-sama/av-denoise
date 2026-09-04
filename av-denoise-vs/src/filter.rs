@@ -17,23 +17,6 @@ use vapoursynth::video_info::{Resolution, VideoInfo};
 use crate::frames::{pack_plane, unpack_plane_into, window_indices};
 use crate::params::{AlgorithmKind, RawFormat, RawParams, layout_from_format, plane_options_from};
 
-/// Raises the stack size cubecl's kernel codegen thread inherits.
-///
-/// Codegen unrolls the windowed NLM kernel body `(2R+1)^2` times, which
-/// overflows the default 2 MiB stack at a search radius of 5 or more and
-/// aborts the host process. `export_vapoursynth_plugin!` expands to the
-/// whole body of the plugin's entry point, so there is no earlier hook of
-/// ours to set this in. Setting it as the first statement of the shared
-/// filter-creation function is early enough: cubecl only spawns its
-/// codegen thread once a denoiser is created, later in this same function.
-pub(crate) fn raise_stack_limit() {
-    if std::env::var_os("RUST_MIN_STACK").is_none() {
-        // SAFETY: called before any denoiser thread spawns, and before any
-        // other thread in this process could be reading the environment.
-        unsafe { std::env::set_var("RUST_MIN_STACK", "16777216") };
-    }
-}
-
 /// The running pipeline and the output frame it last produced.
 ///
 /// VapourSynth may call `get_frame` from several threads, so the
@@ -105,7 +88,14 @@ impl<'core> Denoise<'core> {
         algorithm_kind: AlgorithmKind,
         raw: &RawParams,
     ) -> Result<Self, Error> {
-        raise_stack_limit();
+        // `export_vapoursynth_plugin!` expands to the whole body of the
+        // plugin's entry point, so there is no earlier hook of ours to
+        // raise the stack limit in.
+        // SAFETY: best-effort mutation at the earliest hook this plugin
+        // gets. The host may already have other threads touching the
+        // environment, so this cannot guarantee exclusive access, but the
+        // alternative is a hard abort during codegen.
+        unsafe { av_denoise_core::raise_codegen_stack_limit() };
 
         let info = source.info();
 
@@ -178,23 +168,19 @@ impl<'core> Denoise<'core> {
     /// including frame 0, abandons the stream and rebuilds it from an
     /// explicit window, which costs more but is correct from any
     /// starting point.
-    ///
-    /// The fast path can still fall through to a rebuild: `recv` returns
-    /// `None` when the stream has not yet primed enough history to emit,
-    /// which happens right after a `reseed` landed the pipeline on a
-    /// frame within `span.behind` of the clip's start. Falling back to
-    /// the window rebuild handles that case correctly instead of
-    /// surfacing an error or a blank frame.
-    ///
-    /// The one frame this pushes is `n + span.ahead`: the pipeline is
-    /// already positioned to complete output frame `n` once its own
-    /// window reaches that far ahead, the same relationship
-    /// [`Self::window`] uses to build a whole window from scratch.
     fn render(&self, n: usize, fetch: impl Fn(usize) -> Result<Planes, Error>) -> Result<Planes, Error> {
         let mut state = self.state.lock().expect("denoiser mutex poisoned");
         let last_frame = self.source_len - 1;
 
-        if state.last == Some(n.wrapping_sub(1)) && n > 0 {
+        // Read the anchor, then clear it before anything touches the pipeline.
+        //
+        // Every path below either reaches a `state.last = Some(n)` or leaves through `?`,
+        // so an error out of `fetch`, `push`, `recv`, or `reseed` can never leave the
+        // anchor claiming a position the stream has moved past.
+        let sequential = state.last == Some(n.wrapping_sub(1)) && n > 0;
+        state.last = None;
+
+        if sequential {
             let ahead = (n + self.span.ahead).min(last_frame);
             state.denoiser.push(&fetch(ahead)?)?;
             if let Some(out) = state.denoiser.recv()? {

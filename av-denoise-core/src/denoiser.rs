@@ -9,6 +9,7 @@ use crate::device::Device;
 use crate::nl4d::{Nl4dDenoiser, Nl4dParams};
 use crate::nlmeans::{
     ChannelMode,
+    Depth,
     HqParams,
     MotionCompensationMode,
     MotionSearch,
@@ -16,6 +17,7 @@ use crate::nlmeans::{
     NlmParams,
     Pending,
     PrefilterMode,
+    TryWait,
     hq_default_strength,
     validate_dimensions,
 };
@@ -41,6 +43,69 @@ pub struct DenoiserOptions {
     /// algorithm reads.
     #[builder(default)]
     pub algorithm: Algorithm,
+    /// What format denoised frames come back in.
+    #[builder(default = OutputFormat::F32)]
+    pub output_format: OutputFormat,
+}
+
+/// What a denoiser hands back from [`Denoiser::recv_frame`],
+/// [`Denoiser::try_recv_frame`] and [`Denoiser::flush`].
+///
+/// The GPU only ever holds normalised `f32`. [`Depth`] is a wire concept,
+/// so a denoiser that returns wire bytes is told its depth when it is
+/// built rather than at each call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// Normalised `f32`, one value per channel per pixel.
+    F32,
+    /// Wire bytes at this depth, quantised on the GPU.
+    Wire { depth: Depth },
+}
+
+/// One denoised frame, in whichever format its denoiser was built for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FrameOutput {
+    /// Normalised `f32`, `width * height * channels` values.
+    F32(Vec<f32>),
+    /// Wire bytes, interleaved except for a chroma pair, which is laid
+    /// out as U's whole region followed by V's.
+    Wire(Vec<u8>),
+}
+
+impl FrameOutput {
+    /// The `f32` frame, or `None` if this came from a wire-mode denoiser.
+    pub fn into_f32(self) -> Option<Vec<f32>> {
+        match self {
+            Self::F32(v) => Some(v),
+            Self::Wire(_) => None,
+        }
+    }
+
+    /// The wire bytes, or `None` if this came from an `f32`-mode denoiser.
+    pub fn into_wire(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Wire(v) => Some(v),
+            Self::F32(_) => None,
+        }
+    }
+
+    /// Borrows the `f32` frame, or `None` if this came from a wire-mode
+    /// denoiser.
+    pub fn as_f32(&self) -> Option<&[f32]> {
+        match self {
+            Self::F32(v) => Some(v),
+            Self::Wire(_) => None,
+        }
+    }
+
+    /// Borrows the wire bytes, or `None` if this came from an `f32`-mode
+    /// denoiser.
+    pub fn as_wire(&self) -> Option<&[u8]> {
+        match self {
+            Self::Wire(v) => Some(v),
+            Self::F32(_) => None,
+        }
+    }
 }
 
 /// Which denoising algorithm to run.
@@ -413,6 +478,9 @@ impl DenoiserOptions {
     /// Whichever default `strength` applies is folded in here. For the
     /// HQ algorithm that comes from
     /// [`crate::nlmeans::hq_default_strength`].
+    ///
+    /// This is public so callers building per-plane options, and tests,
+    /// can read the resolved values without building a real `Denoiser`.
     #[doc(hidden)]
     pub fn to_nlm_params(&self) -> NlmParams {
         let temporal_radius = match self.mode {
@@ -484,6 +552,12 @@ pub enum DenoiserError {
     /// then retry the same `push_frame` call.
     #[error("denoiser queue is full, collect the pending frame before pushing more")]
     QueueFull,
+    /// An earlier call failed, so how many frames are in flight is no
+    /// longer known and later output would not line up with its input.
+    ///
+    /// Call [`Denoiser::reset_stream`] to start a fresh stream, or drop the denoiser.
+    #[error("denoiser failed earlier, reset the stream before using it again")]
+    Poisoned,
     /// None of the accelerators in the priority list could be started.
     #[error("no accelerator from the priority list is available")]
     NoAcceleratorAvailable,
@@ -515,6 +589,13 @@ impl<R: Runtime> Engine<R> {
         }
     }
 
+    fn push_frame_wire(&mut self, planes: &[&[u8]], depth: Depth) {
+        match self {
+            Self::Nlm(d) => d.push_frame_wire(planes, depth),
+            Self::Nl4d(d) => d.push_frame_wire(planes, depth),
+        }
+    }
+
     fn denoise_submit(&mut self) -> Result<Option<Pending<R>>, anyhow::Error> {
         match self {
             Self::Nlm(d) => d.denoise_submit(),
@@ -526,7 +607,7 @@ impl<R: Runtime> Engine<R> {
         }
     }
 
-    fn flush(&mut self, sink: impl FnMut(&[f32])) -> Result<(), anyhow::Error> {
+    fn flush(&mut self, sink: impl FnMut(&FrameOutput)) -> Result<(), anyhow::Error> {
         match self {
             Self::Nlm(d) => d.flush(sink),
             Self::Nl4d(d) => d.flush(sink).map_err(anyhow::Error::from),
@@ -556,6 +637,7 @@ fn build_engine<R: Runtime>(
     params: NlmParams,
     width: u32,
     height: u32,
+    output_format: OutputFormat,
 ) -> Result<Engine<R>, DenoiserError> {
     match algorithm {
         Algorithm::Nl4d(opts) => {
@@ -580,13 +662,14 @@ fn build_engine<R: Runtime>(
                 mismatch_scale: opts.mismatch_scale,
                 confidence_variance: opts.confidence_variance,
             };
-            let denoiser = Nl4dDenoiser::new(client, nl4d_params, width, height)
-                .map_err(|e| DenoiserError::Other(anyhow::anyhow!(e)))?;
+            let denoiser =
+                Nl4dDenoiser::with_output_format(client, nl4d_params, width, height, output_format)
+                    .map_err(|e| DenoiserError::Other(anyhow::anyhow!(e)))?;
             Ok(Engine::Nl4d(Box::new(denoiser)))
         },
-        Algorithm::Nlmeans(_) | Algorithm::NlmeansHq(_) => Ok(Engine::Nlm(Box::new(NlmDenoiser::new(
-            client, params, width, height,
-        )))),
+        Algorithm::Nlmeans(_) | Algorithm::NlmeansHq(_) => Ok(Engine::Nlm(Box::new(
+            NlmDenoiser::with_output_format(client, params, width, height, output_format),
+        ))),
     }
 }
 
@@ -610,6 +693,7 @@ impl Backend {
             Self::Wgpu(e) => e.is_nl4d(),
         }
     }
+
 }
 
 enum BackendPending {
@@ -622,7 +706,7 @@ enum BackendPending {
 }
 
 impl BackendPending {
-    fn wait(self) -> Result<Vec<f32>, anyhow::Error> {
+    fn wait(self) -> Result<FrameOutput, anyhow::Error> {
         match self {
             #[cfg(feature = "cuda")]
             Self::Cuda(p) => p.wait(),
@@ -630,6 +714,28 @@ impl BackendPending {
             Self::Rocm(p) => p.wait(),
             #[cfg(any(feature = "vulkan", feature = "metal"))]
             Self::Wgpu(p) => p.wait(),
+        }
+    }
+
+    /// Polls the readback once. `Ok(Ok(frame))` is a landed frame,
+    /// `Ok(Err(self))` is a readback still in flight.
+    fn try_wait(self) -> Result<Result<FrameOutput, Self>, anyhow::Error> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(p) => match p.try_wait()? {
+                TryWait::Ready(frame) => Ok(Ok(frame)),
+                TryWait::NotReady(p) => Ok(Err(Self::Cuda(p))),
+            },
+            #[cfg(feature = "rocm")]
+            Self::Rocm(p) => match p.try_wait()? {
+                TryWait::Ready(frame) => Ok(Ok(frame)),
+                TryWait::NotReady(p) => Ok(Err(Self::Rocm(p))),
+            },
+            #[cfg(any(feature = "vulkan", feature = "metal"))]
+            Self::Wgpu(p) => match p.try_wait()? {
+                TryWait::Ready(frame) => Ok(Ok(frame)),
+                TryWait::NotReady(p) => Ok(Err(Self::Wgpu(p))),
+            },
         }
     }
 }
@@ -677,17 +783,62 @@ impl WindowSpan {
 /// At the end of the stream call [`flush`](Self::flush) to drain
 /// whatever temporal context is left.
 ///
-/// Frames are `f32` values in `[0, 1]`, laid out as
-/// `width * height * channels`.
+/// Input frames are `f32` values in `[0, 1]`, laid out as
+/// `width * height * channels`. Output comes back as a [`FrameOutput`]
+/// in whichever [`OutputFormat`] the options named.
+///
+/// ```no_run
+/// use av_denoise_core::accelerate::Accelerator;
+/// use av_denoise_core::{ChannelMode, Denoiser, DenoiserOptions, DenoisingMode, Device};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let options = DenoiserOptions::builder()
+///     .channel_mode(ChannelMode::Luma)
+///     .mode(DenoisingMode::Temporal { radius: 2 })
+///     .build();
+///
+/// let mut denoiser = Denoiser::create(
+///     &[Accelerator::Vulkan],
+///     &Device::Default,
+///     1920,
+///     1080,
+///     options,
+/// )?;
+///
+/// let frames: Vec<Vec<f32>> = read_my_frames();
+/// let mut cleaned: Vec<Vec<f32>> = Vec::new();
+///
+/// for frame in &frames {
+///     denoiser.push_frame(frame)?;
+///
+///     // Temporal denoising runs a few frames behind the input, so
+///     // there is not always one ready to collect.
+///     if let Some(out) = denoiser.recv_frame()? {
+///         cleaned.push(out.into_f32().expect("built for f32 output"));
+///     }
+/// }
+///
+/// // Drain the frames still inside the temporal window.
+/// denoiser.flush(|out| cleaned.push(out.into_f32().expect("built for f32 output")))?;
+/// # Ok(())
+/// # }
+/// # fn read_my_frames() -> Vec<Vec<f32>> { Vec::new() }
+/// ```
 pub struct Denoiser {
     backend: Backend,
     pending: VecDeque<BackendPending>,
     accelerator: Accelerator,
     width: u32,
     height: u32,
-    channels: u32,
     temporal_radius: u32,
+    output_format: OutputFormat,
     frames_pushed: u32,
+    /// Set once any call other than a `QueueFull` push has failed, so how
+    /// many frames are in flight is no longer known.
+    ///
+    /// Every entry point refuses to run while this is set.
+    /// [`Self::reset_stream`] clears it.
+    poisoned: bool,
 }
 
 impl Denoiser {
@@ -707,8 +858,8 @@ impl Denoiser {
     /// `(2 * search_radius + 1)^2` times, so a `search_radius` of about
     /// 5 or more can overflow the 2 MiB default and abort the process.
     ///
-    /// Callers using a `search_radius` above 4 should set
-    /// `RUST_MIN_STACK` to at least 16 MiB before any cubecl thread
+    /// Callers using a `search_radius` above 4 should call
+    /// [`crate::raise_codegen_stack_limit`] before any cubecl thread
     /// spawns, usually right at the top of `main`.
     pub fn create(
         accelerators: &[Accelerator],
@@ -735,7 +886,6 @@ impl Denoiser {
         params.validate()?;
         validate_dimensions(width, height)?;
 
-        let channels = params.channels.count();
         let temporal_radius = params.temporal_radius;
         let backend = build_backend(
             accelerator,
@@ -744,6 +894,7 @@ impl Denoiser {
             params,
             width,
             height,
+            options.output_format,
             stream_id,
         )?;
 
@@ -753,9 +904,10 @@ impl Denoiser {
             accelerator,
             width,
             height,
-            channels,
             temporal_radius,
+            output_format: options.output_format,
             frames_pushed: 0,
+            poisoned: false,
         })
     }
 
@@ -777,6 +929,11 @@ impl Denoiser {
     /// The temporal radius the resolved parameters run at.
     pub fn temporal_radius(&self) -> u32 {
         self.temporal_radius
+    }
+
+    /// The format every collected frame comes back in.
+    pub fn output_format(&self) -> OutputFormat {
+        self.output_format
     }
 
     /// How many frames behind and ahead of a target frame this
@@ -809,10 +966,6 @@ impl Denoiser {
         }
     }
 
-    pub fn push_would_block(&self) -> bool {
-        self.frames_pushed > self.temporal_radius && self.pending.len() >= MAX_PENDING
-    }
-
     /// Uploads one frame into the temporal window.
     ///
     /// `frame` holds `width * height * channels` `f32` values in
@@ -826,11 +979,28 @@ impl Denoiser {
     /// still travelling. At that ceiling this returns
     /// [`DenoiserError::QueueFull`], and the caller has to drain a frame
     /// with [`Self::recv_frame`] before pushing more.
+    ///
+    /// Any other failure poisons the denoiser, so every further call
+    /// returns [`DenoiserError::Poisoned`] until [`Self::reset_stream`]
+    /// clears it. `QueueFull` does not poison, since it is the documented
+    /// retry signal above.
     pub fn push_frame(&mut self, frame: &[f32]) -> Result<(), DenoiserError> {
+        if self.poisoned {
+            return Err(DenoiserError::Poisoned);
+        }
+        self.push_frame_inner(frame).inspect_err(|err| {
+            if !matches!(err, DenoiserError::QueueFull) {
+                self.poisoned = true;
+            }
+        })
+    }
+
+    fn push_frame_inner(&mut self, frame: &[f32]) -> Result<(), DenoiserError> {
         // After `temporal_radius` real pushes the leading-edge mirror
         // has primed the window, so the next push produces a pending
         // frame. From then on every push takes a pending slot.
-        if self.push_would_block() {
+        let window_full = self.frames_pushed > self.temporal_radius;
+        if window_full && self.pending.len() >= MAX_PENDING {
             return Err(DenoiserError::QueueFull);
         }
 
@@ -862,6 +1032,81 @@ impl Denoiser {
         Ok(())
     }
 
+    /// Uploads one frame held as wire bytes into the temporal window.
+    ///
+    /// `planes` holds one `width * height` plane per channel at `depth`,
+    /// which the GPU normalises and interleaves. The planes run Y, U, V
+    /// for a fused frame and U, V for a chroma pair.
+    ///
+    /// Queueing, poisoning, and the `QueueFull` retry signal work exactly
+    /// as they do for [`Self::push_frame`].
+    pub fn push_frame_wire(&mut self, planes: &[&[u8]], depth: Depth) -> Result<(), DenoiserError> {
+        if self.poisoned {
+            return Err(DenoiserError::Poisoned);
+        }
+        self.push_frame_wire_inner(planes, depth).inspect_err(|err| {
+            if !matches!(err, DenoiserError::QueueFull) {
+                self.poisoned = true;
+            }
+        })
+    }
+
+    fn push_frame_wire_inner(&mut self, planes: &[&[u8]], depth: Depth) -> Result<(), DenoiserError> {
+        // The same window accounting `push_frame_inner` does.
+        let window_full = self.frames_pushed > self.temporal_radius;
+        if window_full && self.pending.len() >= MAX_PENDING {
+            return Err(DenoiserError::QueueFull);
+        }
+
+        match &mut self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda(d) => {
+                d.push_frame_wire(planes, depth);
+                if let Some(p) = d.denoise_submit()? {
+                    self.pending.push_back(BackendPending::Cuda(p));
+                }
+            },
+            #[cfg(feature = "rocm")]
+            Backend::Rocm(d) => {
+                d.push_frame_wire(planes, depth);
+                if let Some(p) = d.denoise_submit()? {
+                    self.pending.push_back(BackendPending::Rocm(p));
+                }
+            },
+            #[cfg(any(feature = "vulkan", feature = "metal"))]
+            Backend::Wgpu(d) => {
+                d.push_frame_wire(planes, depth);
+                if let Some(p) = d.denoise_submit()? {
+                    self.pending.push_back(BackendPending::Wgpu(p));
+                }
+            },
+        }
+
+        self.frames_pushed = self.frames_pushed.saturating_add(1);
+        Ok(())
+    }
+
+    /// Uploads one frame held as wire bytes into the temporal window
+    /// without starting a denoise.
+    ///
+    /// The wire counterpart of [`Self::push_frame_priming`].
+    pub fn push_frame_wire_priming(&mut self, planes: &[&[u8]], depth: Depth) -> Result<(), DenoiserError> {
+        if self.poisoned {
+            return Err(DenoiserError::Poisoned);
+        }
+        match &mut self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda(d) => d.push_frame_wire(planes, depth),
+            #[cfg(feature = "rocm")]
+            Backend::Rocm(d) => d.push_frame_wire(planes, depth),
+            #[cfg(any(feature = "vulkan", feature = "metal"))]
+            Backend::Wgpu(d) => d.push_frame_wire(planes, depth),
+        }
+
+        self.frames_pushed = self.frames_pushed.saturating_add(1);
+        Ok(())
+    }
+
     /// Uploads one frame into the temporal window without starting a
     /// denoise.
     ///
@@ -870,7 +1115,13 @@ impl Denoiser {
     /// output is queued. This is how a caller that can hand over a whole
     /// window at once, rather than a strictly ordered stream, fills the
     /// window in one go and lets only the last push in it submit.
+    ///
+    /// A failure elsewhere poisons the denoiser, so this refuses to run
+    /// until [`Self::reset_stream`] clears it.
     pub fn push_frame_priming(&mut self, frame: &[f32]) -> Result<(), DenoiserError> {
+        if self.poisoned {
+            return Err(DenoiserError::Poisoned);
+        }
         match &mut self.backend {
             #[cfg(feature = "cuda")]
             Backend::Cuda(d) => d.push_frame(frame),
@@ -887,10 +1138,13 @@ impl Denoiser {
     /// Drops the current stream and returns to the state a fresh
     /// denoiser starts in, keeping every GPU allocation.
     ///
-    /// Anything still in flight is discarded.
+    /// Anything still in flight is discarded. This also clears the
+    /// poison an earlier failure left, so it is the recovery path for
+    /// [`DenoiserError::Poisoned`].
     pub fn reset_stream(&mut self) {
         self.pending.clear();
         self.frames_pushed = 0;
+        self.poisoned = false;
 
         match &mut self.backend {
             #[cfg(feature = "cuda")]
@@ -907,20 +1161,56 @@ impl Denoiser {
     ///
     /// Returns `Ok(None)` when nothing is in flight, which happens while
     /// the temporal window is still filling up.
-    pub fn recv_frame(&mut self) -> Result<Option<Vec<f32>>, DenoiserError> {
+    ///
+    /// A failure poisons the denoiser, so every further call returns
+    /// [`DenoiserError::Poisoned`] until [`Self::reset_stream`] clears it.
+    pub fn recv_frame(&mut self) -> Result<Option<FrameOutput>, DenoiserError> {
+        if self.poisoned {
+            return Err(DenoiserError::Poisoned);
+        }
+        self.recv_frame_inner().inspect_err(|_| self.poisoned = true)
+    }
+
+    fn recv_frame_inner(&mut self) -> Result<Option<FrameOutput>, DenoiserError> {
         let Some(pending) = self.pending.pop_front() else {
             return Ok(None);
         };
         Ok(Some(pending.wait()?))
     }
 
-    /// Collects the in-flight denoise if one is ready.
+    /// Polls the in-flight denoise once.
     ///
-    /// This can still block for a moment while the runtime confirms the
-    /// readback has landed. When the kernels have already finished the
-    /// wait is effectively nothing.
-    pub fn try_recv_frame(&mut self) -> Result<Option<Vec<f32>>, DenoiserError> {
-        self.recv_frame()
+    /// Returns `Ok(None)` both when nothing is in flight and when the in-flight readback
+    /// has not landed yet, so `None` alone does not tell those two cases apart.
+    ///
+    /// A caller that needs the frame rather than just checking on it should
+    /// use [`Self::recv_frame`] instead.
+    ///
+    /// This only avoids blocking on the wgpu backends, meaning Vulkan and Metal.
+    /// On CUDA and ROCm the readback completes synchronously on its first poll,
+    /// so this call blocks until the readback lands there, the same as `recv_frame`.
+    ///
+    /// A failure poisons the denoiser, so every further call returns
+    /// [`DenoiserError::Poisoned`] until [`Self::reset_stream`] clears it.
+    pub fn try_recv_frame(&mut self) -> Result<Option<FrameOutput>, DenoiserError> {
+        if self.poisoned {
+            return Err(DenoiserError::Poisoned);
+        }
+        self.try_recv_frame_inner().inspect_err(|_| self.poisoned = true)
+    }
+
+    fn try_recv_frame_inner(&mut self) -> Result<Option<FrameOutput>, DenoiserError> {
+        let Some(pending) = self.pending.pop_front() else {
+            return Ok(None);
+        };
+
+        match pending.try_wait()? {
+            Ok(frame) => Ok(Some(frame)),
+            Err(pending) => {
+                self.pending.push_front(pending);
+                Ok(None)
+            },
+        }
     }
 
     /// Drains the in-flight frames and the trailing temporal tail,
@@ -933,38 +1223,34 @@ impl Denoiser {
     /// a new temporal window from scratch, and flushing more than once
     /// is fine.
     ///
-    /// If `flush` returns `Err` the denoiser is in an undefined state
-    /// and should be dropped rather than reused.
-    pub fn flush(&mut self, mut sink: impl FnMut(Vec<f32>)) -> Result<(), DenoiserError> {
+    /// A failure poisons the denoiser, so every further call returns
+    /// [`DenoiserError::Poisoned`] until [`Self::reset_stream`] clears it.
+    pub fn flush(&mut self, sink: impl FnMut(FrameOutput)) -> Result<(), DenoiserError> {
+        if self.poisoned {
+            return Err(DenoiserError::Poisoned);
+        }
+        self.flush_inner(sink).inspect_err(|_| self.poisoned = true)
+    }
+
+    fn flush_inner(&mut self, mut sink: impl FnMut(FrameOutput)) -> Result<(), DenoiserError> {
         // Drain the whole pending pipeline, up to MAX_PENDING frames,
-        // before submitting the trailing-tail mirrors.
-        while let Some(frame) = self.recv_frame()? {
+        // before submitting the trailing-tail mirrors. This also leaves
+        // every output slot free, so the tail's own readbacks cannot be
+        // handed a slot a streaming readback is still reading.
+        while let Some(frame) = self.recv_frame_inner()? {
             sink(frame);
         }
 
-        let pixels = (self.width * self.height) as usize;
-        let channels = self.channels as usize;
-        let scratch_cap = pixels * channels;
-
+        // The tail frames come back through each algorithm's own
+        // blocking readback, in the same format as every streaming
+        // frame, so they are quantised by the same pack kernel.
         match &mut self.backend {
             #[cfg(feature = "cuda")]
-            Backend::Cuda(d) => d.flush(|slice| {
-                let mut v = Vec::with_capacity(scratch_cap);
-                v.extend_from_slice(slice);
-                sink(v);
-            })?,
+            Backend::Cuda(d) => d.flush(|frame| sink(frame.clone()))?,
             #[cfg(feature = "rocm")]
-            Backend::Rocm(d) => d.flush(|slice| {
-                let mut v = Vec::with_capacity(scratch_cap);
-                v.extend_from_slice(slice);
-                sink(v);
-            })?,
+            Backend::Rocm(d) => d.flush(|frame| sink(frame.clone()))?,
             #[cfg(any(feature = "vulkan", feature = "metal"))]
-            Backend::Wgpu(d) => d.flush(|slice| {
-                let mut v = Vec::with_capacity(scratch_cap);
-                v.extend_from_slice(slice);
-                sink(v);
-            })?,
+            Backend::Wgpu(d) => d.flush(|frame| sink(frame.clone()))?,
         }
 
         // The backend has already reset its own stream indices. Reset
@@ -974,6 +1260,7 @@ impl Denoiser {
 
         Ok(())
     }
+
 }
 
 fn build_backend(
@@ -983,6 +1270,7 @@ fn build_backend(
     params: NlmParams,
     width: u32,
     height: u32,
+    output_format: OutputFormat,
     stream_id: StreamId,
 ) -> Result<Backend, DenoiserError> {
     match accel {
@@ -991,7 +1279,12 @@ fn build_backend(
             let dev = device.to_cuda()?;
             let client = client_on_stream::<cubecl::cuda::CudaRuntime>(&dev, stream_id);
             Ok(Backend::Cuda(build_engine(
-                &client, algorithm, params, width, height,
+                &client,
+                algorithm,
+                params,
+                width,
+                height,
+                output_format,
             )?))
         },
         #[cfg(feature = "rocm")]
@@ -999,7 +1292,12 @@ fn build_backend(
             let dev = device.to_amd()?;
             let client = client_on_stream::<cubecl::hip::HipRuntime>(&dev, stream_id);
             Ok(Backend::Rocm(build_engine(
-                &client, algorithm, params, width, height,
+                &client,
+                algorithm,
+                params,
+                width,
+                height,
+                output_format,
             )?))
         },
         #[cfg(feature = "vulkan")]
@@ -1007,7 +1305,12 @@ fn build_backend(
             let dev = device.to_wgpu()?;
             let client = client_on_stream::<cubecl::wgpu::WgpuRuntime>(&dev, stream_id);
             Ok(Backend::Wgpu(build_engine(
-                &client, algorithm, params, width, height,
+                &client,
+                algorithm,
+                params,
+                width,
+                height,
+                output_format,
             )?))
         },
         #[cfg(feature = "metal")]
@@ -1015,14 +1318,22 @@ fn build_backend(
             let dev = device.to_wgpu()?;
             let client = client_on_stream::<cubecl::wgpu::WgpuRuntime>(&dev, stream_id);
             Ok(Backend::Wgpu(build_engine(
-                &client, algorithm, params, width, height,
+                &client,
+                algorithm,
+                params,
+                width,
+                height,
+                output_format,
             )?))
         },
         // Keeps the match exhaustive on docs.rs, where `cfg(docsrs)`
         // widens the `Accelerator` enum to include variants whose
         // backend feature is not enabled. Never reached at runtime.
         #[cfg(docsrs)]
-        #[allow(unreachable_patterns)]
+        #[expect(
+            unreachable_patterns,
+            reason = "the arm only keeps the match exhaustive on docs.rs"
+        )]
         _ => unreachable!(),
     }
 }
