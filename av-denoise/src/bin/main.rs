@@ -95,6 +95,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     let (opts, input, workers, frame_budget) = match &args.command {
+        Command::Nlmeans(nlm) => (
+            nlm.build_options(&args)?,
+            &nlm.common.input,
+            nlm.common.workers,
+            nlm.common.frame_budget,
+        ),
         Command::Nl4d(nl4d) => (
             nl4d.build_options(&args)?,
             &nl4d.common.input,

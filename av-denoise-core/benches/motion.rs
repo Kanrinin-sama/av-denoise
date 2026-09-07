@@ -12,7 +12,11 @@ use av_denoise_core::nlmeans::{
 };
 use cubecl::prelude::*;
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "the shared kernel module is included by several bench binaries, each of which uses \
+              only part of it"
+)]
 #[path = "kernels/mod.rs"]
 mod kernels;
 
@@ -21,6 +25,7 @@ use kernels::mc_block_match_fine::BlockMatchFineBench;
 use kernels::mc_confidence::McConfidenceBench;
 use kernels::mc_downscale::DownscaleBench;
 use kernels::mc_warp::WarpBench;
+use kernels::mv_regularise::MvRegulariseBench;
 use kernels::{CHANNELS, print_header, run};
 
 const W: u32 = 1920;
@@ -157,7 +162,12 @@ fn bench_eager<R: Runtime>(
 
     run_pipeline_bench(&name, backend, client, WARMUP_PIPELINE, ITERS_PIPELINE, || {
         denoiser.push_frame(&frame);
-        let result = denoiser.denoise().unwrap().unwrap();
+        let result = denoiser
+            .denoise()
+            .unwrap()
+            .unwrap()
+            .as_f32()
+            .expect("f32 denoiser");
         black_box(&result);
     })
 }
@@ -218,6 +228,9 @@ fn run_kernels<R: Runtime>(backend: &str, client: &ComputeClient<R>) {
         client: client.clone(),
     });
     run(McConfidenceBench {
+        client: client.clone(),
+    });
+    run(MvRegulariseBench {
         client: client.clone(),
     });
     for &(ch, ch_name) in CHANNELS {

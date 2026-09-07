@@ -11,10 +11,12 @@ use av_denoise_core::collab::kernels::aggregate::{
     collab_normalise,
     collab_zero_accum,
     cross_frame_accum_scale,
+    kaiser_window,
     weight_scale,
 };
 use av_denoise_core::collab::kernels::fused::collab_fused;
 use av_denoise_core::collab::kernels::transforms::dct_noise_profile;
+use av_denoise_core::collab::{PATCH_SIZE, needs_warp_uniform_search};
 use av_denoise_core::nlmeans::{BLOCK_X, BLOCK_Y};
 use cubecl::benchmark::{Benchmark, BenchmarkComputations, TimingMethod};
 use cubecl::prelude::*;
@@ -52,12 +54,15 @@ const SPATIAL_RADIUS: u32 = 9;
 const K_MAX: u32 = 8;
 const BLK_STEP: u32 = 8;
 const BLKSIZE: u32 = 16;
-const THSAD: f32 = (BLKSIZE * BLKSIZE) as f32 * 0.02;
+/// `Nl4dParams::default().mismatch_scale` squared, the kernel's
+/// `mismatch_scale2` argument.
+const MISMATCH_SCALE2: f32 = 1.0;
 const N_FRAMES: u32 = 2 * RADIUS + 1;
 const CENTRE_SLOT: u32 = RADIUS;
 const NEIGHBOUR_SLOTS: [u32; 4] = [0, 1, 3, 4];
 const SIGMA: f32 = 0.02;
-const LAMBDA_HT: f32 = 5.3;
+/// `Nl4dParams::default().lambda_ht`.
+const LAMBDA_HT: f32 = 5.2;
 
 fn frame_data(g: Geom) -> Vec<f32> {
     let mut data = Vec::with_capacity((g.w * g.h * g.stored) as usize);
@@ -101,6 +106,12 @@ struct Rig<R: Runtime> {
     group_weight: Handle,
     sigma: Handle,
     dct_profile: Handle,
+    /// The uniform aggregation window, which the `fused` row runs with.
+    kaiser_off: Handle,
+    /// A `beta = 2` window, which the `fused_kaiser` row runs with. The
+    /// taper is two more loads and two more multiplies per scattered
+    /// pixel, and this is the row that says what they cost.
+    kaiser_on: Handle,
     mv_len: usize,
     conf_len: usize,
     blocks_x: u32,
@@ -149,6 +160,8 @@ impl<R: Runtime> Rig<R> {
             group_weight: client.empty(refs * size_of::<f32>()),
             sigma: client.create_from_slice(f32::as_bytes(&sigma_host)),
             dct_profile: client.create_from_slice(f32::as_bytes(&dct_noise_profile(0.0))),
+            kaiser_off: client.create_from_slice(f32::as_bytes(&kaiser_window(0.0))),
+            kaiser_on: client.create_from_slice(f32::as_bytes(&kaiser_window(2.0))),
             ring_len: ring_data.len(),
             ring,
             mv_len,
@@ -167,6 +180,15 @@ impl<R: Runtime> Rig<R> {
     /// eighth as wide along x as the reference grid and the cube is 1D.
     /// One row covers matching, filtering, and scatter together.
     fn fused(&self) {
+        self.fused_with(&self.kaiser_off);
+    }
+
+    /// [`Self::fused`] with the aggregation window on.
+    fn fused_kaiser(&self) {
+        self.fused_with(&self.kaiser_on);
+    }
+
+    fn fused_with(&self, kaiser: &Handle) {
         let g = self.g;
         let refs = ref_count(g.w, g.h);
         let refs_x = refs_along(g.w);
@@ -184,17 +206,19 @@ impl<R: Runtime> Rig<R> {
                 ArrayArg::from_raw_parts(self.neighbour_slots.clone(), NEIGHBOUR_SLOTS.len()),
                 ArrayArg::from_raw_parts(self.sigma.clone(), g.stored as usize),
                 ArrayArg::from_raw_parts(self.dct_profile.clone(), 8),
+                ArrayArg::from_raw_parts(kaiser.clone(), PATCH_SIZE as usize),
                 ArrayArg::from_raw_parts(self.accum.clone(), frame_len * N_FRAMES as usize),
                 ArrayArg::from_raw_parts(self.wsum.clone(), pixels * N_FRAMES as usize),
                 ArrayArg::from_raw_parts(self.group_weight.clone(), refs),
                 CENTRE_SLOT,
                 0.0f32,
                 0.0f32,
-                THSAD,
+                MISMATCH_SCALE2,
                 LAMBDA_HT,
                 weight_scale(SIGMA, &dct_noise_profile(0.0)),
                 cross_frame_accum_scale(SPATIAL_RADIUS, RADIUS),
                 true,
+                needs_warp_uniform_search(&self.client),
                 RADIUS,
                 REFINE,
                 self.mv_stride,
@@ -278,6 +302,7 @@ impl<R: Runtime> Benchmark for Arm<'_, R> {
     fn execute(&self, _: Self::Input) -> Result<(), String> {
         match self.kernel {
             "fused" => self.rig.fused(),
+            "fused_kaiser" => self.rig.fused_kaiser(),
             "normalise" => self.rig.normalise(),
             _ => self.rig.zero(),
         }
@@ -327,7 +352,12 @@ fn main() {
         // (name, prime). A primed arm runs `fused` once before it is
         // timed, so `normalise` reads real accumulator contents rather
         // than an empty buffer.
-        let kernels = [("zero_accum", false), ("fused", false), ("normalise", true)];
+        let kernels = [
+            ("zero_accum", false),
+            ("fused", false),
+            ("fused_kaiser", false),
+            ("normalise", true),
+        ];
         let mut totals = vec![0.0f64; kernels.len()];
 
         for g in PLANES {

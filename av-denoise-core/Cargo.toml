@@ -35,6 +35,7 @@ cubecl = { version = "0.10", features = ["std"] }
 [dev-dependencies]
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
+tempfile = "3"
 
 [features]
 vulkan = ["cubecl/vulkan"]
@@ -69,4 +70,8 @@ harness = false
 
 [[bench]]
 name = "reseed"
+harness = false
+
+[[bench]]
+name = "mc_accuracy"
 harness = false

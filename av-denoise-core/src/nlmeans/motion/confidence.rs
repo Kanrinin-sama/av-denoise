@@ -125,3 +125,33 @@ pub(crate) fn run_confidence_for_neighbour<R: Runtime>(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sad_noise_floor_scales_with_block_area_and_sigma() {
+        let sigma = 4.0 / 255.0;
+        let got = sad_noise_floor(16, sigma);
+        let expected = (16 * 16) as f32 * 2.0 * sigma / std::f32::consts::PI.sqrt();
+        assert!((got - expected).abs() < 1e-6, "expected {expected}, got {got}");
+    }
+
+    #[test]
+    fn sad_noise_floor_zero_for_zero_sigma() {
+        assert_eq!(sad_noise_floor(16, 0.0), 0.0);
+    }
+
+    #[test]
+    fn thsad_scales_with_block_area_and_scale() {
+        let got = thsad(16, 2.0);
+        let expected = 2.0 * (16 * 16) as f32 * THSAD_PIXEL;
+        assert!((got - expected).abs() < 1e-6, "expected {expected}, got {got}");
+    }
+
+    #[test]
+    fn thsad_default_scale_is_positive() {
+        assert!(thsad(16, 1.0) > 0.0);
+    }
+}

@@ -28,6 +28,12 @@ use crate::accelerate::Accelerator;
 /// warning again every time it is probed.
 static PROBED: Mutex<Vec<Accelerator>> = Mutex::new(Vec::new());
 
+/// Opens a client for `accelerator` on `device`, or reports that the
+/// backend cannot run here.
+///
+/// The client is synchronised before it is handed back. cubecl kernels
+/// are fully asynchronous, so a successful `sync()` is what proves the
+/// backend works, and no test kernel is needed.
 pub(crate) fn open_client<R: Runtime>(
     accelerator: Accelerator,
     device: &R::Device,
@@ -75,4 +81,46 @@ fn quiet_panics<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
     let out = panic::catch_unwind(AssertUnwindSafe(f));
     panic::set_hook(previous);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn a_panic_inside_becomes_an_error() {
+        let _probed = PROBED.lock().unwrap_or_else(|err| err.into_inner());
+
+        assert!(quiet_panics(|| panic!("the backend fell over")).is_err());
+        assert_eq!(quiet_panics(|| 7).unwrap(), 7);
+    }
+
+    /// The hook has to come back however the probe ended, or every later
+    /// panic in the process reports at debug level.
+    ///
+    /// Holding [`PROBED`], the way [`open_client`] does, keeps a probe on
+    /// another thread from swapping the hook mid-test.
+    #[test]
+    fn the_panic_hook_is_restored() {
+        let _probed = PROBED.lock().unwrap_or_else(|err| err.into_inner());
+
+        let marker = Arc::new(AtomicBool::new(false));
+        let flag = marker.clone();
+        panic::set_hook(Box::new(move |_| flag.store(true, Ordering::SeqCst)));
+
+        let _ = quiet_panics(|| panic!("swallowed by the quiet hook"));
+        assert!(
+            !marker.load(Ordering::SeqCst),
+            "the quiet hook did not replace the installed one",
+        );
+
+        let _ = panic::catch_unwind(|| panic!("seen by the restored hook"));
+        let restored = marker.load(Ordering::SeqCst);
+        let _ = panic::take_hook();
+
+        assert!(restored, "the probe left its own panic hook installed");
+    }
 }

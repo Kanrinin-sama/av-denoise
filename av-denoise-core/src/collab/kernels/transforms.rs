@@ -206,6 +206,8 @@ pub(crate) fn haar_reg_inv_level(stack: &mut Array<f32>, #[comptime] len: u32) {
 /// `(va + vb) / 2`. Running this over the same levels, in the same
 /// pairing order, as the signal turns `v[j]` into the variance of stack
 /// coefficient `j`.
+///
+/// [`haar_variance_ladder`] is the host mirror this is checked against.
 /// This takes the level length as a `#[comptime]` argument for the
 /// reason [`haar_reg_fwd_level`] gives.
 #[cube]
@@ -273,4 +275,137 @@ pub fn dct_noise_profile(rho: f32) -> [f32; 8] {
         *slot = sum as f32;
     }
     g
+}
+
+/// The host-side mirror of the variance propagation the stack Haar
+/// applies to a per-coefficient noise variance instead of a signal.
+///
+/// A Haar butterfly's two outputs are each a sum of two independent
+/// values scaled by `1/sqrt(2)`, so if `va` and `vb` are the variances
+/// of `a` and `b`, both outputs land on the same variance, `(va +
+/// vb) / 2`. Squaring `1/sqrt(2)` gives the `1/2`, and both outputs get
+/// the same value because both are a sum of the same two inputs, just
+/// with one sign flipped.
+///
+/// This runs the same multi-level recursion as [`haar_reg_fwd_level`],
+/// over plain host `f32`, so a filter kernel can propagate a per-patch
+/// sigma down to a per-coefficient sigma without a GPU round trip.
+///
+/// Every caller is a test oracle, so this only builds under `cfg(test)`
+/// with a GPU runtime feature enabled, matching the callers themselves.
+#[cfg(all(test, any(feature = "vulkan", feature = "metal")))]
+pub(crate) fn haar_variance_ladder(sig2: &[f32], k_use: u32) -> Vec<f32> {
+    let mut out = sig2.to_vec();
+    let mut len = k_use;
+    while len > 1 {
+        let half = len / 2;
+        let snapshot = out[..len as usize].to_vec();
+        for p in 0..half {
+            let va = snapshot[(2 * p) as usize];
+            let vb = snapshot[(2 * p + 1) as usize];
+            let avg = (va + vb) / 2.0;
+            out[p as usize] = avg;
+            out[(half + p) as usize] = avg;
+        }
+        len = half;
+    }
+    out
+}
+
+#[cfg(all(test, any(feature = "vulkan", feature = "metal")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dct_noise_profile_rho_zero_is_uniform_identity() {
+        let g = dct_noise_profile(0.0);
+        assert_eq!(
+            g, [1.0f32; 8],
+            "rho=0 must give exactly 1.0 at every frequency, got {g:?}"
+        );
+
+        // A small negative rho is not a real correlation either, and
+        // must fall onto the same exact identity rather than running
+        // the summation with a negative base.
+        let g_neg = dct_noise_profile(-0.1);
+        assert_eq!(g_neg, [1.0f32; 8]);
+    }
+
+    #[test]
+    fn dct_noise_profile_sums_to_eight_across_a_range_of_rho() {
+        for rho in [0.05f32, 0.3, 0.5, 0.67, 0.8, 0.85, 0.86, 0.95, 0.99] {
+            let g = dct_noise_profile(rho);
+            let sum: f32 = g.iter().sum();
+            assert!(
+                (sum - 8.0).abs() < 1e-3,
+                "rho={rho}: expected sum(g) == 8.0 (variance redistributed, not created or \
+                 destroyed), got {sum}"
+            );
+        }
+    }
+
+    #[test]
+    fn dct_noise_profile_is_monotonically_decreasing_for_positive_rho() {
+        for rho in [0.05f32, 0.3, 0.5, 0.67, 0.8, 0.85, 0.86, 0.95, 0.99] {
+            let g = dct_noise_profile(rho);
+            for u in 0..7 {
+                assert!(
+                    g[u] > g[u + 1],
+                    "rho={rho}: expected g to strictly decrease with frequency (low frequencies \
+                     carry more of a positively correlated residual's noise power), got \
+                     g[{u}]={} <= g[{}]={}",
+                    g[u],
+                    u + 1,
+                    g[u + 1],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_variance_is_unchanged_by_the_ladder() {
+        for k in [1u32, 2, 4, 8] {
+            let sig2 = vec![0.3f32; k as usize];
+            let out = haar_variance_ladder(&sig2, k);
+            for (idx, &v) in out.iter().enumerate() {
+                assert!((v - 0.3).abs() < 1e-6, "k={k} idx={idx}: got {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn two_element_ladder_averages_the_pair() {
+        let out = haar_variance_ladder(&[1.0, 0.0], 2);
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - 0.5).abs() < 1e-6);
+        assert!((out[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn k_use_of_one_is_the_identity() {
+        let out = haar_variance_ladder(&[0.7], 1);
+        assert_eq!(out, vec![0.7]);
+    }
+
+    #[test]
+    fn eight_element_ladder_matches_hand_computed_levels() {
+        // Level 1 (len=8, half=4) averages the pairs (0,1), (2,3),
+        // (4,5), (6,7), and writes each pair's average into both its
+        // approximation slot and its detail slot, giving
+        // [2, 2, 3, 2, 2, 2, 3, 2].
+        //
+        // Level 2 (len=4, half=2) only touches positions 0..4, again
+        // writing each pair's average into both output slots, giving
+        // [2, 2.5, 2, 2.5] there and leaving 4..8 alone.
+        //
+        // Level 3 (len=2, half=1) only touches positions 0..2, folding
+        // that last pair down to [2.25, 2.25].
+        let sig2 = vec![1.0, 3.0, 2.0, 2.0, 5.0, 1.0, 4.0, 0.0];
+        let out = haar_variance_ladder(&sig2, 8);
+
+        let expected = [2.25f32, 2.25, 2.0, 2.5, 2.0, 2.0, 3.0, 2.0];
+        for (idx, (&got, &want)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!((got - want).abs() < 1e-6, "idx={idx}: got {got} want {want}");
+        }
+    }
 }

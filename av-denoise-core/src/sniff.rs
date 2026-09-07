@@ -10,11 +10,24 @@
 //! fallback.
 //!
 //! The probe runs on that device rather than on the backend's default
-//! one.
+//! one. Opening a client is what proves a backend works, and opening it
+//! on a card the caller did not choose both tests the wrong hardware and
+//! pays that card's first-time driver initialisation.
 //!
 //! [`Denoiser::create`](crate::Denoiser::create) calls this for you, so
 //! reach for it directly only when you want to know the answer without
 //! building a denoiser.
+//!
+//! ```no_run
+//! use av_denoise_core::Device;
+//! use av_denoise_core::accelerate::get_default_accelerators;
+//! use av_denoise_core::sniff::sniff_best_accelerator;
+//!
+//! match sniff_best_accelerator(&get_default_accelerators(), &Device::Default) {
+//!     Some(accelerator) => println!("running on {accelerator}"),
+//!     None => println!("no usable backend on this machine"),
+//! }
+//! ```
 
 use cubecl::prelude::*;
 
@@ -24,6 +37,10 @@ use crate::probe::open_client;
 
 /// Tries each accelerator in turn and returns the first one whose client
 /// can be built and synchronised on `device`.
+///
+/// cubecl kernels are fully asynchronous, so a successful
+/// `client.sync()` is enough to prove the backend works. No test kernel
+/// is needed.
 ///
 /// An accelerator that cannot express `device` at all is treated as
 /// unavailable and the search moves on. That is the same answer the

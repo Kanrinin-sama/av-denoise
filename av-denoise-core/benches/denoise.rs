@@ -141,11 +141,10 @@ fn bench_push_recv(
         times.push(start.elapsed());
     }
 
-    // Drain trailing temporal frames before the denoiser drops.
-    // Otherwise outstanding `Pending` readbacks die in flight while
-    // their GPU buffers are still mapped, which wgpu's validation
-    // layer rejects on the next `Denoiser::create` for the next
-    // config (manifests as a `Buffer ... is still mapped` panic).
+    // Drain the temporal tail so every pushed frame is accounted for
+    // before the denoiser drops. An unpolled `Pending` has started no
+    // readback and is free to drop, so this is bookkeeping rather than
+    // a safety requirement.
     denoiser.flush(|_| {})?;
 
     let total: Duration = times.iter().sum();
@@ -166,13 +165,8 @@ fn bench_push_recv(
 }
 
 fn main() {
-    // Match the av-denoise binary: bump RUST_MIN_STACK so cubecl's DSD
-    // worker thread can codegen the (2R+1)²-unrolled windowed NLM kernels
-    // at large --search-radius. See src/bin/main.rs for the full rationale.
-    if std::env::var_os("RUST_MIN_STACK").is_none() {
-        // SAFETY: single-threaded at entry, no race possible.
-        unsafe { std::env::set_var("RUST_MIN_STACK", "16777216") };
-    }
+    // SAFETY: single-threaded at entry, no race possible.
+    unsafe { av_denoise_core::raise_codegen_stack_limit() };
 
     use clap::Parser;
     let cli = Cli::parse();

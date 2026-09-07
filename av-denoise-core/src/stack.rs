@@ -30,3 +30,47 @@ fn limit_is_sufficient(raw: Option<&OsStr>) -> bool {
         .and_then(|v| v.parse::<usize>().ok())
         .is_some_and(|bytes| bytes >= CODEGEN_STACK_BYTES)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unset_is_insufficient() {
+        assert!(!limit_is_sufficient(None));
+    }
+
+    #[test]
+    fn zero_is_insufficient() {
+        assert!(!limit_is_sufficient(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn one_below_the_limit_is_insufficient() {
+        let value = (CODEGEN_STACK_BYTES - 1).to_string();
+        assert!(!limit_is_sufficient(Some(OsStr::new(&value))));
+    }
+
+    #[test]
+    fn exactly_the_limit_is_sufficient() {
+        let value = CODEGEN_STACK_BYTES.to_string();
+        assert!(limit_is_sufficient(Some(OsStr::new(&value))));
+    }
+
+    #[test]
+    fn above_the_limit_is_sufficient() {
+        let value = (CODEGEN_STACK_BYTES * 2).to_string();
+        assert!(limit_is_sufficient(Some(OsStr::new(&value))));
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_insufficient() {
+        let value = format!("  {CODEGEN_STACK_BYTES}  ");
+        assert!(!limit_is_sufficient(Some(OsStr::new(&value))));
+    }
+
+    #[test]
+    fn non_numeric_is_insufficient() {
+        assert!(!limit_is_sufficient(Some(OsStr::new("not-a-number"))));
+    }
+}

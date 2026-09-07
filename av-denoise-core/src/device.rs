@@ -152,3 +152,92 @@ impl Device {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_default() {
+        assert_eq!("default".parse::<Device>().unwrap(), Device::Default);
+    }
+
+    #[test]
+    fn parse_discrete_with_and_without_index() {
+        assert_eq!(
+            "discrete".parse::<Device>().unwrap(),
+            Device::Discrete { index: 0 },
+        );
+        assert_eq!(
+            "discrete:3".parse::<Device>().unwrap(),
+            Device::Discrete { index: 3 },
+        );
+    }
+
+    #[test]
+    fn parse_integrated_virtual_cpu() {
+        assert_eq!(
+            "integrated:1".parse::<Device>().unwrap(),
+            Device::Integrated { index: 1 },
+        );
+        assert_eq!(
+            "virtual:2".parse::<Device>().unwrap(),
+            Device::Virtual { index: 2 },
+        );
+        assert_eq!("cpu".parse::<Device>().unwrap(), Device::Cpu);
+    }
+
+    #[test]
+    fn parse_rejects_unknown_kind() {
+        assert!("unicorn".parse::<Device>().is_err());
+    }
+
+    #[test]
+    fn parse_rejects_non_numeric_index() {
+        assert!("discrete:abc".parse::<Device>().is_err());
+    }
+
+    #[test]
+    fn parse_rejects_index_on_default_and_cpu() {
+        assert!("default:0".parse::<Device>().is_err());
+        assert!("default:1".parse::<Device>().is_err());
+        assert!("cpu:2".parse::<Device>().is_err());
+    }
+
+    #[test]
+    fn rejected_index_error_names_the_kind() {
+        let err = "default:1".parse::<Device>().unwrap_err();
+        assert!(err.contains("default"), "{err}");
+        let err = "cpu:2".parse::<Device>().unwrap_err();
+        assert!(err.contains("cpu"), "{err}");
+    }
+
+    #[test]
+    fn display_writes_selector_spellings() {
+        assert_eq!(Device::Default.to_string(), "default");
+        assert_eq!(Device::Discrete { index: 1 }.to_string(), "discrete:1");
+        assert_eq!(Device::Integrated { index: 0 }.to_string(), "integrated:0");
+        assert_eq!(Device::Virtual { index: 2 }.to_string(), "virtual:2");
+        assert_eq!(Device::Cpu.to_string(), "cpu");
+    }
+
+    #[test]
+    fn display_round_trips_through_from_str() {
+        let devices = [
+            Device::Default,
+            Device::Discrete { index: 3 },
+            Device::Integrated { index: 1 },
+            Device::Virtual { index: 0 },
+            Device::Cpu,
+        ];
+        for device in devices {
+            let printed = device.to_string();
+            assert_eq!(printed.parse::<Device>().unwrap(), device, "{printed}");
+        }
+    }
+
+    #[test]
+    fn default_is_default_variant() {
+        assert_eq!(Device::default(), Device::Default);
+    }
+}

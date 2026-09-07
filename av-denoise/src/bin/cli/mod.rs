@@ -3,6 +3,7 @@ mod input;
 mod list_devices;
 mod motion;
 mod nl4d;
+mod nlmeans;
 
 pub use av_denoise::Preset;
 use av_denoise::accelerate::{Accelerator, get_default_accelerators};
@@ -14,6 +15,7 @@ pub use self::input::InputSource;
 pub use self::list_devices::run_list_devices;
 pub use self::motion::MotionArgs;
 pub use self::nl4d::Nl4dArgs;
+pub use self::nlmeans::NlmeansArgs;
 
 /// The options `main` runs a denoising pass with.
 ///
@@ -165,6 +167,13 @@ pub struct Args {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Denoise with the non-local means family.
+    ///
+    /// `nlmeans` compares small patches of pixels and averages the ones
+    /// that look alike, either inside a single frame or across a
+    /// temporal window.
+    Nlmeans(NlmeansArgs),
+
     /// Denoise by grouping matching patches across several noisy frames
     /// directly, rather than filtering with non-local means first.
     ///

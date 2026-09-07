@@ -1,3 +1,13 @@
+//! Turns a VapourSynth clip's format and a filter's script arguments
+//! into the option types `av-denoise-core` denoises with.
+//!
+//! Everything here is a pure function over plain values, with no
+//! VapourSynth core and no GPU, so the whole accept/reject matrix is
+//! unit-testable. [`Format`](vapoursynth::format::Format) itself cannot
+//! be built outside a running core, so [`layout_from_format`] takes a
+//! [`RawFormat`] of the plain fields it needs instead. The caller in
+//! `filter.rs` does the short extraction from a real `Format`.
+
 use av_denoise_core::accelerate::{Accelerator, get_default_accelerators};
 use av_denoise_core::{
     Algorithm,
@@ -27,6 +37,14 @@ use av_denoise_core::{
 };
 use vapoursynth::format::{ColorFamily, SampleType};
 
+/// The handful of format fields [`layout_from_format`] actually reads.
+///
+/// The real caller is `vapoursynth::format::Format`, which wraps a
+/// pointer only a running VapourSynth core can hand out, so it cannot be
+/// built in a unit test. A caller with a real `Format` builds one of
+/// these from `format.sample_type()`, `format.bits_per_sample()`,
+/// `format.sub_sampling_w()`, `format.sub_sampling_h()`, and
+/// `format.color_family()`.
 #[derive(Debug, Clone, Copy)]
 pub struct RawFormat {
     pub sample_type: SampleType,

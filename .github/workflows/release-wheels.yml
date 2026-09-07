@@ -3,8 +3,8 @@ name: Release wheels
 on:
   release:
     types: [published]
-  # A dispatch run is a dry run. It builds the wheels and uploads them as workflow
-  # artifacts, but attaches nothing to a release and publishes nothing to
+  # A dispatch run is a dry run. It builds and tests the wheels and uploads them as
+  # workflow artifacts, but attaches nothing to a release and publishes nothing to
   # PyPI. Leave `version` empty to just check that the three wheels still build.
   workflow_dispatch:
     inputs:
@@ -84,8 +84,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The interpreter only drives the build and never leaks into the wheel's own
-        # tag, which bdist_wheel.get_tag() forces to py3-none-<platform>.
+        # The interpreter here only builds and drives the test step, it never leaks
+        # into the wheel's own tag (bdist_wheel.get_tag() forces py3-none-<platform>
+        # in setup.py). It is pinned to cp312 because VapourSynth's own PyPI wheels
+        # are tagged cp312-abi3 on every platform we target, so CIBW_TEST_REQUIRES
+        # can only resolve a prebuilt `vapoursynth` wheel, instead of falling back to
+        # a from-source build that fails on these runners, when the interpreter
+        # driving the test step is cp312 or newer. Do not lower this without checking
+        # VapourSynth's published wheel tags again.
         include:
           - os: ubuntu-latest
             platform: linux
@@ -109,6 +115,8 @@ jobs:
       CIBW_BEFORE_ALL_LINUX: curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
       CIBW_ENVIRONMENT_LINUX: PATH="$HOME/.cargo/bin:$PATH" VSAVD_VERSION=${{ needs.resolve-version.outputs.pep440_version }}
       CIBW_ENVIRONMENT: VSAVD_VERSION=${{ needs.resolve-version.outputs.pep440_version }}
+      CIBW_TEST_REQUIRES: pytest vapoursynth
+      CIBW_TEST_COMMAND: pytest {package}/tests -m "not gpu"
       CIBW_BUILD_VERBOSITY: "1"
     steps:
       - name: Checkout
@@ -174,7 +182,7 @@ jobs:
           {
             echo "### Dry run"
             echo
-            echo "All three wheels built at version \`${RAW_VERSION}\` (\`${PEP440_VERSION}\`)."
+            echo "All three wheels built and passed their tests at version \`${RAW_VERSION}\` (\`${PEP440_VERSION}\`)."
             echo "Nothing was attached to a release and nothing was published to PyPI."
             echo "The wheels are on this run as workflow artifacts."
           } >> "${GITHUB_STEP_SUMMARY}"

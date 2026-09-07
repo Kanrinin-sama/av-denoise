@@ -26,3 +26,44 @@ pub fn finish_warm_up(warm_up: &mut Option<WarmUp>) {
         warm_up.finish();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use av_denoise::{Algorithm, ChannelIntent, DenoisingMode, Depth, Device, Subsampling};
+
+    use super::*;
+
+    #[test]
+    fn create_denoiser_forwards_the_create_error() {
+        let opts = PlaneOptions {
+            accelerators: Vec::new(),
+            device: Device::Default,
+            intent: ChannelIntent::LumaChroma,
+            mode: DenoisingMode::Spacial,
+            algorithm: Algorithm::default(),
+            luma_strength: None,
+            chroma_strength: None,
+            luma_lambda_ht: None,
+            chroma_lambda_ht: None,
+            luma_mismatch_scale: None,
+            chroma_mismatch_scale: None,
+        };
+        // Zero width collapses the 4:2:0 chroma plane to nothing, which
+        // `PlanarDenoiser::create` rejects before touching the GPU.
+        let layout = FrameLayout {
+            width: 0,
+            height: 0,
+            subsampling: Subsampling::Yuv420,
+            depth: Depth::Eight,
+        };
+
+        let direct = PlanarDenoiser::create(&opts, layout)
+            .err()
+            .expect("zero-size layout should be rejected");
+        let wrapped = create_denoiser(&opts, layout)
+            .err()
+            .expect("wrapper should forward the same rejection");
+
+        assert_eq!(wrapped.to_string(), direct.to_string());
+    }
+}

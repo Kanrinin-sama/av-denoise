@@ -54,13 +54,35 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      # The same three invocations as the `clippy` Justfile recipe.
+      # The same three invocations as the `clippy` Justfile recipe. Hosted runners
+      # have no accelerator, so the tests these lint are never run here.
       - name: Clippy
         run: |
           set -euo pipefail
           cargo clippy -p av-denoise-core --features vulkan --all-targets -- -D warnings
           cargo clippy -p av-denoise --features vulkan,binary --all-targets -- -D warnings
           cargo clippy -p av-denoise-vs --features vulkan --all-targets -- -D warnings
+
+  rust-check-windows:
+    name: check (windows target)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # The VS plugin has a `#[cfg(windows)]` block that the Linux clippy job
+      # never compiles. `cargo check` needs no linker, so this catches a broken
+      # signature or flag before a release build does.
+      - name: Check
+        run: cargo check -p av-denoise-vs --features vulkan --target x86_64-pc-windows-msvc
 
   python:
     name: ruff and mypy

@@ -1,3 +1,8 @@
+# Feature set for the end-to-end benchmark binary. Override to build against another
+# backend, e.g. `AVD_BENCH_FEATURES="vulkan,cuda" just benchmark-e2e`. The `binary`
+# feature is always added, without it Cargo skips the CLI target.
+bench_features := env("AVD_BENCH_FEATURES", "vulkan") + ",binary"
+
 hello:
 
 # Prefer `rustfmt +nightly <file>` for targeted edits; this formats the whole workspace.
@@ -95,3 +100,18 @@ denoise-file-ffmpeg input output search="5" patch="9" strength="1.2":
 denoise-file-bm3d input output sigma="15" jobs="0":
     @echo "[bm3d] collaborative filtering is on (group=16/32), roughly 30x slower than ffmpeg's group=1 default. This will take a while." >&2
     uv run scripts/bm3d_parallel.py --input "{{input}}" --output "{{output}}" --sigma {{sigma}} --jobs {{jobs}}
+# End-to-end throughput benchmark. Runs every variant in scripts/configs/benchmark_e2e.toml
+# and reports wall-clock timings and amortized fps per group. The variants run
+# `target/release/av-denoise` directly, so compiling is never timed.
+benchmark-e2e *ARGS: _build-benchmark-bin _rebuild-benchmark-vs-plugin
+    uv run --directory scripts src/benchmark_e2e.py {{ARGS}}
+
+_build-benchmark-bin:
+    cargo build --release --bin av-denoise --features {{bench_features}}
+
+# The benchmark's plugin arms take vsavd from `packages/vs-avd` as an editable
+# install, and `uv run` does not rebuild the cdylib after a Rust change, so they
+# would otherwise measure a stale build against a freshly built CLI. Cargo is
+# incremental, so this costs about a second when nothing has moved.
+_rebuild-benchmark-vs-plugin:
+    uv sync --directory scripts --group vs --reinstall-package vsavd

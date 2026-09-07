@@ -5,6 +5,7 @@ pub mod frames;
 pub mod params;
 
 use anyhow::Error;
+use tracing_subscriber::EnvFilter;
 use vapoursynth::core::CoreRef;
 use vapoursynth::plugins::{Filter, FilterArgument, Metadata};
 use vapoursynth::prelude::{API, Node};
@@ -12,6 +13,79 @@ use vapoursynth::{export_vapoursynth_plugin, make_filter_function};
 
 use crate::filter::Denoise;
 use crate::params::{AlgorithmKind, RawParams};
+
+/// Installs the tracing subscriber that writes the plugin's logs to stderr.
+///
+/// `RUST_LOG` picks what is printed, and without it the plugin logs at `warn` so
+/// an ordinary render stays quiet.
+fn init_logging() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+/// Keeps this plugin's library mapped for the rest of the process.
+///
+/// VapourSynth unloads every plugin library when it frees a core, and
+/// vspipe frees its core right before exiting. The GPU runtime this
+/// plugin builds spawns a device thread per accelerator, plus a
+/// polling thread per stream on the wgpu backends, and those threads
+/// run for the rest of the process. The device thread never blocks. It
+/// spins, yields, then sleeps briefly, over and over. On Windows its
+/// first wake after `FreeLibrary` returns into unmapped code and the
+/// process dies with an access violation, after every frame was
+/// already written. The polling thread parks or waits in the driver,
+/// and dies the same way once anything wakes it.
+///
+/// Pinning the module makes the unload a no-op, so the threads stay
+/// valid until process exit terminates them. On Linux the loader
+/// already refuses to unload a library that registered thread-local
+/// destructors, which is what happens as soon as this plugin's threads
+/// start, so nothing needs doing there. macOS is not covered and has
+/// not been tested.
+///
+/// This runs once, on the first filter creation. That is before any
+/// device thread exists, since only a filter builds a denoiser. The
+/// plugin's init function runs earlier, but the export macro owns its
+/// body and this plugin has no code of its own in it.
+fn pin_plugin_library() {
+    static PIN: std::sync::Once = std::sync::Once::new();
+    PIN.call_once(|| {
+        #[cfg(windows)]
+        pin_plugin_library_windows();
+    });
+}
+
+#[cfg(windows)]
+fn pin_plugin_library_windows() {
+    use std::ffi::c_void;
+
+    const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x0000_0001;
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleExW(flags: u32, module_name: *const u16, module: *mut *mut c_void) -> i32;
+    }
+
+    let address = pin_plugin_library_windows as *const () as *const u16;
+    let mut module: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `address` is a code address inside this library, which is
+    // what `FROM_ADDRESS` asks for, and `module` is a valid out pointer.
+    let ok = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            address,
+            &mut module,
+        )
+    };
+    if ok == 0 {
+        tracing::warn!("could not pin the plugin library, the process may crash at exit");
+    }
+}
 
 /// Reads one optional UTF-8 script argument, naming `field` in the error
 /// when the bytes are not valid UTF-8.

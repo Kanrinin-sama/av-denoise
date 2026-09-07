@@ -30,13 +30,15 @@ mod compensate;
 mod confidence;
 mod pyramid;
 
-pub(crate) use analyse::{confidence_byte_offset, run_analyse, run_seeded_refine};
-pub(crate) use chain::{run_pair_analyse, zero_pair_slot};
+pub(crate) use analyse::{confidence_byte_offset, mv_field_byte_offset, run_analyse, run_seeded_refine};
+#[cfg(all(test, any(feature = "vulkan", feature = "metal")))]
+pub(crate) use chain::pair_byte_offset;
+pub(crate) use chain::{neighbour_idx_for_k, run_pair_analyse, zero_pair_slot};
 pub(crate) use compensate::run_compensate;
-pub(crate) use confidence::{run_confidence_for_neighbour, sad_noise_floor, thsad};
+pub(crate) use confidence::{THSAD_PIXEL, run_confidence_for_neighbour, sad_noise_floor, thsad};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
-pub(crate) use pyramid::{pyramid_pixels_per_frame, run_pyramid_build};
+pub(crate) use pyramid::{level_dims, pyramid_pixels_per_frame, pyramid_slot_byte_offset, run_pyramid_build};
 
 use crate::nlmeans::align::StorageAlign;
 
@@ -127,6 +129,12 @@ pub enum MotionCompensationMode {
         /// half-size coarse pass that seeds the fine one. The maximum is
         /// [`MAX_PYRAMID_LEVELS`].
         pyramid_levels: u32,
+        /// How motion toward each temporal neighbour is estimated.
+        ///
+        /// `Auto`, the default, picks a strategy from the temporal
+        /// radius and is what callers normally want. Naming `Direct` or
+        /// `Chained` is mostly useful for pinning one strategy in tests
+        /// and benches.
         estimation: MotionEstimation,
     },
 }
@@ -544,4 +552,252 @@ pub(crate) fn build_pyramid_for_slot<R: Runtime>(
         pyramid,
         stored_ch,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn none_is_inactive() {
+        let m = MotionCompensationMode::None;
+        assert!(!m.is_active());
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn mvtools_default_is_active() {
+        let m = MotionCompensationMode::mvtools_default();
+        assert!(m.is_active());
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_tiny_blksize() {
+        let m = MotionCompensationMode::Mvtools {
+            blksize: 2,
+            overlap: 0,
+            search_radius: 4,
+            pyramid_levels: 2,
+            estimation: MotionEstimation::Direct,
+        };
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_odd_blksize() {
+        let m = MotionCompensationMode::Mvtools {
+            blksize: 9,
+            overlap: 0,
+            search_radius: 4,
+            pyramid_levels: 2,
+            estimation: MotionEstimation::Direct,
+        };
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_overlap_equal_to_blksize() {
+        let m = MotionCompensationMode::Mvtools {
+            blksize: 16,
+            overlap: 16,
+            search_radius: 4,
+            pyramid_levels: 2,
+            estimation: MotionEstimation::Direct,
+        };
+        // An overlap equal to blksize would leave a step of 0.
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_half_overlap() {
+        let m = MotionCompensationMode::Mvtools {
+            blksize: 16,
+            overlap: 8,
+            search_radius: 4,
+            pyramid_levels: 2,
+            estimation: MotionEstimation::Direct,
+        };
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_zero_search_radius() {
+        let m = MotionCompensationMode::Mvtools {
+            blksize: 16,
+            overlap: 4,
+            search_radius: 0,
+            pyramid_levels: 2,
+            estimation: MotionEstimation::Direct,
+        };
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_pyramid_levels() {
+        let m = MotionCompensationMode::Mvtools {
+            blksize: 16,
+            overlap: 4,
+            search_radius: 4,
+            pyramid_levels: 0,
+            estimation: MotionEstimation::Direct,
+        };
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn chained_default_is_valid() {
+        let m = MotionCompensationMode::Mvtools {
+            blksize: 16,
+            overlap: 8,
+            search_radius: 4,
+            pyramid_levels: 2,
+            estimation: MotionEstimation::chained_default(),
+        };
+        m.validate().unwrap();
+        assert_eq!(
+            m,
+            MotionCompensationMode::Mvtools {
+                blksize: 16,
+                overlap: 8,
+                search_radius: 4,
+                pyramid_levels: 2,
+                estimation: MotionEstimation::Chained {
+                    refine_radius: DEFAULT_REFINE_RADIUS
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_refine_radius() {
+        let m = MotionCompensationMode::Mvtools {
+            blksize: 16,
+            overlap: 8,
+            search_radius: 4,
+            pyramid_levels: 2,
+            estimation: MotionEstimation::Chained { refine_radius: 0 },
+        };
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_refine_radius_above_max() {
+        let m = MotionCompensationMode::Mvtools {
+            blksize: 16,
+            overlap: 8,
+            search_radius: 4,
+            pyramid_levels: 2,
+            estimation: MotionEstimation::Chained {
+                refine_radius: MAX_SEARCH_RADIUS + 1,
+            },
+        };
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_refine_radius_at_max() {
+        let m = MotionCompensationMode::Mvtools {
+            blksize: 16,
+            overlap: 8,
+            search_radius: 4,
+            pyramid_levels: 2,
+            estimation: MotionEstimation::Chained {
+                refine_radius: MAX_SEARCH_RADIUS,
+            },
+        };
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn motion_estimation_default_is_auto() {
+        assert_eq!(MotionEstimation::default(), MotionEstimation::Auto);
+    }
+
+    #[test]
+    fn resolve_auto_below_threshold_gives_direct() {
+        assert_eq!(MotionEstimation::Auto.resolve(1), MotionEstimation::Direct);
+        assert_eq!(MotionEstimation::Auto.resolve(2), MotionEstimation::Direct);
+    }
+
+    #[test]
+    fn resolve_auto_at_and_above_threshold_gives_chained_default() {
+        assert_eq!(
+            MotionEstimation::Auto.resolve(CHAINED_RADIUS_THRESHOLD),
+            MotionEstimation::chained_default()
+        );
+        assert_eq!(
+            MotionEstimation::Auto.resolve(8),
+            MotionEstimation::chained_default()
+        );
+    }
+
+    #[test]
+    fn resolve_leaves_explicit_direct_unchanged_at_every_radius() {
+        for radius in 1..=8u32 {
+            assert_eq!(MotionEstimation::Direct.resolve(radius), MotionEstimation::Direct);
+        }
+    }
+
+    #[test]
+    fn resolve_leaves_explicit_chained_unchanged_at_every_radius() {
+        let chained = MotionEstimation::Chained { refine_radius: 5 };
+        for radius in 1..=8u32 {
+            assert_eq!(chained.resolve(radius), chained);
+        }
+    }
+
+    #[test]
+    fn validate_accepts_auto() {
+        let m = MotionCompensationMode::Mvtools {
+            blksize: 16,
+            overlap: 8,
+            search_radius: 4,
+            pyramid_levels: 2,
+            estimation: MotionEstimation::Auto,
+        };
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn resolved_estimation_is_none_when_mode_is_none() {
+        assert_eq!(MotionCompensationMode::None.resolved_estimation(4), None);
+    }
+
+    #[test]
+    fn resolved_estimation_resolves_auto_from_the_mode() {
+        let m = MotionCompensationMode::Mvtools {
+            blksize: 16,
+            overlap: 8,
+            search_radius: 4,
+            pyramid_levels: 2,
+            estimation: MotionEstimation::Auto,
+        };
+        assert_eq!(m.resolved_estimation(1), Some(MotionEstimation::Direct));
+        assert_eq!(
+            m.resolved_estimation(4),
+            Some(MotionEstimation::chained_default())
+        );
+    }
+
+    #[test]
+    fn pair_ring_slot_count_is_double_radius() {
+        assert_eq!(pair_ring_slot_count(3), 6);
+        assert_eq!(pair_ring_slot_count(1), 2);
+    }
+
+    #[test]
+    fn motion_ctx_blocks_match_step() {
+        let mode = MotionCompensationMode::Mvtools {
+            blksize: 16,
+            overlap: 8,
+            search_radius: 4,
+            pyramid_levels: 2,
+            estimation: MotionEstimation::Direct,
+        };
+        let ctx = MotionCtx::new(mode, 1920, 1080, StorageAlign::new(32)).unwrap();
+        assert_eq!(ctx.step, 8);
+        assert_eq!(ctx.blocks_x, 1920u32.div_ceil(8));
+        assert_eq!(ctx.blocks_y, 1080u32.div_ceil(8));
+    }
 }

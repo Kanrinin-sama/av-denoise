@@ -5,24 +5,11 @@ use super::align::StorageAlign;
 use super::kernels::{gpu_copy, gpu_unpack_wire};
 use super::motion::{self, MotionCtx, MotionEstimation, build_pyramid_for_slot, run_pyramid_build};
 use super::noise::{
-    EMA_ALPHA,
-    NoiseCtx,
-    NoiseEstimator,
-    TemporalNoiseSample,
-    TemporalStatsCtx,
-    aggregate_temporal_noise_stats,
-    build_spatial_offset_lut,
-    correlation_factor,
-    noise_partials_slot_stride_bytes,
-    partials_len,
-    run_noise_estimate,
-    run_temporal_noise_stats,
-    sigma_block_p25_from_partials,
-    sigma_from_abs_sum,
-    temporal_stats_buf_bytes,
-    temporal_stats_slot_len,
-    temporal_stats_slot_stride_bytes,
-    zero_temporal_stats_slot,
+    EMA_ALPHA, NoiseCtx, NoiseEstimator, TemporalNoiseSample, TemporalStatsCtx,
+    aggregate_temporal_noise_stats, build_spatial_offset_lut, correlation_factor,
+    noise_partials_slot_stride_bytes, partials_len, run_noise_estimate, run_temporal_noise_stats,
+    sigma_block_p25_from_partials, sigma_from_abs_sum, temporal_stats_buf_bytes, temporal_stats_slot_len,
+    temporal_stats_slot_stride_bytes, zero_temporal_stats_slot,
 };
 use super::params::{NlmParams, SEPARABLE_THRESHOLD, sigma_eff, validate_dimensions};
 use super::pending::{Pending, empty_output, start_readback};
@@ -81,6 +68,13 @@ pub(crate) struct RingView {
     pub mv_stride: u32,
     /// `f32` element stride between neighbours in `confidence`.
     pub conf_stride: u32,
+    /// The luma pyramid the motion estimator analysed, the reference
+    /// ring's when a prefilter is active and the input ring's
+    /// otherwise. Level 0 of slot `s` starts at
+    /// `pyramid_slot_byte_offset(width, height, frame_count, 0, s, align)`.
+    pub pyramid: Handle,
+    /// How many frames the ring holds.
+    pub frame_count: u32,
 }
 
 /// The stateful NLMeans denoiser that owns the GPU buffers.
@@ -1308,16 +1302,14 @@ impl<R: Runtime> NlmDenoiser<R> {
                 raw_low_unboosted[c] = raw_low_unboosted[c].max(sample.sigma_low[c]);
             }
             raw_temporal_only = Some(sample.sigma_low);
-            self.rho_smoothed = Some(
-                if windowed {
-                    sample.rho
-                } else {
-                    match self.rho_smoothed {
-                        None => sample.rho,
-                        Some(prev) => EMA_ALPHA * sample.rho + (1.0 - EMA_ALPHA) * prev,
-                    }
-                },
-            );
+            self.rho_smoothed = Some(if windowed {
+                sample.rho
+            } else {
+                match self.rho_smoothed {
+                    None => sample.rho,
+                    Some(prev) => EMA_ALPHA * sample.rho + (1.0 - EMA_ALPHA) * prev,
+                }
+            });
         } else if windowed {
             // Window-local estimation must not let an earlier push's
             // correlation reading leak into a fold that has no temporal
@@ -1592,6 +1584,12 @@ impl<R: Runtime> NlmDenoiser<R> {
                 ))
             })?
             .clone();
+        let pyramid = self
+            .pyramid_reference
+            .as_ref()
+            .or(self.pyramid_input.as_ref())
+            .expect("pyramid allocated when mc_ctx is Some")
+            .clone();
 
         Ok(Some(RingView {
             input: self.input_buf.clone(),
@@ -1601,6 +1599,8 @@ impl<R: Runtime> NlmDenoiser<R> {
             neighbour_slots,
             mv_stride: (mc.mv_field_bytes_per_neighbour() / size_of::<i32>() as u64) as u32,
             conf_stride: (mc.confidence_bytes_per_neighbour() / size_of::<f32>() as u64) as u32,
+            pyramid,
+            frame_count: self.params.total_frames(),
         }))
     }
 
@@ -1636,8 +1636,21 @@ impl<R: Runtime> NlmDenoiser<R> {
             .expect("motion_ctx called without motion compensation active")
     }
 
-    /// `thsad(blksize, thsad_scale)` in normalised SAD units, the same
-    /// threshold [`Self::submit_machinery`] scores confidence against.
+    /// The SAD two noisy copies of one block show by chance, the floor
+    /// [`Self::submit_machinery`] scored confidence against.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same condition as [`Self::motion_ctx`].
+    pub(crate) fn sad_noise_floor_value(&self) -> f32 {
+        let blksize = self.motion_ctx().blksize;
+        let sigma = crate::nlmeans::dispatch::mc_sad_noise_floor_sigma(self.params.prefilter, self.sigma_y);
+        motion::sad_noise_floor(blksize, sigma)
+    }
+
+    /// The SAD threshold [`Self::submit_machinery`] scored confidence
+    /// against, the same one [`Self::sad_noise_floor_value`] is measured
+    /// past.
     ///
     /// # Panics
     ///
@@ -1692,6 +1705,12 @@ impl<R: Runtime> NlmDenoiser<R> {
             pixels,
             self.output_format,
         )))
+    }
+
+    /// The packed-word destinations, which are `Some` only in wire mode.
+    #[cfg(test)]
+    pub(crate) fn wire_outputs_for_test(&self) -> Option<&[Handle; 2]> {
+        self.wire_outputs.as_ref()
     }
 
     /// The smoothed per-channel sigma estimate NLMeans is currently

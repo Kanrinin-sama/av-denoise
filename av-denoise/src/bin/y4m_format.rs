@@ -58,3 +58,67 @@ pub fn y4m_vendor_extensions(raw_params: &[u8]) -> Vec<y4m::VendorExtensionStrin
         .filter_map(|tok| y4m::VendorExtensionString::new(tok[1..].to_vec()).ok())
         .collect()
 }
+
+#[cfg(test)]
+mod colorspace_tests {
+    use super::*;
+
+    #[test]
+    fn colorspace_round_trips_every_supported_combination() {
+        let combos = [
+            (Subsampling::Yuv420, Depth::Eight),
+            (Subsampling::Yuv420, Depth::Ten),
+            (Subsampling::Yuv420, Depth::Twelve),
+            (Subsampling::Yuv422, Depth::Eight),
+            (Subsampling::Yuv422, Depth::Ten),
+            (Subsampling::Yuv422, Depth::Twelve),
+            (Subsampling::Yuv444, Depth::Eight),
+            (Subsampling::Yuv444, Depth::Ten),
+            (Subsampling::Yuv444, Depth::Twelve),
+        ];
+
+        for (sub, depth) in combos {
+            let cs = subsampling_to_y4m(sub, depth);
+            let (rsub, rdepth) = subsampling_from_y4m(cs).expect("should map back");
+
+            assert_eq!(rsub, sub, "subsampling lost for {cs:?}");
+            assert_eq!(rdepth, depth, "depth lost for {cs:?}");
+        }
+    }
+
+    #[test]
+    fn ten_bit_420_maps_to_c420p10() {
+        // `y4m::Colorspace` derives only `Debug, Clone, Copy`, not
+        // `PartialEq`, so `assert_eq!` won't compile here.
+        assert!(matches!(
+            subsampling_to_y4m(Subsampling::Yuv420, Depth::Ten),
+            y4m::Colorspace::C420p10
+        ));
+    }
+
+    #[test]
+    fn eight_bit_420_variants_all_map_to_yuv420_eight() {
+        for cs in [
+            y4m::Colorspace::C420,
+            y4m::Colorspace::C420jpeg,
+            y4m::Colorspace::C420paldv,
+            y4m::Colorspace::C420mpeg2,
+        ] {
+            let (sub, depth) = subsampling_from_y4m(cs).expect("should map");
+            assert_eq!(sub, Subsampling::Yuv420);
+            assert_eq!(depth, Depth::Eight);
+        }
+    }
+
+    #[test]
+    fn grayscale_colorspaces_are_rejected_with_a_clear_message() {
+        for cs in [y4m::Colorspace::Cmono, y4m::Colorspace::Cmono12] {
+            let err = subsampling_from_y4m(cs).expect_err("grayscale should be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("{cs:?}")),
+                "error should name the offending colorspace, got {msg}"
+            );
+        }
+    }
+}

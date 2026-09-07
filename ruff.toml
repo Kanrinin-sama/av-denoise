@@ -1,6 +1,10 @@
+# Matches rustfmt.toml's max_width, so Rust and Python wrap at the same column.
 line-length = 110
-target-version = "py312"
-extend-exclude = ["scripts"]
+# av-denoise-vs/tests/vs_harness.py declares requires-python = ">=3.11", the lowest
+# floor among the checked files. The vs-avd package itself needs 3.12.
+target-version = "py311"
+
+extend-include = ["*.vpy"]
 
 [lint]
 select = ["E", "F", "I", "W"]

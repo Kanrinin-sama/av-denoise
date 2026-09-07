@@ -1,3 +1,4 @@
+use av_denoise_core::Depth;
 use cubecl::prelude::*;
 
 mod kernels;
@@ -28,8 +29,11 @@ use kernels::mc_chain_compose::ChainComposeBench;
 use kernels::mc_confidence::McConfidenceBench;
 use kernels::mc_downscale::DownscaleBench;
 use kernels::mc_warp::WarpBench;
+use kernels::mv_regularise::MvRegulariseBench;
 use kernels::noise_partial::NoisePartialBench;
+use kernels::pack_wire::PackWireBench;
 use kernels::temporal_noise_stats::TemporalNoiseStatsBench;
+use kernels::unpack_wire::UnpackWireBench;
 use kernels::vertical_weight::VWeightBench;
 use kernels::vweight_pair_accumulate::VWeightPairAccBench;
 use kernels::zero::ZeroBench;
@@ -48,6 +52,26 @@ fn run_all<R: Runtime>(backend: &str, device: &R::Device) {
             ch,
             ch_name,
         });
+    }
+    for &(ch, ch_name) in CHANNELS {
+        for depth in [Depth::Eight, Depth::Ten] {
+            run(PackWireBench {
+                client: client.clone(),
+                ch,
+                ch_name,
+                depth,
+            });
+        }
+    }
+    for &(ch, ch_name) in CHANNELS {
+        for depth in [Depth::Eight, Depth::Ten] {
+            run(UnpackWireBench {
+                client: client.clone(),
+                ch,
+                ch_name,
+                depth,
+            });
+        }
     }
     for &(ch, ch_name) in CHANNELS {
         run(ZeroBench {
@@ -197,11 +221,23 @@ fn run_all<R: Runtime>(backend: &str, device: &R::Device) {
     run(ChainComposeBench {
         client: client.clone(),
     });
+    run(MvRegulariseBench {
+        client: client.clone(),
+    });
     for &(ch, ch_name) in CHANNELS {
         run(CollabFusedBench {
             client: client.clone(),
             ch,
             ch_name,
+            split_mv: false,
+        });
+    }
+    for &(ch, ch_name) in CHANNELS {
+        run(CollabFusedBench {
+            client: client.clone(),
+            ch,
+            ch_name,
+            split_mv: true,
         });
     }
     for &(ch, ch_name) in CHANNELS {
