@@ -21,6 +21,9 @@ bon = "3"
 cubecl = { version = "0.10", features = ["std"] }
 av-denoise-core = { path = "av-denoise-core", version = "0.4.0", default-features = false }
 
+[patch.crates-io]
+av-decoders = { path = "crates/av-decoders" }
+
 [profile.test]
 opt-level = 3
 debug-assertions = true

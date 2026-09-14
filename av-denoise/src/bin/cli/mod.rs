@@ -10,7 +10,7 @@ use av_denoise::accelerate::{Accelerator, get_default_accelerators};
 use av_denoise::{ChannelIntent, Device, PlaneOptions};
 use clap::{Parser, Subcommand};
 
-pub use self::common::CommonArgs;
+pub use self::common::{CommonArgs, FrameRange};
 pub use self::input::InputSource;
 pub use self::list_devices::run_list_devices;
 pub use self::motion::MotionArgs;
@@ -188,6 +188,15 @@ pub enum Command {
     /// Motion tracking is always on, and every preset keeps a temporal
     /// window, which this algorithm needs.
     Nl4d(Nl4dArgs),
+
+    Scenes {
+        #[arg(short, long)]
+        input: std::path::PathBuf,
+        #[arg(short, long)]
+        output: std::path::PathBuf,
+        #[arg(long = "keep-frames", value_name = "START:END")]
+        keep_frames: Vec<FrameRange>,
+    },
 
     /// List the devices each backend can see on this machine.
     ///

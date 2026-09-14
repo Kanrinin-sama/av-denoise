@@ -6,14 +6,21 @@ use std::time::Duration;
 
 use av_decoders::{Decoder, Rational32};
 use av_denoise::{
-    DenoisingMode, Depth, FrameLayout, PlanarDenoiser, PlaneOptions, Planes, Subsampling, WarmUp,
+    DenoisingMode,
+    Depth,
+    FrameLayout,
+    PlanarDenoiser,
+    PlaneOptions,
+    Planes,
+    Subsampling,
+    WarmUp,
     push_needs_retry,
 };
 use av_scenechange::{DetectionOptions, detect_scene_changes};
 use indicatif::ProgressBar;
 use y4m::Frame as Y4mFrame;
 
-use crate::cli::RunOptions;
+use crate::cli::{FrameRange, RunOptions};
 use crate::frame_index;
 use crate::progress::{self, denoise_bar_visible, denoise_progress_bar, scene_progress_bar};
 use crate::warm_start::{create_denoiser, finish_warm_up};
@@ -122,6 +129,37 @@ struct SceneLayout {
     /// `scene_starts[i]` is the inclusive start frame of scene `i`, in  emitted frame numbers.
     /// The final entry is `total_frames` so scene `i` covers `scene_starts[i]..scene_starts[i + 1]`.
     scene_starts: Vec<usize>,
+    source_ranges: Vec<(usize, usize)>,
+    keep_frames: Vec<FrameRange>,
+}
+
+const SCENE_LAYOUT_SCHEMA: u32 = 1;
+const SCENE_DETECTOR_ID: &str = "av-scenechange-0.23-default";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredSceneLayout {
+    schema: u32,
+    detector: String,
+    width: u32,
+    height: u32,
+    subsampling: String,
+    depth: u8,
+    frame_rate_numerator: i32,
+    frame_rate_denominator: i32,
+    total_frames: usize,
+    raw_frames: usize,
+    phantom: BTreeSet<usize>,
+    scene_starts: Vec<usize>,
+    #[serde(default)]
+    keep_frames: Vec<StoredFrameRange>,
+    #[serde(default)]
+    source_ranges: Vec<(usize, usize)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredFrameRange {
+    start: usize,
+    end: usize,
 }
 
 impl SceneLayout {
@@ -135,6 +173,8 @@ pub fn run_file(
     input: &Path,
     workers: usize,
     frame_budget_bytes: u64,
+    stored_layout: Option<&Path>,
+    keep_frames: &[FrameRange],
 ) -> Result<(), anyhow::Error> {
     if workers == 0 {
         anyhow::bail!("--workers must be at least 1");
@@ -145,7 +185,11 @@ pub fn run_file(
     // bar shares the terminal with whatever consumes our output, so it
     // waits for --progress.
     let is_terminal = std::io::stderr().is_terminal();
-    let scenes = detect_scenes(input, is_terminal)?;
+    let scenes = match stored_layout {
+        Some(path) => read_scene_layout(input, path, keep_frames)?,
+        None if keep_frames.is_empty() => detect_scenes(input, is_terminal)?,
+        None => anyhow::bail!("--keep-frames requires --scene-layout; run `scenes` first"),
+    };
 
     tracing::info!(
         scene_count = scenes.scene_count(),
@@ -162,6 +206,163 @@ pub fn run_file(
         denoise_bar_visible(opts.progress, is_terminal),
         frame_budget_bytes,
     )
+}
+
+pub fn write_scene_layout(
+    input: &Path,
+    output: &Path,
+    keep_frames: &[FrameRange],
+) -> Result<(), anyhow::Error> {
+    let scenes = if keep_frames.is_empty() {
+        detect_scenes(input, std::io::stderr().is_terminal())?
+    } else {
+        detect_kept_scenes(input, keep_frames, std::io::stderr().is_terminal())?
+    };
+    let stored = StoredSceneLayout::from_layout(&scenes);
+    let bytes = serde_json::to_vec(&stored)?;
+    let name = output
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("scene layout output has no file name"))?;
+    let temporary = output.with_file_name(format!(".{}.{}.tmp", name.to_string_lossy(), std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    use std::io::Write;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temporary, output) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+impl StoredSceneLayout {
+    fn from_layout(layout: &SceneLayout) -> Self {
+        Self {
+            schema: if layout.keep_frames.is_empty() {
+                SCENE_LAYOUT_SCHEMA
+            } else {
+                2
+            },
+            detector: SCENE_DETECTOR_ID.into(),
+            width: layout.layout.width,
+            height: layout.layout.height,
+            subsampling: format!("{:?}", layout.layout.subsampling),
+            depth: layout.layout.depth.bits() as u8,
+            frame_rate_numerator: *layout.framerate.numer(),
+            frame_rate_denominator: *layout.framerate.denom(),
+            total_frames: layout.total_frames,
+            raw_frames: layout.raw_frames,
+            phantom: layout.phantom.clone(),
+            scene_starts: layout.scene_starts.clone(),
+            keep_frames: layout
+                .keep_frames
+                .iter()
+                .map(|range| StoredFrameRange {
+                    start: range.start,
+                    end: range.end,
+                })
+                .collect(),
+            source_ranges: layout.source_ranges.clone(),
+        }
+    }
+}
+
+fn read_scene_layout(
+    input: &Path,
+    path: &Path,
+    keep_frames: &[FrameRange],
+) -> Result<SceneLayout, anyhow::Error> {
+    let stored: StoredSceneLayout = serde_json::from_slice(&std::fs::read(path)?)?;
+    let expected_schema = if keep_frames.is_empty() {
+        SCENE_LAYOUT_SCHEMA
+    } else {
+        2
+    };
+    if stored.schema != expected_schema || stored.detector != SCENE_DETECTOR_ID {
+        anyhow::bail!("scene layout schema or detector does not match this av-denoise build");
+    }
+    let decoder = Decoder::from_file(input)?;
+    let details = *decoder.get_video_details();
+    let layout = FrameLayout {
+        width: details.width as u32,
+        height: details.height as u32,
+        subsampling: subsampling_from_av_decoders(details.chroma_sampling)?,
+        depth: Depth::from_bits(details.bit_depth)?,
+    };
+    let actual_subsampling = format!("{:?}", layout.subsampling);
+    if stored.width != layout.width
+        || stored.height != layout.height
+        || stored.subsampling != actual_subsampling
+        || stored.depth != layout.depth.bits() as u8
+        || stored.frame_rate_numerator != *details.frame_rate.numer()
+        || stored.frame_rate_denominator != *details.frame_rate.denom()
+        || details
+            .total_frames
+            .is_some_and(|frames| stored.raw_frames != frames)
+    {
+        anyhow::bail!("scene layout does not match the opened source video");
+    }
+    drop(decoder);
+    let stored_keep = stored
+        .keep_frames
+        .iter()
+        .map(|range| FrameRange {
+            start: range.start,
+            end: range.end,
+        })
+        .collect::<Vec<_>>();
+    let source_total = stored
+        .raw_frames
+        .checked_sub(stored.phantom.len())
+        .ok_or_else(|| anyhow::anyhow!("scene layout contains invalid phantom frames"))?;
+    if !stored_keep.is_empty() {
+        validate_keep_frames(&stored_keep, source_total)?;
+    }
+    let expected_ranges = stored_keep
+        .iter()
+        .map(|range| {
+            (
+                emitted_boundary_to_raw(range.start, stored.raw_frames, &stored.phantom),
+                emitted_boundary_to_raw(range.end, stored.raw_frames, &stored.phantom),
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected_total = if stored_keep.is_empty() {
+        source_total
+    } else {
+        stored_keep.iter().map(|range| range.end - range.start).sum()
+    };
+    if stored_keep != keep_frames
+        || stored.total_frames != expected_total
+        || (!stored_keep.is_empty() && stored.source_ranges != expected_ranges)
+        || stored.total_frames == 0
+        || stored.scene_starts.first() != Some(&0)
+        || stored.scene_starts.last() != Some(&stored.total_frames)
+        || stored.scene_starts.windows(2).any(|pair| pair[0] >= pair[1])
+        || stored.phantom.iter().any(|index| *index >= stored.raw_frames)
+    {
+        anyhow::bail!("scene layout contains invalid frame boundaries");
+    }
+    Ok(SceneLayout {
+        layout,
+        framerate: details.frame_rate,
+        total_frames: stored.total_frames,
+        raw_frames: stored.raw_frames,
+        phantom: stored.phantom,
+        scene_starts: stored.scene_starts,
+        source_ranges: if stored_keep.is_empty() {
+            vec![(0, stored.raw_frames)]
+        } else {
+            stored.source_ranges
+        },
+        keep_frames: stored_keep,
+    })
 }
 
 /// Opens the input, reads its layout, and runs `av_scenechange` to
@@ -258,6 +459,122 @@ fn detect_scenes(input: &Path, visible: bool) -> Result<SceneLayout, anyhow::Err
         raw_frames,
         phantom,
         scene_starts,
+        source_ranges: vec![(0, raw_frames)],
+        keep_frames: Vec::new(),
+    })
+}
+
+fn validate_keep_frames(ranges: &[FrameRange], total: usize) -> Result<(), anyhow::Error> {
+    if ranges.is_empty()
+        || ranges
+            .iter()
+            .any(|range| range.start >= range.end || range.end > total)
+        || ranges.windows(2).any(|pair| pair[0].end > pair[1].start)
+    {
+        anyhow::bail!("--keep-frames ranges must be sorted, non-overlapping, and within the source");
+    }
+    Ok(())
+}
+
+fn emitted_boundary_to_raw(emitted: usize, raw_total: usize, phantom: &BTreeSet<usize>) -> usize {
+    let mut seen = 0usize;
+    for raw in 0..raw_total {
+        if seen == emitted {
+            return raw;
+        }
+        if !phantom.contains(&raw) {
+            seen += 1;
+        }
+    }
+    raw_total
+}
+
+fn detect_kept_scenes(
+    input: &Path,
+    keep_frames: &[FrameRange],
+    visible: bool,
+) -> Result<SceneLayout, anyhow::Error> {
+    let mut metadata = Decoder::from_file(input)?;
+    let details = *metadata.get_video_details();
+    let raw_frames = details
+        .total_frames
+        .ok_or_else(|| anyhow::anyhow!("FFMS2 did not report a source frame count"))?;
+    let phantom = frame_index::read_index(&mut metadata)
+        .map(|index| frame_index::phantom_indices(&index))
+        .unwrap_or_default();
+    let source_total = raw_frames - phantom.len();
+    validate_keep_frames(keep_frames, source_total)?;
+    let depth = Depth::from_bits(details.bit_depth)?;
+    let layout = FrameLayout {
+        width: details.width as u32,
+        height: details.height as u32,
+        subsampling: subsampling_from_av_decoders(details.chroma_sampling)?,
+        depth,
+    };
+    drop(metadata);
+    let source_ranges = keep_frames
+        .iter()
+        .map(|range| {
+            (
+                emitted_boundary_to_raw(range.start, raw_frames, &phantom),
+                emitted_boundary_to_raw(range.end, raw_frames, &phantom),
+            )
+        })
+        .collect::<Vec<_>>();
+    let total_frames = keep_frames.iter().map(|range| range.end - range.start).sum();
+    let pb = scene_progress_bar(Some(total_frames), visible);
+    let mut analyzed = 0usize;
+    let mut scene_starts = vec![0usize];
+    let mut compact_offset = 0usize;
+    for &(raw_start, raw_end) in &source_ranges {
+        let mut decoder = Decoder::from_file(input)?;
+        decoder.seek_video_frame(raw_start)?;
+        let raw_count = raw_end - raw_start;
+        let on_progress = |frames: usize, _keyframes: usize| {
+            pb.set_position((analyzed + frames) as u64);
+        };
+        let detection = match depth {
+            Depth::Eight => detect_scene_changes::<u8>(
+                &mut decoder,
+                DetectionOptions::default(),
+                Some(raw_count),
+                Some(&on_progress),
+            )?,
+            Depth::Ten | Depth::Twelve => detect_scene_changes::<u16>(
+                &mut decoder,
+                DetectionOptions::default(),
+                Some(raw_count),
+                Some(&on_progress),
+            )?,
+        };
+        let local_phantom = phantom
+            .range(raw_start..raw_end)
+            .map(|index| index - raw_start)
+            .collect::<BTreeSet<_>>();
+        let remapped = frame_index::remap_scene_starts(&detection.scene_changes, &local_phantom);
+        scene_starts.extend(
+            remapped
+                .into_iter()
+                .filter(|start| *start > 0)
+                .map(|start| compact_offset + start),
+        );
+        let emitted_count = raw_count - local_phantom.len();
+        compact_offset += emitted_count;
+        scene_starts.push(compact_offset);
+        analyzed += raw_count;
+    }
+    progress::finish(&pb);
+    scene_starts.sort_unstable();
+    scene_starts.dedup();
+    Ok(SceneLayout {
+        layout,
+        framerate: details.frame_rate,
+        total_frames,
+        raw_frames,
+        phantom,
+        scene_starts,
+        source_ranges,
+        keep_frames: keep_frames.to_vec(),
     })
 }
 
@@ -389,23 +706,15 @@ where
 {
     let mut scene_idx = 0usize;
     let mut next_boundary = scenes.scene_starts[1];
-    let mut g = 0u64;
     let mut current: Option<(usize, crossbeam_channel::Sender<StagedFrame>)> = None;
 
     // The iterator yields frames in raw decoder order, so position is the
     // raw index. Every frame is read, phantom or not, because the decoder
     // walks the file in order and cannot be told to skip one.
-    for (raw, planes) in frames.enumerate() {
+    for (g, planes) in frames.enumerate() {
         let planes = planes?;
 
-        // A phantom frame repeats one of its neighbours. Emitting it would lengthen the output
-        // and shift everything after it, and feeding it to a worker would put a false
-        // still frame into the temporal window.
-        if scenes.phantom.contains(&raw) {
-            continue;
-        }
-
-        while g >= next_boundary as u64 && scene_idx + 1 < scenes.scene_count() {
+        while g >= next_boundary && scene_idx + 1 < scenes.scene_count() {
             scene_idx += 1;
             next_boundary = scenes.scene_starts[scene_idx + 1];
         }
@@ -440,12 +749,10 @@ where
             .expect("a scene sender exists after the check above");
 
         tx.send(StagedFrame {
-            global_idx: g,
+            global_idx: g as u64,
             planes,
         })
         .map_err(|_| anyhow::anyhow!("the worker holding scene {scene_idx} disconnected"))?;
-
-        g += 1;
     }
 
     Ok(())
@@ -467,16 +774,50 @@ fn dispatch_frames(
     let mut decoder = decoder?;
     let layout = scenes.layout;
 
-    let frames = (0..scenes.raw_frames).map(move |_| -> Result<Planes, anyhow::Error> {
+    let ranges = scenes.source_ranges.clone();
+    let phantom = scenes.phantom.clone();
+    let mut range_index = 0usize;
+    let mut remaining = 0usize;
+    let mut raw_index = 0usize;
+    let frames = std::iter::from_fn(move || -> Option<Result<Planes, anyhow::Error>> {
+        loop {
+            if remaining == 0 {
+                let &(start, end) = ranges.get(range_index)?;
+                if let Err(error) = decoder.seek_video_frame(start) {
+                    return Some(Err(error.into()));
+                }
+                raw_index = start;
+                remaining = end - start;
+                range_index += 1;
+            }
+            remaining -= 1;
+            let current = raw_index;
+            raw_index += 1;
+            if phantom.contains(&current) {
+                let skipped = match layout.depth {
+                    Depth::Eight => decoder.read_video_frame::<u8>().map(|_| ()),
+                    Depth::Ten | Depth::Twelve => decoder.read_video_frame::<u16>().map(|_| ()),
+                };
+                if let Err(error) = skipped {
+                    return Some(Err(error.into()));
+                }
+                continue;
+            }
+            break;
+        }
         match layout.depth {
-            Depth::Eight => {
-                let frame = decoder.read_video_frame::<u8>()?;
-                planes_from_v_frame_u8(&frame, layout)
-            },
-            Depth::Ten | Depth::Twelve => {
-                let frame = decoder.read_video_frame::<u16>()?;
-                planes_from_v_frame_u16(&frame, layout)
-            },
+            Depth::Eight => Some(
+                decoder
+                    .read_video_frame::<u8>()
+                    .map_err(Into::into)
+                    .and_then(|frame| planes_from_v_frame_u8(&frame, layout)),
+            ),
+            Depth::Ten | Depth::Twelve => Some(
+                decoder
+                    .read_video_frame::<u16>()
+                    .map_err(Into::into)
+                    .and_then(|frame| planes_from_v_frame_u16(&frame, layout)),
+            ),
         }
     });
 
@@ -863,6 +1204,8 @@ mod tests {
             raw_frames: total_frames + phantom.len(),
             phantom,
             scene_starts,
+            source_ranges: vec![(0, total_frames)],
+            keep_frames: Vec::new(),
         }
     }
 

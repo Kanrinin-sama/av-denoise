@@ -29,6 +29,8 @@ fn run_input(
     input: &InputSource,
     workers: Option<usize>,
     frame_budget: Option<u64>,
+    scene_layout: Option<&std::path::Path>,
+    keep_frames: &[cli::FrameRange],
 ) -> Result<(), anyhow::Error> {
     match input {
         InputSource::File(path) => file_mode::run_file(
@@ -36,6 +38,8 @@ fn run_input(
             path,
             workers.unwrap_or(DEFAULT_WORKERS),
             frame_budget.unwrap_or(DEFAULT_FRAME_BUDGET_BYTES),
+            scene_layout,
+            keep_frames,
         ),
         stream @ (InputSource::Stdin | InputSource::Fd(_)) => {
             if workers.is_some() {
@@ -82,6 +86,15 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Command::Scenes {
+        input,
+        output,
+        keep_frames,
+    } = &args.command
+    {
+        return file_mode::write_scene_layout(input, output, keep_frames);
+    }
+
     // Point CubeCL at a kernel cache. This has to run before
     // Denoiser::create, because the first CubeCL client locks the global
     // config the moment it is built.
@@ -94,22 +107,26 @@ fn main() -> anyhow::Result<()> {
         Err(err) => return Err(anyhow::Error::new(err).context("unable to install the kernel cache")),
     }
 
-    let (opts, input, workers, frame_budget) = match &args.command {
+    let (opts, input, workers, frame_budget, scene_layout, keep_frames) = match &args.command {
         Command::Nlmeans(nlm) => (
             nlm.build_options(&args)?,
             &nlm.common.input,
             nlm.common.workers,
             nlm.common.frame_budget,
+            nlm.common.scene_layout.as_deref(),
+            nlm.common.keep_frames.as_slice(),
         ),
         Command::Nl4d(nl4d) => (
             nl4d.build_options(&args)?,
             &nl4d.common.input,
             nl4d.common.workers,
             nl4d.common.frame_budget,
+            nl4d.common.scene_layout.as_deref(),
+            nl4d.common.keep_frames.as_slice(),
         ),
         // Handled above, before any denoising options are built.
-        Command::ListDevices => unreachable!(),
+        Command::ListDevices | Command::Scenes { .. } => unreachable!(),
     };
 
-    run_input(&opts, input, workers, frame_budget)
+    run_input(&opts, input, workers, frame_budget, scene_layout, keep_frames)
 }

@@ -93,6 +93,7 @@ fn open_fd(fd: u32) -> Result<Box<dyn Read>, anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::io::{Read, Write};
     #[cfg(unix)]
     use std::os::fd::AsRawFd;
