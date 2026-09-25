@@ -21,8 +21,9 @@ pub struct CommonArgs {
     /// reachable by prefixing it, for example `./-`.
     ///
     /// The source's bit depth is detected automatically. 8, 10, and
-    /// 12-bit sources are supported and the output keeps the source's
-    /// depth. Other depths are rejected with a clear error message.
+    /// 12-bit sources are supported. The output keeps the source's
+    /// depth unless `--output-depth` selects another supported depth.
+    /// Other depths are rejected with a clear error message.
     #[arg(short, long)]
     pub input: InputSource,
 
@@ -31,6 +32,15 @@ pub struct CommonArgs {
 
     #[arg(long = "keep-frames", value_name = "START:END")]
     pub keep_frames: Vec<FrameRange>,
+
+    #[arg(long = "scene-span", value_name = "START:END")]
+    pub scene_span: Option<FrameRange>,
+
+    #[arg(long = "window-service-slots", value_name = "COUNT")]
+    pub window_service_slots: Option<usize>,
+
+    #[arg(long, value_name = "BITS", value_parser = clap::value_parser!(u8).range(8..=12))]
+    pub output_depth: Option<u8>,
 
     /// How many scenes to clean in parallel.
     ///

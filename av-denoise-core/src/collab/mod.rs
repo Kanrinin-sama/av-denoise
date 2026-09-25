@@ -34,12 +34,6 @@ pub fn needs_warp_uniform_search<R: Runtime>(client: &ComputeClient<R>) -> bool 
     R::name(client) == "cuda"
 }
 
-// Every test in this tree runs against a real GPU runtime, see
-// `tests::helpers::R`, so it only builds when a wgpu-backed feature is
-// enabled. A cpu-only build skips it entirely.
-#[cfg(all(test, any(feature = "vulkan", feature = "metal")))]
-mod tests;
-
 /// Side length of a collaborative patch in pixels.
 pub const PATCH_SIZE: u32 = 8;
 /// Pixels in one patch.

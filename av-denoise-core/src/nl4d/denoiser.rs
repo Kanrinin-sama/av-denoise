@@ -1,6 +1,7 @@
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
+use super::fruit::FRUIT_DITHER;
 use super::params::Nl4dParams;
 use super::regularise::run_regularise;
 use super::snapshot::{LastFields, MotionSnapshot, read_snapshot};
@@ -25,6 +26,7 @@ use crate::nlmeans::{
     MAX_GRID_1D,
     NlmDenoiser,
     Pending,
+    ReadbackShape,
     RingView,
     start_readback,
 };
@@ -117,6 +119,7 @@ pub struct Nl4dDenoiser<R: Runtime> {
     /// These buffers rotate on the same slot counter, so each is free again exactly
     /// when the `f32` slot it is packed from is free.
     wire_outputs: Option<[Handle; 2]>,
+    fruit_dither: Option<Handle>,
     /// How many passes [`Self::run_collab_stage`] has run for the
     /// current stream.
     ///
@@ -231,7 +234,7 @@ impl<R: Runtime> Nl4dDenoiser<R> {
         ];
         let wire_outputs = match output_format {
             OutputFormat::F32 => None,
-            OutputFormat::Wire { depth } => {
+            OutputFormat::Wire { depth, .. } => {
                 let samples = pixels as u32 * channels.count();
                 let words = samples.div_ceil(depth.wire_pack().samples_per_word()) as usize;
                 Some([
@@ -239,6 +242,10 @@ impl<R: Runtime> Nl4dDenoiser<R> {
                     client.empty(words * size_of::<u32>()),
                 ])
             },
+        };
+        let fruit_dither = match output_format {
+            OutputFormat::F32 => None,
+            OutputFormat::Wire { .. } => Some(client.create_from_slice(u32::as_bytes(&FRUIT_DITHER))),
         };
 
         // `motion_ctx()` panics without motion compensation, and
@@ -280,6 +287,7 @@ impl<R: Runtime> Nl4dDenoiser<R> {
             next_output_slot: 0,
             output_format,
             wire_outputs,
+            fruit_dither,
             passes_run: 0,
             last_fields: None,
             field_lambda: params.field_lambda,
@@ -729,16 +737,14 @@ impl<R: Runtime> Nl4dDenoiser<R> {
             self.front.compute_client(),
             handle,
             wire_dst,
-            self.channels.count(),
-            self.channels.storage_count(),
-            pixels,
+            ReadbackShape {
+                channels: self.channels.count(),
+                stored_ch: self.channels.storage_count(),
+                pixels,
+                width: self.width,
+            },
             format,
+            self.fruit_dither.as_ref(),
         )
-    }
-
-    /// The packed-word destinations, which are `Some` only in wire mode.
-    #[cfg(test)]
-    pub(crate) fn wire_outputs_for_test(&self) -> Option<&[Handle; 2]> {
-        self.wire_outputs.as_ref()
     }
 }

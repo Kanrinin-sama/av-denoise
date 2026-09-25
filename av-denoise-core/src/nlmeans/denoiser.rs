@@ -5,14 +5,27 @@ use super::align::StorageAlign;
 use super::kernels::{gpu_copy, gpu_unpack_wire};
 use super::motion::{self, MotionCtx, MotionEstimation, build_pyramid_for_slot, run_pyramid_build};
 use super::noise::{
-    EMA_ALPHA, NoiseCtx, NoiseEstimator, TemporalNoiseSample, TemporalStatsCtx,
-    aggregate_temporal_noise_stats, build_spatial_offset_lut, correlation_factor,
-    noise_partials_slot_stride_bytes, partials_len, run_noise_estimate, run_temporal_noise_stats,
-    sigma_block_p25_from_partials, sigma_from_abs_sum, temporal_stats_buf_bytes, temporal_stats_slot_len,
-    temporal_stats_slot_stride_bytes, zero_temporal_stats_slot,
+    EMA_ALPHA,
+    NoiseCtx,
+    NoiseEstimator,
+    TemporalNoiseSample,
+    TemporalStatsCtx,
+    aggregate_temporal_noise_stats,
+    build_spatial_offset_lut,
+    correlation_factor,
+    noise_partials_slot_stride_bytes,
+    partials_len,
+    run_noise_estimate,
+    run_temporal_noise_stats,
+    sigma_block_p25_from_partials,
+    sigma_from_abs_sum,
+    temporal_stats_buf_bytes,
+    temporal_stats_slot_len,
+    temporal_stats_slot_stride_bytes,
+    zero_temporal_stats_slot,
 };
 use super::params::{NlmParams, SEPARABLE_THRESHOLD, sigma_eff, validate_dimensions};
-use super::pending::{Pending, empty_output, start_readback};
+use super::pending::{Pending, ReadbackShape, empty_output, start_readback};
 use super::prefilter::{PrefilterCtx, PrefilterMode, run_prefilter};
 use super::{BLOCK_1D, Depth, MAX_GRID_1D};
 use crate::denoiser::{DenoiserError, FrameOutput, OutputFormat};
@@ -421,7 +434,7 @@ impl<R: Runtime> NlmDenoiser<R> {
         let outputs = [client.empty(frame_bytes), client.empty(frame_bytes)];
         let wire_outputs = match output_format {
             OutputFormat::F32 => None,
-            OutputFormat::Wire { depth } => {
+            OutputFormat::Wire { depth, .. } => {
                 let samples = pixels as u32 * params.channels.count();
                 let words = samples.div_ceil(depth.wire_pack().samples_per_word()) as usize;
                 Some([
@@ -820,7 +833,7 @@ impl<R: Runtime> NlmDenoiser<R> {
         // wrong maximum and darkens the whole frame without failing
         // anything else, so it is pinned against the depth this denoiser
         // returns frames in.
-        if let OutputFormat::Wire { depth: out_depth } = self.output_format {
+        if let OutputFormat::Wire { depth: out_depth, .. } = self.output_format {
             assert_eq!(
                 depth, out_depth,
                 "wire push depth {depth:?} does not match the denoiser's output depth {out_depth:?}"
@@ -1302,14 +1315,16 @@ impl<R: Runtime> NlmDenoiser<R> {
                 raw_low_unboosted[c] = raw_low_unboosted[c].max(sample.sigma_low[c]);
             }
             raw_temporal_only = Some(sample.sigma_low);
-            self.rho_smoothed = Some(if windowed {
-                sample.rho
-            } else {
-                match self.rho_smoothed {
-                    None => sample.rho,
-                    Some(prev) => EMA_ALPHA * sample.rho + (1.0 - EMA_ALPHA) * prev,
-                }
-            });
+            self.rho_smoothed = Some(
+                if windowed {
+                    sample.rho
+                } else {
+                    match self.rho_smoothed {
+                        None => sample.rho,
+                        Some(prev) => EMA_ALPHA * sample.rho + (1.0 - EMA_ALPHA) * prev,
+                    }
+                },
+            );
         } else if windowed {
             // Window-local estimation must not let an earlier push's
             // correlation reading leak into a fold that has no temporal
@@ -1700,17 +1715,15 @@ impl<R: Runtime> NlmDenoiser<R> {
             &self.client,
             output.handle,
             self.wire_outputs.as_ref().map(|w| &w[output.slot]),
-            self.params.channels.count(),
-            self.params.channels.storage_count(),
-            pixels,
+            ReadbackShape {
+                channels: self.params.channels.count(),
+                stored_ch: self.params.channels.storage_count(),
+                pixels,
+                width: self.width,
+            },
             self.output_format,
+            None,
         )))
-    }
-
-    /// The packed-word destinations, which are `Some` only in wire mode.
-    #[cfg(test)]
-    pub(crate) fn wire_outputs_for_test(&self) -> Option<&[Handle; 2]> {
-        self.wire_outputs.as_ref()
     }
 
     /// The smoothed per-channel sigma estimate NLMeans is currently
@@ -2009,10 +2022,14 @@ impl<R: Runtime> NlmDenoiser<R> {
                     &self.client,
                     output.handle,
                     self.wire_outputs.as_ref().map(|w| &w[output.slot]),
-                    self.params.channels.count(),
-                    self.params.channels.storage_count(),
-                    pixels,
+                    ReadbackShape {
+                        channels: self.params.channels.count(),
+                        stored_ch: self.params.channels.storage_count(),
+                        pixels,
+                        width: self.width,
+                    },
                     self.output_format,
+                    None,
                 );
                 pending.wait_into(&mut self.output_scratch)?;
                 sink(&self.output_scratch);

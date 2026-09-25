@@ -14,6 +14,13 @@ use crate::denoiser::{FrameOutput, OutputFormat};
 
 pub(crate) type ReadFuture = Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ServerError>> + Send>>;
 
+pub(crate) struct ReadbackShape {
+    pub channels: u32,
+    pub stored_ch: u32,
+    pub pixels: usize,
+    pub width: u32,
+}
+
 /// A denoise that is still in flight.
 ///
 /// The kernels are queued, the GPU may still be working on them, and the
@@ -173,7 +180,7 @@ pub(super) fn empty_output(pixels: usize, channels: u32, format: OutputFormat) -
     let samples = pixels * channels as usize;
     match format {
         OutputFormat::F32 => FrameOutput::F32(Vec::with_capacity(samples)),
-        OutputFormat::Wire { depth } => {
+        OutputFormat::Wire { depth, .. } => {
             FrameOutput::Wire(Vec::with_capacity(samples * depth.bytes_per_sample()))
         },
     }
@@ -198,7 +205,7 @@ fn unpack_into(
         (OutputFormat::F32, FrameOutput::F32(out)) => {
             unpack_bytes_into(bytes, pixels, channels, stored_ch, out);
         },
-        (OutputFormat::Wire { depth }, FrameOutput::Wire(out)) => {
+        (OutputFormat::Wire { depth, .. }, FrameOutput::Wire(out)) => {
             unpack_wire_into(bytes, samples * depth.bytes_per_sample(), out);
         },
         (OutputFormat::F32, dst) => {
@@ -206,7 +213,7 @@ fn unpack_into(
             unpack_bytes_into(bytes, pixels, channels, stored_ch, &mut out);
             *dst = FrameOutput::F32(out);
         },
-        (OutputFormat::Wire { depth }, dst) => {
+        (OutputFormat::Wire { depth, .. }, dst) => {
             let mut out = Vec::new();
             unpack_wire_into(bytes, samples * depth.bytes_per_sample(), &mut out);
             *dst = FrameOutput::Wire(out);
@@ -243,15 +250,14 @@ pub(crate) fn start_readback<R: Runtime>(
     client: &ComputeClient<R>,
     handle: Handle,
     wire_dst: Option<&Handle>,
-    channels: u32,
-    stored_ch: u32,
-    pixels: usize,
+    shape: ReadbackShape,
     format: OutputFormat,
+    fruit_dither: Option<&Handle>,
 ) -> Pending<R> {
     let handle = match (format, wire_dst) {
         (OutputFormat::F32, _) => handle,
-        (OutputFormat::Wire { depth }, Some(dst)) => {
-            pack_wire(client, &handle, dst, channels, stored_ch, pixels, depth);
+        (OutputFormat::Wire { depth, source_depth }, Some(dst)) => {
+            pack_wire(client, &handle, dst, &shape, depth, source_depth, fruit_dither);
             dst.clone()
         },
         (OutputFormat::Wire { .. }, None) => {
@@ -267,7 +273,7 @@ pub(crate) fn start_readback<R: Runtime>(
     let client = client.clone();
     let fut = Box::pin(async move { client.read_async(vec![handle]).await });
 
-    Pending::new(fut, channels, stored_ch, pixels, format)
+    Pending::new(fut, shape.channels, shape.stored_ch, shape.pixels, format)
 }
 
 /// Queues [`gpu_pack_wire`] over `src`, writing the packed words into `dst`.
@@ -275,34 +281,49 @@ fn pack_wire<R: Runtime>(
     client: &ComputeClient<R>,
     src: &Handle,
     dst: &Handle,
-    channels: u32,
-    stored_ch: u32,
-    pixels: usize,
+    shape: &ReadbackShape,
     depth: Depth,
+    source_depth: Depth,
+    fruit_dither: Option<&Handle>,
 ) {
     let pack = depth.wire_pack();
-    let samples = pixels as u32 * channels;
+    let samples = shape.pixels as u32 * shape.channels;
     let words = samples.div_ceil(pack.samples_per_word());
 
-    let split_planes = wire_splits_planes(channels);
-    let outer = if split_planes { pixels as u32 } else { channels };
+    let split_planes = wire_splits_planes(shape.channels);
+    let outer = if split_planes {
+        shape.pixels as u32
+    } else {
+        shape.channels
+    };
 
     let grid = words.div_ceil(BLOCK_1D).clamp(1, MAX_GRID_1D);
     let total_threads = grid * BLOCK_1D;
 
     unsafe {
+        let dither = fruit_dither.unwrap_or(src);
         gpu_pack_wire::launch_unchecked::<R>(
             client,
             CubeCount::new_1d(grid),
             CubeDim::new_1d(BLOCK_1D),
-            ArrayArg::from_raw_parts(src.clone(), pixels * stored_ch as usize),
+            ArrayArg::from_raw_parts(src.clone(), shape.pixels * shape.stored_ch as usize),
             ArrayArg::from_raw_parts(dst.clone(), words as usize),
-            pack.max(),
-            pixels as u32,
-            channels,
-            stored_ch,
+            ArrayArg::from_raw_parts(
+                dither.clone(),
+                if fruit_dither.is_some() {
+                    4096
+                } else {
+                    shape.pixels * shape.stored_ch as usize
+                },
+            ),
+            wire_scale(source_depth, depth),
+            shape.width,
+            shape.pixels as u32,
+            shape.channels,
+            shape.stored_ch,
             outer,
             split_planes,
+            fruit_dither.is_some(),
             pack.samples_per_word(),
             words,
             total_threads,
@@ -316,6 +337,15 @@ fn pack_wire<R: Runtime>(
 /// Only the chroma pair splits. A luma frame has nothing to split, and a
 /// packed YUV frame stays interleaved because that is the layout its
 /// consumer already reads.
+fn wire_scale(source: Depth, output: Depth) -> f32 {
+    let difference = output.bits() as i32 - source.bits() as i32;
+    if difference >= 0 {
+        source.max_value() * (1u32 << difference) as f32
+    } else {
+        source.max_value() / (1u32 << -difference) as f32
+    }
+}
+
 pub(crate) fn wire_splits_planes(channels: u32) -> bool {
     channels == 2
 }

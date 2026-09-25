@@ -1,0 +1,10 @@
+av-denoise includes a precomputed 64x64 fruit dithering matrix derived from mpv's
+video/out/dither.c.
+
+Copyright © 2013 Wessel Dankers <wsl@fruit.je>
+
+This component is licensed under the GNU Lesser General Public License,
+version 2.1 or (at your option) any later version. The license text is in
+LICENSES/LGPL-2.1-or-later.txt. Its source is available at
+https://github.com/mpv-player/mpv/blob/e76a35ea/video/out/dither.c.
+

@@ -91,12 +91,15 @@ pub fn gpu_zero_buffers(
 pub fn gpu_pack_wire(
     src: &Array<f32>,
     dst: &mut Array<u32>,
+    dither: &Array<u32>,
     max: f32,
+    #[comptime] width: u32,
     #[comptime] pixels: u32,
     #[comptime] channels: u32,
     #[comptime] stored_ch: u32,
     #[comptime] outer: u32,
     #[comptime] split_planes: bool,
+    #[comptime] fruit_dither: bool,
     #[comptime] samples_per_word: u32,
     #[comptime] words: u32,
     #[comptime] total_threads: u32,
@@ -122,7 +125,14 @@ pub fn gpu_pack_wire(
             let src_idx = select(split_planes, b * stored_ch + a, a * stored_ch + b);
 
             let v = f32::clamp(src[src_idx as usize], 0.0, 1.0);
-            let q = u32::cast_from(v * max + 0.5);
+            let pixel = select(split_planes, b, a);
+            let mut threshold = 0.5f32;
+            if comptime![fruit_dither] {
+                let x = pixel % width;
+                let y = pixel / width;
+                threshold = (f32::cast_from(dither[((y & 63) * 64 + (x & 63)) as usize]) + 0.5) / 4096.0;
+            }
+            let q = u32::min(u32::cast_from(v * max + threshold), u32::cast_from(max));
 
             acc |= select(s < samples, q, 0u32) << (lane * bits);
         }

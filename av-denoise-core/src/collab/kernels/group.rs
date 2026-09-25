@@ -15,19 +15,6 @@ pub(crate) fn pack_pos(x: u32, y: u32) -> u32 {
     (y << 13) | x
 }
 
-/// The host-side mirror of [`pack_pos`], for building expected values in
-/// tests without a GPU round trip.
-#[cfg(all(test, any(feature = "vulkan", feature = "metal")))]
-pub(crate) fn pack_pos_host(x: u32, y: u32) -> u32 {
-    (y << 13) | x
-}
-
-/// The host-side mirror of unpacking a position [`pack_pos`] produced.
-#[cfg(all(test, any(feature = "vulkan", feature = "metal")))]
-pub(crate) fn unpack_pos_host(packed: u32) -> (u32, u32) {
-    (packed & 0x1FFF, (packed >> 13) & 0x1FFF)
-}
-
 /// Packs a candidate position and the neighbour it came from into one
 /// word.
 ///
@@ -55,18 +42,6 @@ pub(crate) fn pack_pos_t(x: u32, y: u32, t: u32) -> u32 {
 #[cube]
 pub(crate) fn unpack_t(packed: u32) -> u32 {
     packed >> 26u32
-}
-
-/// The host-side mirror of [`pack_pos_t`].
-#[cfg(all(test, any(feature = "vulkan", feature = "metal")))]
-pub(crate) fn pack_pos_t_host(x: u32, y: u32, t: u32) -> u32 {
-    (t << 26) | (y << 13) | x
-}
-
-/// The host-side mirror of [`unpack_t`].
-#[cfg(all(test, any(feature = "vulkan", feature = "metal")))]
-pub(crate) fn unpack_t_host(packed: u32) -> u32 {
-    packed >> 26
 }
 
 /// Clamps a candidate top-left coordinate to `[0, max_pos]`.

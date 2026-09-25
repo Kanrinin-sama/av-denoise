@@ -136,7 +136,7 @@ impl Ffms2Decoder {
                 index_handle.track,
                 index_handle.idx_handle,
                 threads,
-                0,
+                1,
                 std::ptr::addr_of_mut!(err),
             )
         };
@@ -220,11 +220,11 @@ impl Ffms2Decoder {
         let input_cstr = CString::from_str(&input.to_string_lossy())
             .map_err(|e| DecoderError::FileReadError { cause: e.to_string() })?;
 
-        let idx_path = format!("{}.ffindex", input.to_string_lossy());
-        let idx_cstr = CString::new(idx_path.as_str())
+        let idx_path = std::path::PathBuf::from(format!("{}.ffindex", input.to_string_lossy()));
+        let idx_cstr = CString::new(idx_path.to_string_lossy().as_bytes())
             .map_err(|e| DecoderError::FileReadError { cause: e.to_string() })?;
 
-        let mut idx = if std::path::Path::new(&idx_path).exists() {
+        let mut idx = if idx_path.exists() {
             // SAFETY: `idx_cstr` is not null since we just created it
             unsafe { FFMS_ReadIndex(idx_cstr.as_ptr(), std::ptr::addr_of_mut!(err)) }
         } else {
@@ -245,6 +245,9 @@ impl Ffms2Decoder {
         }
 
         let idx = if idx.is_null() {
+            if idx_path.exists() {
+                let _ = std::fs::remove_file(&idx_path);
+            }
             // SAFETY: `input_cstr` is not null since we created it
             let idxer = unsafe { FFMS_CreateIndexer(input_cstr.as_ptr(), std::ptr::addr_of_mut!(err)) };
             if idxer.is_null() {
@@ -274,8 +277,38 @@ impl Ffms2Decoder {
                 });
             }
 
-            // SAFETY: verified `idx` is not null
-            unsafe { FFMS_WriteIndex(idx_cstr.as_ptr(), idx, std::ptr::addr_of_mut!(err)) };
+            let temporary_path = idx_path.with_extension(format!(
+                "ffindex.{}.{}.tmp",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            let temporary_cstr = CString::new(temporary_path.to_string_lossy().as_bytes())
+                .map_err(|e| DecoderError::FileReadError { cause: e.to_string() })?;
+            free_error_info(&mut err);
+            err = unsafe { empty_error_info() };
+            let write_result = unsafe {
+                FFMS_WriteIndex(temporary_cstr.as_ptr(), idx, std::ptr::addr_of_mut!(err))
+            };
+            if write_result != 0 {
+                let error_msg = get_error_message(err);
+                let _ = std::fs::remove_file(&temporary_path);
+                unsafe { FFMS_DestroyIndex(idx) };
+                free_error_info(&mut err);
+                return Err(DecoderError::FileReadError { cause: error_msg });
+            }
+            if let Err(error) = std::fs::rename(&temporary_path, &idx_path) {
+                let _ = std::fs::remove_file(&temporary_path);
+                if !idx_path.exists() {
+                    unsafe { FFMS_DestroyIndex(idx) };
+                    free_error_info(&mut err);
+                    return Err(DecoderError::FileReadError {
+                        cause: error.to_string(),
+                    });
+                }
+            }
             idx
         } else {
             idx

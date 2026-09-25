@@ -198,6 +198,11 @@ pub enum Command {
         keep_frames: Vec<FrameRange>,
     },
 
+    Index {
+        #[arg(short, long)]
+        input: std::path::PathBuf,
+    },
+
     /// List the devices each backend can see on this machine.
     ///
     /// Every row names a device in the spelling `--device` takes, next

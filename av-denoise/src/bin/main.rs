@@ -31,6 +31,7 @@ fn run_input(
     frame_budget: Option<u64>,
     scene_layout: Option<&std::path::Path>,
     keep_frames: &[cli::FrameRange],
+    scene_span: Option<cli::FrameRange>,
 ) -> Result<(), anyhow::Error> {
     match input {
         InputSource::File(path) => file_mode::run_file(
@@ -40,6 +41,7 @@ fn run_input(
             frame_budget.unwrap_or(DEFAULT_FRAME_BUDGET_BYTES),
             scene_layout,
             keep_frames,
+            scene_span,
         ),
         stream @ (InputSource::Stdin | InputSource::Fd(_)) => {
             if workers.is_some() {
@@ -95,6 +97,11 @@ fn main() -> anyhow::Result<()> {
         return file_mode::write_scene_layout(input, output, keep_frames);
     }
 
+    if let Command::Index { input } = &args.command {
+        av_decoders::Decoder::from_file(input)?;
+        return Ok(());
+    }
+
     // Point CubeCL at a kernel cache. This has to run before
     // Denoiser::create, because the first CubeCL client locks the global
     // config the moment it is built.
@@ -107,7 +114,7 @@ fn main() -> anyhow::Result<()> {
         Err(err) => return Err(anyhow::Error::new(err).context("unable to install the kernel cache")),
     }
 
-    let (opts, input, workers, frame_budget, scene_layout, keep_frames) = match &args.command {
+    let (opts, input, workers, frame_budget, scene_layout, keep_frames, scene_span) = match &args.command {
         Command::Nlmeans(nlm) => (
             nlm.build_options(&args)?,
             &nlm.common.input,
@@ -115,6 +122,7 @@ fn main() -> anyhow::Result<()> {
             nlm.common.frame_budget,
             nlm.common.scene_layout.as_deref(),
             nlm.common.keep_frames.as_slice(),
+            nlm.common.scene_span,
         ),
         Command::Nl4d(nl4d) => (
             nl4d.build_options(&args)?,
@@ -123,10 +131,47 @@ fn main() -> anyhow::Result<()> {
             nl4d.common.frame_budget,
             nl4d.common.scene_layout.as_deref(),
             nl4d.common.keep_frames.as_slice(),
+            nl4d.common.scene_span,
         ),
         // Handled above, before any denoising options are built.
-        Command::ListDevices | Command::Scenes { .. } => unreachable!(),
+        Command::ListDevices | Command::Scenes { .. } | Command::Index { .. } => unreachable!(),
     };
 
-    run_input(&opts, input, workers, frame_budget, scene_layout, keep_frames)
+    if let Some(slots) = nl4d_window_service_slots(&args.command) {
+        let InputSource::File(path) = input else {
+            anyhow::bail!("--window-service-slots requires a file input");
+        };
+        let Some(scene_layout) = scene_layout else {
+            anyhow::bail!("--window-service-slots requires --scene-layout");
+        };
+        if scene_span.is_some() {
+            anyhow::bail!("--window-service-slots cannot be combined with --scene-span");
+        }
+        return file_mode::run_window_service(
+            &opts,
+            path,
+            workers.unwrap_or(DEFAULT_WORKERS),
+            frame_budget.unwrap_or(DEFAULT_FRAME_BUDGET_BYTES),
+            scene_layout,
+            keep_frames,
+            slots,
+        );
+    }
+
+    run_input(
+        &opts,
+        input,
+        workers,
+        frame_budget,
+        scene_layout,
+        keep_frames,
+        scene_span,
+    )
+}
+
+fn nl4d_window_service_slots(command: &Command) -> Option<usize> {
+    match command {
+        Command::Nl4d(nl4d) => nl4d.common.window_service_slots,
+        _ => None,
+    }
 }

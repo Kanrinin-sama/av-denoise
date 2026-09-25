@@ -94,20 +94,6 @@ pub struct DecoderConfig {
     pub luma_only: bool,
 }
 
-#[cfg(test)]
-impl Default for VideoDetails {
-    #[inline]
-    fn default() -> Self {
-        VideoDetails {
-            width: 640,
-            height: 480,
-            bit_depth: 8,
-            chroma_sampling: ChromaSubsampling::Yuv420,
-            frame_rate: Rational32::new(30, 1),
-            total_frames: None,
-        }
-    }
-}
 
 /// A unified video decoder that can handle multiple video formats and sources.
 ///

@@ -508,6 +508,7 @@ pub fn plane_options_from(
         device,
         intent,
         mode,
+        output_depth: None,
         algorithm,
         luma_strength: raw.luma_strength.map(|v| v as f32),
         chroma_strength: raw.chroma_strength.map(|v| v as f32),

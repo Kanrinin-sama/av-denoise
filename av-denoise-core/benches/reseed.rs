@@ -58,6 +58,7 @@ fn plane_options(accelerators: &[Accelerator], device: &Device) -> PlaneOptions 
         device: device.clone(),
         intent: ChannelIntent::LumaChroma,
         mode: DenoisingMode::Temporal { radius: RADIUS },
+        output_depth: None,
         algorithm: Algorithm::default(),
         luma_strength: None,
         chroma_strength: None,
