@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use av_decoders::Decoder;
-use ffms2_sys::{FFMS_GetFrameInfo, FFMS_GetNumFrames, FFMS_GetTrackFromVideo};
+use ffms2_sys::{FFMS_GetFrameInfo, FFMS_GetNumFrames, FFMS_GetTimeBase, FFMS_GetTrackFromVideo};
 
 /// One entry of the ffms2 video index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +62,23 @@ pub fn read_index(decoder: &mut Decoder) -> Option<Vec<IndexEntry>> {
     }
 
     Some(index)
+}
+
+/// Seconds per unit of the index timestamps [`read_index`] returns.
+pub fn read_time_base(decoder: &mut Decoder) -> Option<f64> {
+    let source = decoder.get_ffms2_impl()?.video_source;
+
+    // SAFETY: as in `read_index`, the track belongs to the live source.
+    let track = unsafe { FFMS_GetTrackFromVideo(source) };
+
+    if track.is_null() {
+        return None;
+    }
+
+    // SAFETY: `track` is non-null, and ffms2 owns the time base it points at.
+    let base = unsafe { FFMS_GetTimeBase(track).as_ref() }?;
+
+    (base.Den > 0).then(|| base.Num as f64 / base.Den as f64 / 1000.0)
 }
 
 /// Returns the index positions that carry no picture of their own.

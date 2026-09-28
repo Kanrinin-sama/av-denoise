@@ -4,7 +4,11 @@ use tracing_subscriber::EnvFilter;
 mod cli;
 mod file_mode;
 mod frame_index;
+mod nvdec_source;
 mod progress;
+mod scan_chunks;
+mod scan_source;
+mod scene_scan;
 mod stream_mode;
 mod warm_start;
 mod y4m_format;
@@ -92,9 +96,10 @@ fn main() -> anyhow::Result<()> {
         input,
         output,
         keep_frames,
+        ffmpeg,
     } = &args.command
     {
-        return file_mode::write_scene_layout(input, output, keep_frames);
+        return file_mode::write_scene_layout(input, output, keep_frames, ffmpeg.as_deref());
     }
 
     if let Command::Index { input } = &args.command {

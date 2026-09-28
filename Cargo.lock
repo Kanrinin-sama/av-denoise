@@ -191,6 +191,7 @@ dependencies = [
  "ffms2-sys",
  "indicatif",
  "mimalloc",
+ "rayon",
  "serde",
  "serde_json",
  "strum",

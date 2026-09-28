@@ -43,6 +43,7 @@ av-decoders = { version = "0.9", optional = true, features = ["ffms2"] }
 # ffms2-sys that av-decoders links, so both share one set of handles.
 ffms2-sys = { version = "0.3", optional = true }
 v_frame = { version = "0.5", optional = true }
+rayon = { version = "1", optional = true }
 
 # Frame ingestion via y4m stdin
 y4m = { version = "0.8", optional = true }
@@ -72,6 +73,7 @@ binary = [
     "av-decoders",
     "ffms2-sys",
     "v_frame",
+    "rayon",
     "y4m",
     "indicatif",
     "tracing-indicatif",

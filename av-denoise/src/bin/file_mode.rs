@@ -16,13 +16,12 @@ use av_denoise::{
     WarmUp,
     push_needs_retry,
 };
-use av_scenechange::{DetectionOptions, detect_scene_changes};
 use indicatif::ProgressBar;
 use y4m::Frame as Y4mFrame;
 
 use crate::cli::{FrameRange, RunOptions};
-use crate::frame_index;
-use crate::progress::{self, denoise_bar_visible, denoise_progress_bar, scene_progress_bar};
+use crate::progress::{self, denoise_bar_visible, denoise_progress_bar};
+use crate::scene_scan;
 use crate::warm_start::{create_denoiser, finish_warm_up};
 use crate::y4m_format::subsampling_to_y4m;
 
@@ -115,27 +114,27 @@ fn frame_permit_channel(count: usize) -> (crossbeam_channel::Sender<()>, crossbe
 /// Scene boundaries plus the video metadata needed to build the output
 /// y4m header.
 #[derive(Clone)]
-struct SceneLayout {
-    layout: FrameLayout,
-    framerate: Rational32,
+pub(crate) struct SceneLayout {
+    pub(crate) layout: FrameLayout,
+    pub(crate) framerate: Rational32,
     /// Frames this run emits, being `raw_frames` less the phantom entries.
-    total_frames: usize,
+    pub(crate) total_frames: usize,
     /// Frames the decoder hands over, phantom entries included. Every
     /// one has to be read to keep the sequential decoder in step, even
     /// though only `total_frames` of them are emitted.
-    raw_frames: usize,
+    pub(crate) raw_frames: usize,
     /// Decoder frame numbers that carry no picture of their own. See
     /// [`crate::frame_index`].
-    phantom: BTreeSet<usize>,
+    pub(crate) phantom: BTreeSet<usize>,
     /// `scene_starts[i]` is the inclusive start frame of scene `i`, in  emitted frame numbers.
     /// The final entry is `total_frames` so scene `i` covers `scene_starts[i]..scene_starts[i + 1]`.
-    scene_starts: Vec<usize>,
-    source_ranges: Vec<(usize, usize)>,
-    keep_frames: Vec<FrameRange>,
+    pub(crate) scene_starts: Vec<usize>,
+    pub(crate) source_ranges: Vec<(usize, usize)>,
+    pub(crate) keep_frames: Vec<FrameRange>,
 }
 
 const SCENE_LAYOUT_SCHEMA: u32 = 1;
-const SCENE_DETECTOR_ID: &str = "av-scenechange-0.23-default";
+const SCENE_DETECTOR_ID: &str = "av-scenechange-0.23-default-chunked-1080p";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredSceneLayout {
@@ -212,7 +211,7 @@ fn run_file_to(
     let is_terminal = std::io::stderr().is_terminal();
     let scenes = match stored_layout {
         Some(path) => read_scene_layout(input, path, keep_frames)?,
-        None if keep_frames.is_empty() => detect_scenes(input, is_terminal)?,
+        None if keep_frames.is_empty() => scene_scan::detect(input, keep_frames, None, is_terminal)?,
         None => anyhow::bail!("--keep-frames requires --scene-layout; run `scenes` first"),
     };
     let scenes = match scene_span {
@@ -489,12 +488,9 @@ pub fn write_scene_layout(
     input: &Path,
     output: &Path,
     keep_frames: &[FrameRange],
+    ffmpeg: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
-    let scenes = if keep_frames.is_empty() {
-        detect_scenes(input, std::io::stderr().is_terminal())?
-    } else {
-        detect_kept_scenes(input, keep_frames, std::io::stderr().is_terminal())?
-    };
+    let scenes = scene_scan::detect(input, keep_frames, ffmpeg, std::io::stderr().is_terminal())?;
     let stored = StoredSceneLayout::from_layout(&scenes);
     let bytes = serde_json::to_vec(&stored)?;
     let name = output
@@ -677,106 +673,7 @@ fn merge_adjacent_ranges(ranges: &[FrameRange]) -> Vec<FrameRange> {
     merged
 }
 
-/// Opens the input, reads its layout, and runs `av_scenechange` to
-/// produce a list of scene boundaries.
-///
-/// Returns once the detector pass has finished and the temporary decoder
-/// it used has been dropped.
-fn detect_scenes(input: &Path, visible: bool) -> Result<SceneLayout, anyhow::Error> {
-    let index_path = std::path::PathBuf::from(format!("{}.ffindex", input.to_string_lossy()));
-    let index_existed = index_path.try_exists()?;
-    let decoder = Decoder::from_file(input);
-    if !index_existed {
-        let _ = std::fs::remove_file(index_path);
-    }
-    let mut decoder = decoder?;
-    let details = *decoder.get_video_details();
-
-    let depth = Depth::from_bits(details.bit_depth)?;
-
-    let layout = FrameLayout {
-        width: details.width as u32,
-        height: details.height as u32,
-        subsampling: subsampling_from_av_decoders(details.chroma_sampling)?,
-        depth,
-    };
-
-    tracing::info!(
-        width = layout.width,
-        height = layout.height,
-        subsampling = ?layout.subsampling,
-        depth = ?layout.depth,
-        total_frames = details.total_frames,
-        "running scene detection",
-    );
-
-    // Read the index before decoding anything. This only inspects the
-    // metadata ffms2 already built, so it costs nothing.
-    let phantom = frame_index::read_index(&mut decoder)
-        .map(|index| frame_index::phantom_indices(&index))
-        .unwrap_or_default();
-
-    if !phantom.is_empty() {
-        tracing::info!(
-            dropped = phantom.len(),
-            "the decoder reports frames that carry no picture of their own, dropping them",
-        );
-    }
-
-    let pb = scene_progress_bar(details.total_frames, visible);
-    let on_progress = |frames_analyzed: usize, _keyframe_count: usize| {
-        pb.set_position(frames_analyzed as u64);
-    };
-
-    let detect_opts = DetectionOptions::default();
-    let detection = match depth {
-        Depth::Eight => detect_scene_changes::<u8>(&mut decoder, detect_opts, None, Some(&on_progress))?,
-        Depth::Ten | Depth::Twelve => {
-            detect_scene_changes::<u16>(&mut decoder, detect_opts, None, Some(&on_progress))?
-        },
-    };
-
-    progress::finish(&pb);
-
-    drop(decoder);
-
-    let mut scene_starts = detection.scene_changes;
-
-    if scene_starts.is_empty() || scene_starts[0] != 0 {
-        scene_starts.insert(0, 0);
-    }
-
-    // Detection ran over every frame the decoder offers, so both the count and the boundaries
-    // are in decoder frame numbers. Both move into emitted frame numbers together.
-    let raw_frames = detection.frame_count;
-
-    // The index lists every entry the container holds, while detection counts
-    // what the decoder handed over. A decode that stops early leaves entries
-    // above the last frame read, and those match no frame this run sees.
-    let phantom: BTreeSet<usize> = phantom.into_iter().take_while(|&raw| raw < raw_frames).collect();
-
-    scene_starts.push(raw_frames);
-
-    let scene_starts = frame_index::remap_scene_starts(&scene_starts, &phantom);
-    let total_frames = raw_frames - phantom.len();
-
-    if total_frames == 0 {
-        anyhow::bail!("{} holds no decodable frames", input.display());
-    }
-
-    Ok(SceneLayout {
-        layout,
-        framerate: details.frame_rate,
-        total_frames,
-        raw_frames,
-        phantom,
-        scene_starts,
-        source_ranges: vec![(0, raw_frames)],
-        keep_frames: Vec::new(),
-    })
-}
-
-fn validate_keep_frames(ranges: &[FrameRange], total: usize) -> Result<(), anyhow::Error> {
+pub(crate) fn validate_keep_frames(ranges: &[FrameRange], total: usize) -> Result<(), anyhow::Error> {
     if ranges.is_empty()
         || ranges
             .iter()
@@ -788,7 +685,7 @@ fn validate_keep_frames(ranges: &[FrameRange], total: usize) -> Result<(), anyho
     Ok(())
 }
 
-fn emitted_boundary_to_raw(emitted: usize, raw_total: usize, phantom: &BTreeSet<usize>) -> usize {
+pub(crate) fn emitted_boundary_to_raw(emitted: usize, raw_total: usize, phantom: &BTreeSet<usize>) -> usize {
     let mut seen = 0usize;
     for raw in 0..raw_total {
         if seen == emitted {
@@ -799,95 +696,6 @@ fn emitted_boundary_to_raw(emitted: usize, raw_total: usize, phantom: &BTreeSet<
         }
     }
     raw_total
-}
-
-fn detect_kept_scenes(
-    input: &Path,
-    keep_frames: &[FrameRange],
-    visible: bool,
-) -> Result<SceneLayout, anyhow::Error> {
-    let mut metadata = Decoder::from_file(input)?;
-    let details = *metadata.get_video_details();
-    let raw_frames = details
-        .total_frames
-        .ok_or_else(|| anyhow::anyhow!("FFMS2 did not report a source frame count"))?;
-    let phantom = frame_index::read_index(&mut metadata)
-        .map(|index| frame_index::phantom_indices(&index))
-        .unwrap_or_default();
-    let source_total = raw_frames - phantom.len();
-    validate_keep_frames(keep_frames, source_total)?;
-    let depth = Depth::from_bits(details.bit_depth)?;
-    let layout = FrameLayout {
-        width: details.width as u32,
-        height: details.height as u32,
-        subsampling: subsampling_from_av_decoders(details.chroma_sampling)?,
-        depth,
-    };
-    drop(metadata);
-    let source_ranges = keep_frames
-        .iter()
-        .map(|range| {
-            (
-                emitted_boundary_to_raw(range.start, raw_frames, &phantom),
-                emitted_boundary_to_raw(range.end, raw_frames, &phantom),
-            )
-        })
-        .collect::<Vec<_>>();
-    let total_frames = keep_frames.iter().map(|range| range.end - range.start).sum();
-    let pb = scene_progress_bar(Some(total_frames), visible);
-    let mut analyzed = 0usize;
-    let mut scene_starts = vec![0usize];
-    let mut compact_offset = 0usize;
-    for &(raw_start, raw_end) in &source_ranges {
-        let mut decoder = Decoder::from_file(input)?;
-        decoder.seek_video_frame(raw_start)?;
-        let raw_count = raw_end - raw_start;
-        let on_progress = |frames: usize, _keyframes: usize| {
-            pb.set_position((analyzed + frames) as u64);
-        };
-        let detection = match depth {
-            Depth::Eight => detect_scene_changes::<u8>(
-                &mut decoder,
-                DetectionOptions::default(),
-                Some(raw_count),
-                Some(&on_progress),
-            )?,
-            Depth::Ten | Depth::Twelve => detect_scene_changes::<u16>(
-                &mut decoder,
-                DetectionOptions::default(),
-                Some(raw_count),
-                Some(&on_progress),
-            )?,
-        };
-        let local_phantom = phantom
-            .range(raw_start..raw_end)
-            .map(|index| index - raw_start)
-            .collect::<BTreeSet<_>>();
-        let remapped = frame_index::remap_scene_starts(&detection.scene_changes, &local_phantom);
-        scene_starts.extend(
-            remapped
-                .into_iter()
-                .filter(|start| *start > 0)
-                .map(|start| compact_offset + start),
-        );
-        let emitted_count = raw_count - local_phantom.len();
-        compact_offset += emitted_count;
-        scene_starts.push(compact_offset);
-        analyzed += raw_count;
-    }
-    progress::finish(&pb);
-    scene_starts.sort_unstable();
-    scene_starts.dedup();
-    Ok(SceneLayout {
-        layout,
-        framerate: details.frame_rate,
-        total_frames,
-        raw_frames,
-        phantom,
-        scene_starts,
-        source_ranges,
-        keep_frames: keep_frames.to_vec(),
-    })
 }
 
 /// Starts the worker pool and the coordinator, reopens the decoder for
@@ -1502,7 +1310,7 @@ fn collect_plane_u16(plane: &v_frame::plane::Plane<u16>) -> Vec<u8> {
     out
 }
 
-fn subsampling_from_av_decoders(
+pub(crate) fn subsampling_from_av_decoders(
     cs: v_frame::chroma::ChromaSubsampling,
 ) -> Result<Subsampling, anyhow::Error> {
     use v_frame::chroma::ChromaSubsampling;

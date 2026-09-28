@@ -196,6 +196,8 @@ pub enum Command {
         output: std::path::PathBuf,
         #[arg(long = "keep-frames", value_name = "START:END")]
         keep_frames: Vec<FrameRange>,
+        #[arg(long)]
+        ffmpeg: Option<std::path::PathBuf>,
     },
 
     Index {
