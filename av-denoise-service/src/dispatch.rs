@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use av_decoders::Decoder;
 use av_denoise_core::{Depth, Planes};
 use crossbeam_channel::{Receiver, Sender};
@@ -99,20 +97,13 @@ where
     Ok(())
 }
 
-/// Opens the input and stages every frame it decodes.
+/// Stages every frame `decoder` reads.
 pub(crate) fn dispatch_frames(
-    input: &Path,
+    decoder: Decoder,
     scenes: &SceneLayout,
     staging: &Staging<'_>,
 ) -> Result<(), anyhow::Error> {
-    let index_path = std::path::PathBuf::from(format!("{}.ffindex", input.to_string_lossy()));
-    let index_existed = index_path.try_exists()?;
-    let decoder = Decoder::from_file(input);
-    if !index_existed {
-        let _ = std::fs::remove_file(index_path);
-    }
-
-    stage_frames(emitted_frames(decoder?, scenes), scenes, staging)
+    stage_frames(emitted_frames(decoder, scenes), scenes, staging)
 }
 
 /// Decodes the source ranges in order, reading past phantom frames.

@@ -7,6 +7,7 @@ mod layout;
 mod pipeline;
 mod planes;
 mod service;
+mod source;
 mod stored_layout;
 mod warm;
 mod window;

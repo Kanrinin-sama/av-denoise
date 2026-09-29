@@ -7,6 +7,8 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::cancel::Cancel;
 use crate::pipeline::{Pipeline, panic_message};
+use crate::source::open_source;
+use crate::stored_layout::UncheckedLayout;
 use crate::window::{Window, WindowJob};
 use crate::{FrameRange, SceneLayout, ServiceConfig};
 
@@ -38,12 +40,13 @@ impl WindowService {
         if config.workers == 0 {
             anyhow::bail!("--workers must be at least 1");
         }
-        let scenes = SceneLayout::read(&config.source, &config.scene_layout, &config.keep_frames)?;
+        let unchecked = UncheckedLayout::load(&config.scene_layout, &config.keep_frames)?;
+        let source_layout = unchecked.frame_layout()?;
         let pipeline = Arc::new(Pipeline::new(
             config.planes,
-            config.source,
+            config.source.clone(),
             config.workers,
-            scenes.layout,
+            source_layout,
             config.frame_budget,
             config.slots,
         )?);
@@ -53,7 +56,7 @@ impl WindowService {
                 let busy = Arc::new(AtomicBool::new(false));
                 let pipeline = Arc::clone(&pipeline);
                 let slot_busy = Arc::clone(&busy);
-                let handle = thread::spawn(move || run_slot(&pipeline, &slot_busy, &rx));
+                let handle = thread::spawn(move || run_slot(&pipeline, source_layout, &slot_busy, &rx));
                 Slot {
                     requests,
                     busy,
@@ -61,6 +64,9 @@ impl WindowService {
                 }
             })
             .collect();
+        let decoder = open_source(&config.source)?;
+        let scenes = unchecked.check(&decoder)?;
+        pipeline.keep_opened(decoder);
         Ok(Self {
             slots,
             output_layout: pipeline.output_layout(scenes.layout),
@@ -120,10 +126,13 @@ impl WindowService {
     }
 }
 
-fn run_slot(pipeline: &Pipeline, busy: &AtomicBool, requests: &Receiver<SlotRequest>) {
-    let mut denoisers = Vec::new();
+fn run_slot(pipeline: &Pipeline, layout: FrameLayout, busy: &AtomicBool, requests: &Receiver<SlotRequest>) {
+    let mut denoisers = pipeline.create_denoisers(layout);
     while let Ok(request) = requests.recv() {
-        let result = pipeline.run(request.job, &mut denoisers);
+        let result = match &mut denoisers {
+            Ok(denoisers) => pipeline.run(request.job, denoisers),
+            Err(error) => Err(anyhow::anyhow!("{error:#}")),
+        };
         busy.store(false, Ordering::Release);
         let _ = request.done.send(result);
     }

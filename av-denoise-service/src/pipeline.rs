@@ -1,16 +1,19 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-use av_denoise_core::{FrameLayout, PlanarDenoiser, PlaneOptions};
+use av_decoders::Decoder;
+use av_denoise_core::{FrameLayout, PlaneOptions};
 
 use crate::SceneLayout;
 use crate::budget::{FramePermits, temporal_radius};
 use crate::cancel::Cancel;
 use crate::dispatch::{Staging, dispatch_frames};
+use crate::source::{OpenedSource, open_source};
+use crate::warm::create_denoiser;
 use crate::window::{Window, WindowJob};
-use crate::worker::spawn_workers;
+use crate::worker::{Resident, spawn_workers};
 
 /// The decode, denoise and budget settings every window of one source
 /// runs with.
@@ -19,6 +22,7 @@ pub(crate) struct Pipeline {
     source: PathBuf,
     workers: usize,
     permits: FramePermits,
+    opened: Mutex<Option<OpenedSource>>,
 }
 
 impl Pipeline {
@@ -55,6 +59,48 @@ impl Pipeline {
             source,
             workers,
             permits,
+            opened: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn keep_opened(&self, decoder: Decoder) {
+        *self
+            .opened
+            .lock()
+            .expect("the opened source lock is never poisoned") = Some(OpenedSource(decoder));
+    }
+
+    fn take_decoder(&self) -> Result<Decoder, anyhow::Error> {
+        let opened = self
+            .opened
+            .lock()
+            .expect("the opened source lock is never poisoned")
+            .take();
+        match opened {
+            Some(OpenedSource(decoder)) => Ok(decoder),
+            None => open_source(&self.source),
+        }
+    }
+
+    pub(crate) fn create_denoisers(
+        &self,
+        layout: FrameLayout,
+    ) -> Result<Vec<Option<Resident>>, anyhow::Error> {
+        thread::scope(|scope| {
+            let builds: Vec<_> = (0..self.workers)
+                .map(|_| scope.spawn(|| create_denoiser(&self.planes, layout)))
+                .collect();
+            builds
+                .into_iter()
+                .map(|build| {
+                    build
+                        .join()
+                        .map_err(|panic| {
+                            anyhow::anyhow!("denoiser build panicked: {}", panic_message(panic.as_ref()))
+                        })?
+                        .map(Some)
+                })
+                .collect()
         })
     }
 
@@ -73,7 +119,7 @@ impl Pipeline {
     pub(crate) fn run(
         &self,
         job: WindowJob,
-        denoisers: &mut Vec<Option<PlanarDenoiser>>,
+        denoisers: &mut Vec<Option<Resident>>,
     ) -> Result<(), anyhow::Error> {
         let scenes = job.scenes()?;
 
@@ -82,7 +128,7 @@ impl Pipeline {
             spawn_workers(&self.planes, scenes.layout, std::mem::take(denoisers), job.output);
 
         dispatch_frames(
-            &self.source,
+            self.take_decoder()?,
             &scenes,
             &Staging {
                 jobs: &job_tx,

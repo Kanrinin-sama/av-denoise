@@ -3,9 +3,10 @@ use std::io::Write;
 use std::path::Path;
 
 use av_decoders::{Decoder, Rational32};
-use av_denoise_core::{Depth, FrameLayout};
+use av_denoise_core::{Depth, FrameLayout, Subsampling};
 
 use crate::layout::{merge_adjacent_ranges, subsampling_from_av_decoders};
+use crate::source::open_source;
 use crate::{FrameRange, SceneLayout, emitted_boundary_to_raw, validate_keep_frames};
 
 /// Raw decoder frame ranges, end exclusive.
@@ -87,10 +88,9 @@ impl StoredSceneLayout {
             .collect()
     }
 
-    /// Checks this layout was scanned from `input` and returns the
+    /// Checks this layout was scanned from the source `decoder` reads and returns the
     /// source's frame layout and rate.
-    fn check_source(&self, input: &Path) -> Result<(FrameLayout, Rational32), anyhow::Error> {
-        let decoder = Decoder::from_file(input)?;
+    fn check_source(&self, decoder: &Decoder) -> Result<(FrameLayout, Rational32), anyhow::Error> {
         let details = *decoder.get_video_details();
         let layout = FrameLayout {
             width: details.width as u32,
@@ -176,17 +176,43 @@ impl StoredSceneLayout {
     }
 }
 
-impl SceneLayout {
-    /// Loads a layout `scenes` stored for `input`, checking it against
-    /// the source and the requested keep frames.
-    pub fn read(input: &Path, path: &Path, keep_frames: &[FrameRange]) -> Result<Self, anyhow::Error> {
+pub(crate) struct UncheckedLayout {
+    stored: StoredSceneLayout,
+    keep_frames: Vec<FrameRange>,
+}
+
+impl UncheckedLayout {
+    pub(crate) fn load(path: &Path, keep_frames: &[FrameRange]) -> Result<Self, anyhow::Error> {
         let stored: StoredSceneLayout = serde_json::from_slice(&std::fs::read(path)?)?;
         if stored.schema != schema_for(keep_frames) || stored.detector != SCENE_DETECTOR_ID {
             anyhow::bail!("scene layout schema or detector does not match this av-denoise build");
         }
-        let (layout, framerate) = stored.check_source(input)?;
-        let (keep_frames, source_ranges) = stored.resolve_keep_frames(keep_frames)?;
         Ok(Self {
+            stored,
+            keep_frames: keep_frames.to_vec(),
+        })
+    }
+
+    pub(crate) fn frame_layout(&self) -> Result<FrameLayout, anyhow::Error> {
+        let subsampling = [Subsampling::Yuv420, Subsampling::Yuv422, Subsampling::Yuv444]
+            .into_iter()
+            .find(|candidate| format!("{candidate:?}") == self.stored.subsampling)
+            .ok_or_else(|| {
+                anyhow::anyhow!("scene layout has unknown subsampling {}", self.stored.subsampling)
+            })?;
+        Ok(FrameLayout {
+            width: self.stored.width,
+            height: self.stored.height,
+            subsampling,
+            depth: Depth::from_bits(self.stored.depth as usize)?,
+        })
+    }
+
+    pub(crate) fn check(self, decoder: &Decoder) -> Result<SceneLayout, anyhow::Error> {
+        let stored = self.stored;
+        let (layout, framerate) = stored.check_source(decoder)?;
+        let (keep_frames, source_ranges) = stored.resolve_keep_frames(&self.keep_frames)?;
+        Ok(SceneLayout {
             layout,
             framerate,
             total_frames: stored.total_frames,
@@ -196,6 +222,15 @@ impl SceneLayout {
             source_ranges,
             keep_frames,
         })
+    }
+}
+
+impl SceneLayout {
+    /// Loads a layout `scenes` stored for `input`, checking it against
+    /// the source and the requested keep frames.
+    pub fn read(input: &Path, path: &Path, keep_frames: &[FrameRange]) -> Result<Self, anyhow::Error> {
+        let unchecked = UncheckedLayout::load(path, keep_frames)?;
+        unchecked.check(&open_source(input)?)
     }
 
     /// Stores this layout at `output`, replacing it atomically.

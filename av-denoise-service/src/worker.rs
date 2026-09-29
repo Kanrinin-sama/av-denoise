@@ -19,7 +19,11 @@ pub(crate) struct OutputMsg {
 /// permits they hold.
 type Pending = VecDeque<(u64, Permit)>;
 
-pub(crate) type WorkerJoin = thread::JoinHandle<Result<Option<PlanarDenoiser>, anyhow::Error>>;
+/// A built denoiser with the cold-cache queue place it holds until its
+/// first output frame proves the kernels are compiled and cached.
+pub(crate) type Resident = (PlanarDenoiser, Option<WarmUp>);
+
+pub(crate) type WorkerJoin = thread::JoinHandle<Result<Option<Resident>, anyhow::Error>>;
 
 /// Spawns one worker thread per denoiser slot over one shared scene queue.
 ///
@@ -31,7 +35,7 @@ pub(crate) type WorkerJoin = thread::JoinHandle<Result<Option<PlanarDenoiser>, a
 pub(crate) fn spawn_workers(
     opts: &PlaneOptions,
     layout: FrameLayout,
-    denoisers: Vec<Option<PlanarDenoiser>>,
+    denoisers: Vec<Option<Resident>>,
     output: Sender<OutputMsg>,
 ) -> (Sender<SceneJob>, Vec<WorkerJoin>) {
     let (job_tx, job_rx) = crossbeam_channel::bounded::<SceneJob>(0);
@@ -54,24 +58,17 @@ fn run_worker(
     worker_id: usize,
     opts: PlaneOptions,
     layout: FrameLayout,
-    mut wd: Option<PlanarDenoiser>,
+    mut wd: Option<Resident>,
     jobs: Receiver<SceneJob>,
     tx: Sender<OutputMsg>,
-) -> Result<Option<PlanarDenoiser>, anyhow::Error> {
-    // The cold-cache queue place this worker's denoiser holds, until its
-    // first output frame proves the kernels are compiled and cached.
-    let mut warm_up: Option<WarmUp> = None;
-
+) -> Result<Option<Resident>, anyhow::Error> {
     while let Ok(job) = jobs.recv() {
-        // Built on the first claimed scene, so a worker that never claims
-        // one never compiles.
+        // Built on the first claimed scene unless the slot built it ahead.
         if wd.is_none() {
-            let (denoiser, place) = create_denoiser(&opts, layout)?;
-            wd = Some(denoiser);
-            warm_up = place;
+            wd = Some(create_denoiser(&opts, layout)?);
         }
 
-        let denoiser = wd.as_mut().expect("denoiser exists after the check above");
+        let (denoiser, warm_up) = wd.as_mut().expect("denoiser exists after the check above");
 
         tracing::debug!(worker_id, scene_idx = job.scene_idx, "worker started scene");
 
@@ -85,12 +82,12 @@ fn run_worker(
         // critical path of the next push.
         for frame in job.frames {
             pending.push_back((frame.global_idx, frame.permit));
-            push_with_drain(denoiser, &mut warm_up, &mut pending, &frame.planes, &tx)?;
+            push_with_drain(denoiser, warm_up, &mut pending, &frame.planes, &tx)?;
         }
 
         // Reuse the PlanarDenoiser across scenes. Flushing here ensures
         // no temporal window spans two of them.
-        flush_worker(denoiser, &mut warm_up, &mut pending, &tx)?;
+        flush_worker(denoiser, warm_up, &mut pending, &tx)?;
     }
 
     Ok(wd)
