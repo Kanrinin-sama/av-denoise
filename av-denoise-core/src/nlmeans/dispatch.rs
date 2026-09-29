@@ -253,7 +253,7 @@ impl<R: Runtime> NlmDenoiser<R> {
     /// uses the flat `noise_offset` scalar instead.
     fn spatial_offset_lut_arg(&self) -> ArrayArg<R> {
         let len = spatial_offset_lut_len(self.params.search_radius);
-        unsafe { ArrayArg::from_raw_parts(self.spatial_offset_lut.clone(), len) }
+        unsafe { ArrayArg::from_raw_parts(self.spatial_offset_lut.handle(0).clone(), len) }
     }
 
     /// Builds the confidence arguments for one temporal pair, at an
@@ -1160,7 +1160,7 @@ impl<R: Runtime> NlmDenoiser<R> {
     /// This shares the frame-sized accumulators with the main pass. The
     /// GPU queue runs in order and the main dispatch zeroes them again
     /// before use, so sharing them is safe.
-    pub(super) fn run_nlm_spatial_pilot(&self, slot: u32, strength_scale: f32) -> Result<(), anyhow::Error> {
+    pub(super) fn run_nlm_spatial_pilot(&mut self, slot: u32, strength_scale: f32) -> Result<(), anyhow::Error> {
         let ctx = self.launch_ctx();
         self.zero_accumulators(&ctx)?;
 
@@ -1173,12 +1173,12 @@ impl<R: Runtime> NlmDenoiser<R> {
         // adjustment. The denoiser's `input_noise_offset` doc explains
         // why.
         //
-        // It is built fresh each call rather than cached, because
-        // `input_noise_offset` can change between pushes and this is a
-        // tiny one-off upload.
+        // It is refilled each call rather than cached, because
+        // `input_noise_offset` can change between pushes.
         let pilot_lut = build_spatial_offset_lut(self.params.search_radius, 0.0, self.input_noise_offset);
-        let pilot_lut_handle = self.client.create_from_slice(f32::as_bytes(&pilot_lut));
-        let pilot_lut_arg = unsafe { ArrayArg::<R>::from_raw_parts(pilot_lut_handle, pilot_lut.len()) };
+        self.pilot_lut.upload(&[&[f32::as_bytes(&pilot_lut)]]);
+        let pilot_lut_arg =
+            unsafe { ArrayArg::<R>::from_raw_parts(self.pilot_lut.handle(0).clone(), pilot_lut.len()) };
 
         // Always read the noisy input here, never `reference_arg`. For
         // `NlmSpatial` the reference buffer is the pilot's own output

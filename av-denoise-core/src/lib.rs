@@ -10,6 +10,8 @@ mod denoiser;
 pub mod device;
 pub mod enumerate;
 pub mod frame;
+#[cfg(any(feature = "vulkan", feature = "metal"))]
+mod gpu_share;
 #[doc(hidden)]
 pub mod nl4d;
 #[doc(hidden)]
@@ -17,6 +19,9 @@ pub mod nlmeans;
 mod probe;
 pub mod sniff;
 pub mod stack;
+#[cfg(any(feature = "vulkan", feature = "metal"))]
+mod staging_ring;
+mod upload;
 pub mod warmup;
 
 pub use cache::{

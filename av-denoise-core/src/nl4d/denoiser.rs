@@ -17,6 +17,7 @@ use crate::collab::kernels::fused::collab_fused;
 use crate::collab::kernels::transforms::dct_noise_profile;
 use crate::collab::{MAX_K, PATCH_AREA, PATCH_SIZE, needs_warp_uniform_search};
 use crate::denoiser::{DenoiserError, FrameOutput, OutputFormat};
+use crate::upload::Uploader;
 use crate::nlmeans::kernels::helpers::channel_scale_host;
 use crate::nlmeans::{
     BLOCK_X,
@@ -84,7 +85,9 @@ pub struct Nl4dDenoiser<R: Runtime> {
     accum_scale: f32,
 
     group_weight: Handle,
-    sigma_buf: Handle,
+    /// Refilled on every pass: region 0 holds the ring view's neighbour
+    /// slots and region 1 the per-channel sigma, padded to `stored_ch`.
+    collab_upload: Uploader<R>,
     dct_profile_buf: Handle,
     /// The aggregation window's 8 taps, built once from the caller's
     /// `kaiser_beta`. Eight ones when that is 0.
@@ -120,6 +123,9 @@ pub struct Nl4dDenoiser<R: Runtime> {
     /// when the `f32` slot it is packed from is free.
     wire_outputs: Option<[Handle; 2]>,
     fruit_dither: Option<Handle>,
+    /// The frame [`Self::flush`] waits each readback into, kept so a
+    /// flush allocates nothing once the first one has run.
+    flush_scratch: FrameOutput,
     /// How many passes [`Self::run_collab_stage`] has run for the
     /// current stream.
     ///
@@ -210,7 +216,8 @@ impl<R: Runtime> Nl4dDenoiser<R> {
         let frame_len = pixels * stored_ch as usize;
 
         let group_weight = client.empty(refs * size_of::<f32>());
-        let sigma_buf = client.create_from_slice(f32::as_bytes(&vec![0.0f32; stored_ch as usize]));
+        let neighbour_slots_bytes = 2 * params.temporal_radius as usize * size_of::<u32>();
+        let collab_upload = Uploader::new(client, &[neighbour_slots_bytes, stored_ch as usize * size_of::<f32>()]);
         // The correlation profile is purely spatial and this denoiser
         // exposes no `rho` knob, so it is built once here from the
         // white-noise default rather than every submit.
@@ -277,7 +284,7 @@ impl<R: Runtime> Nl4dDenoiser<R> {
             warp_uniform: needs_warp_uniform_search(client),
             accum_scale: cross_frame_accum_scale(params.spatial_radius, params.temporal_radius),
             group_weight,
-            sigma_buf,
+            collab_upload,
             dct_profile_buf,
             dct_profile,
             kaiser_buf,
@@ -288,6 +295,10 @@ impl<R: Runtime> Nl4dDenoiser<R> {
             output_format,
             wire_outputs,
             fruit_dither,
+            flush_scratch: match output_format {
+                OutputFormat::F32 => FrameOutput::F32(Vec::new()),
+                OutputFormat::Wire { .. } => FrameOutput::Wire(Vec::new()),
+            },
             passes_run: 0,
             last_fields: None,
             field_lambda: params.field_lambda,
@@ -393,8 +404,8 @@ impl<R: Runtime> Nl4dDenoiser<R> {
             {
                 let wire_dst = self.wire_outputs.as_ref().map(|w| &w[slot]);
                 let pending = self.start_readback(handle, wire_dst, self.output_format);
-                let frame = pending.wait()?;
-                sink(&frame);
+                pending.wait_into(&mut self.flush_scratch)?;
+                sink(&self.flush_scratch);
                 emitted += 1;
             }
         }
@@ -524,12 +535,12 @@ impl<R: Runtime> Nl4dDenoiser<R> {
         let mv_len = (neighbours * view.mv_stride) as usize;
         let conf_len = (neighbours * view.conf_stride) as usize;
 
-        let neighbour_slots_buf = client.create_from_slice(u32::as_bytes(&view.neighbour_slots));
-
         let sigmas = self.front.current_sigmas_temporal_only();
-        let mut sigma_host = vec![0.0f32; stored_ch as usize];
-        sigma_host[..channels_count as usize].copy_from_slice(&sigmas[..channels_count as usize]);
-        self.sigma_buf = client.create_from_slice(f32::as_bytes(&sigma_host));
+        let mut sigma_lanes = [0.0f32; 4];
+        sigma_lanes[..channels_count as usize].copy_from_slice(&sigmas[..channels_count as usize]);
+        let sigma_host = &sigma_lanes[..stored_ch as usize];
+        self.collab_upload
+            .upload(&[&[u32::as_bytes(&view.neighbour_slots)], &[f32::as_bytes(sigma_host)]]);
         let wnorm = weight_scale(sigma_host[0], &self.dct_profile);
 
         let refs_x = refs_along(self.width);
@@ -660,8 +671,11 @@ impl<R: Runtime> Nl4dDenoiser<R> {
                 ArrayArg::from_raw_parts(view.input.clone(), ring_len),
                 ArrayArg::from_raw_parts(mv_field.clone(), mv_len.max(1)),
                 ArrayArg::from_raw_parts(confidence.clone(), conf_len.max(1)),
-                ArrayArg::from_raw_parts(neighbour_slots_buf, view.neighbour_slots.len().max(1)),
-                ArrayArg::from_raw_parts(self.sigma_buf.clone(), stored_ch as usize),
+                ArrayArg::from_raw_parts(
+                    self.collab_upload.handle(0).clone(),
+                    view.neighbour_slots.len().max(1),
+                ),
+                ArrayArg::from_raw_parts(self.collab_upload.handle(1).clone(), stored_ch as usize),
                 ArrayArg::from_raw_parts(self.dct_profile_buf.clone(), 8),
                 ArrayArg::from_raw_parts(self.kaiser_buf.clone(), PATCH_SIZE as usize),
                 ArrayArg::from_raw_parts(self.accum.clone(), accum_ring_len),

@@ -19,6 +19,7 @@ use super::noise::{
     run_temporal_noise_stats,
     sigma_block_p25_from_partials,
     sigma_from_abs_sum,
+    spatial_offset_lut_len,
     temporal_stats_buf_bytes,
     temporal_stats_slot_len,
     temporal_stats_slot_stride_bytes,
@@ -29,6 +30,7 @@ use super::pending::{Pending, ReadbackShape, empty_output, start_readback};
 use super::prefilter::{PrefilterCtx, PrefilterMode, run_prefilter};
 use super::{BLOCK_1D, Depth, MAX_GRID_1D};
 use crate::denoiser::{DenoiserError, FrameOutput, OutputFormat};
+use crate::upload::Uploader;
 
 /// A denoised frame that has finished its kernels but is still resident
 /// on the GPU.
@@ -126,10 +128,13 @@ pub struct NlmDenoiser<R: Runtime> {
     /// CPU scratch for repacking 3-channel YUV into 4 lanes. Empty when
     /// no padding is needed.
     pub(super) padding_scratch: Vec<f32>,
-    /// CPU scratch the wire push concatenates its planes into, so one
-    /// push costs one transfer whatever the channel mode. Reused, so it
-    /// allocates nothing after the first frame.
-    pub(super) upload_scratch: Vec<u8>,
+    /// The persistent buffer each push uploads its frame into before
+    /// the GPU unpacks it into the ring, so one push costs one transfer
+    /// whatever the channel mode.
+    ///
+    /// It is built on the first push and rebuilt only if a later push
+    /// needs more room, so a steady stream allocates nothing per frame.
+    pub(super) frame_upload: Option<Uploader<R>>,
     /// The weighted-pixel accumulator, one entry per stored channel per
     /// pixel.
     pub(super) accum: Handle,
@@ -216,7 +221,10 @@ pub struct NlmDenoiser<R: Runtime> {
     ///
     /// While `rho_smoothed` is unset every entry equals the flat
     /// `noise_offset` scalar this table replaced.
-    pub(super) spatial_offset_lut: Handle,
+    pub(super) spatial_offset_lut: Uploader<R>,
+    /// The flat table the `NlmSpatial` pilot reads, refilled on every
+    /// pilot run. See `Self::run_nlm_spatial_pilot`.
+    pub(super) pilot_lut: Uploader<R>,
 
     /// Scratch for the first stage of the noise estimate, one slot per
     /// ring position.
@@ -463,11 +471,14 @@ impl<R: Runtime> NlmDenoiser<R> {
         // the initial table matches the flat `noise_offset` scalar it
         // replaces exactly.
         let rho_smoothed: Option<f32> = None;
-        let spatial_offset_lut = client.create_from_slice(f32::as_bytes(&build_spatial_offset_lut(
+        let lut_bytes = spatial_offset_lut_len(params.search_radius) * size_of::<f32>();
+        let mut spatial_offset_lut = Uploader::new(client, &[lut_bytes]);
+        spatial_offset_lut.upload(&[&[f32::as_bytes(&build_spatial_offset_lut(
             params.search_radius,
             0.0,
             noise_offset,
-        )));
+        ))]]);
+        let pilot_lut = Uploader::new(client, &[lut_bytes]);
 
         // Automatic noise estimation only runs when HQ is on and the
         // caller has not pinned a fixed sigma. The fast path and the
@@ -625,7 +636,7 @@ impl<R: Runtime> NlmDenoiser<R> {
             input_buf,
             reference_buf,
             padding_scratch,
-            upload_scratch: Vec::new(),
+            frame_upload: None,
             accum,
             weight_sum,
             max_weight,
@@ -646,6 +657,7 @@ impl<R: Runtime> NlmDenoiser<R> {
             use_reference,
             rho_smoothed,
             spatial_offset_lut,
+            pilot_lut,
             noise_partials,
             noise_results,
             temporal_stats_buf,
@@ -785,8 +797,8 @@ impl<R: Runtime> NlmDenoiser<R> {
             frame.len()
         );
 
-        let staging = if channels == stored_ch {
-            self.client.create_from_slice(f32::as_bytes(frame))
+        let staged = if channels == stored_ch {
+            frame
         } else {
             for i in 0..pixels {
                 let dst_off = i * stored_ch;
@@ -794,9 +806,12 @@ impl<R: Runtime> NlmDenoiser<R> {
                 self.padding_scratch[dst_off..dst_off + channels]
                     .copy_from_slice(&frame[src_off..src_off + channels]);
             }
-            self.client
-                .create_from_slice(f32::as_bytes(&self.padding_scratch))
+            &self.padding_scratch
         };
+
+        let upload = frame_uploader(&mut self.frame_upload, &self.client, size_of_val(staged));
+        upload.upload(&[&[f32::as_bytes(staged)]]);
+        let staging = upload.handle(0).clone();
 
         self.copy_frame_into_slot(dst, slot, &staging, 0, 1);
     }
@@ -840,7 +855,6 @@ impl<R: Runtime> NlmDenoiser<R> {
             );
         }
 
-        self.upload_scratch.clear();
         for plane in planes {
             assert_eq!(
                 plane.len(),
@@ -852,15 +866,16 @@ impl<R: Runtime> NlmDenoiser<R> {
                 wire_samples_in_range(plane, depth),
                 "a sample is larger than {depth:?} can express"
             );
-            self.upload_scratch.extend_from_slice(plane);
         }
 
         // The kernel reads whole words, so a plane that ends mid-word
-        // needs its last word backed by real storage.
-        let words = self.upload_scratch.len().div_ceil(size_of::<u32>());
-        self.upload_scratch.resize(words * size_of::<u32>(), 0);
+        // needs its last word backed by real storage, which the upload
+        // zero-fills.
+        let words = (plane_bytes * planes.len()).div_ceil(size_of::<u32>());
 
-        let src = self.client.create_from_slice(&self.upload_scratch);
+        let upload = frame_uploader(&mut self.frame_upload, &self.client, words * size_of::<u32>());
+        upload.upload(&[planes]);
+        let src = upload.handle(0).clone();
 
         let elements = pixels * stored_ch;
         let total_frames = self.params.total_frames() as usize;
@@ -1909,7 +1924,7 @@ impl<R: Runtime> NlmDenoiser<R> {
             self.rho_smoothed.unwrap_or(0.0),
             self.noise_offset,
         );
-        self.spatial_offset_lut = self.client.create_from_slice(f32::as_bytes(&lut));
+        self.spatial_offset_lut.upload(&[&[f32::as_bytes(&lut)]]);
     }
 
     /// Submits the denoise and waits for it, all in one call.
@@ -2134,4 +2149,17 @@ fn wire_samples_in_range(plane: &[u8], depth: Depth) -> bool {
         .0
         .iter()
         .all(|&s| u32::from(u16::from_le_bytes(s)) <= max)
+}
+
+/// The frame uploader, built or grown so one upload can hold `len`
+/// bytes.
+fn frame_uploader<'a, R: Runtime>(
+    frame_upload: &'a mut Option<Uploader<R>>,
+    client: &ComputeClient<R>,
+    len: usize,
+) -> &'a mut Uploader<R> {
+    if frame_upload.as_ref().is_none_or(|upload| upload.capacity(0) < len) {
+        *frame_upload = Some(Uploader::new(client, &[len]));
+    }
+    frame_upload.as_mut().expect("the frame uploader was just built")
 }

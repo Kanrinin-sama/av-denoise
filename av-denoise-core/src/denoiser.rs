@@ -843,7 +843,7 @@ impl WindowSpan {
 /// }
 ///
 /// // Drain the frames still inside the temporal window.
-/// denoiser.flush(|out| cleaned.push(out.into_f32().expect("built for f32 output")))?;
+/// denoiser.flush(|out| cleaned.push(out.clone().into_f32().expect("built for f32 output")))?;
 /// # Ok(())
 /// # }
 /// # fn read_my_frames() -> Vec<Vec<f32>> { Vec::new() }
@@ -863,6 +863,9 @@ pub struct Denoiser {
     /// Every entry point refuses to run while this is set.
     /// [`Self::reset_stream`] clears it.
     poisoned: bool,
+    /// The frame [`Self::flush`] waits each drained readback into, kept
+    /// so a flush allocates nothing once the first one has run.
+    flush_scratch: FrameOutput,
 }
 
 impl Denoiser {
@@ -923,6 +926,10 @@ impl Denoiser {
             output_format: options.output_format,
             frames_pushed: 0,
             poisoned: false,
+            flush_scratch: match options.output_format {
+                OutputFormat::F32 => FrameOutput::F32(Vec::new()),
+                OutputFormat::Wire { .. } => FrameOutput::Wire(Vec::new()),
+            },
         })
     }
 
@@ -1275,20 +1282,21 @@ impl Denoiser {
     ///
     /// A failure poisons the denoiser, so every further call returns
     /// [`DenoiserError::Poisoned`] until [`Self::reset_stream`] clears it.
-    pub fn flush(&mut self, sink: impl FnMut(FrameOutput)) -> Result<(), DenoiserError> {
+    pub fn flush(&mut self, sink: impl FnMut(&FrameOutput)) -> Result<(), DenoiserError> {
         if self.poisoned {
             return Err(DenoiserError::Poisoned);
         }
         self.flush_inner(sink).inspect_err(|_| self.poisoned = true)
     }
 
-    fn flush_inner(&mut self, mut sink: impl FnMut(FrameOutput)) -> Result<(), DenoiserError> {
+    fn flush_inner(&mut self, mut sink: impl FnMut(&FrameOutput)) -> Result<(), DenoiserError> {
         // Drain the whole pending pipeline, up to MAX_PENDING frames,
         // before submitting the trailing-tail mirrors. This also leaves
         // every output slot free, so the tail's own readbacks cannot be
         // handed a slot a streaming readback is still reading.
-        while let Some(frame) = self.recv_frame_inner()? {
-            sink(frame);
+        while let Some(pending) = self.pending.pop_front() {
+            pending.wait_into(&mut self.flush_scratch)?;
+            sink(&self.flush_scratch);
         }
 
         // The tail frames come back through each algorithm's own
@@ -1296,11 +1304,11 @@ impl Denoiser {
         // frame, so they are quantised by the same pack kernel.
         match &mut self.backend {
             #[cfg(feature = "cuda")]
-            Backend::Cuda(d) => d.flush(|frame| sink(frame.clone()))?,
+            Backend::Cuda(d) => d.flush(&mut sink)?,
             #[cfg(feature = "rocm")]
-            Backend::Rocm(d) => d.flush(|frame| sink(frame.clone()))?,
+            Backend::Rocm(d) => d.flush(&mut sink)?,
             #[cfg(any(feature = "vulkan", feature = "metal"))]
-            Backend::Wgpu(d) => d.flush(|frame| sink(frame.clone()))?,
+            Backend::Wgpu(d) => d.flush(&mut sink)?,
         }
 
         // The backend has already reset its own stream indices. Reset
@@ -1387,7 +1395,7 @@ fn build_backend(
 }
 
 fn client_on_stream<R: Runtime>(device: &R::Device, stream_id: StreamId) -> ComputeClient<R> {
-    let mut client = R::client(device);
+    let mut client = crate::probe::load_client::<R>(device);
     unsafe { client.set_stream(stream_id) };
     client
 }

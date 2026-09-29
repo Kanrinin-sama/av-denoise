@@ -149,7 +149,7 @@ fn run_worker(
 
         // Reuse the PlanarDenoiser across scenes. Flushing here ensures
         // no temporal window spans two of them.
-        flush_worker(denoiser, warm_up, &mut pending, &tx)?;
+        flush_worker(denoiser, warm_up, &mut pending, pools, &tx)?;
     }
 
     Ok(wd)
@@ -189,6 +189,7 @@ fn flush_worker(
     wd: &mut PlanarDenoiser,
     warm_up: &mut Option<WarmUp>,
     pending: &mut Pending,
+    pools: &SharedPools,
     tx: &Sender<OutputMsg>,
 ) -> Result<(), anyhow::Error> {
     let mut disconnected = false;
@@ -201,7 +202,7 @@ fn flush_worker(
         if let Some((global_idx, permit)) = pending.pop_front() {
             let msg = OutputMsg {
                 global_idx,
-                planes: out,
+                planes: std::mem::replace(out, pools.emitted.take()),
                 _permit: permit,
             };
             let did_send = tx.send(msg).is_ok();

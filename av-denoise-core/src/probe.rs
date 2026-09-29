@@ -41,7 +41,7 @@ pub(crate) fn open_client<R: Runtime>(
     let mut probed = PROBED.lock().unwrap_or_else(|err| err.into_inner());
 
     let opened = quiet_panics(|| {
-        let client = R::client(device);
+        let client = load_client::<R>(device);
         cubecl::future::block_on(client.sync()).map(|()| client)
     });
 
@@ -64,6 +64,20 @@ pub(crate) fn open_client<R: Runtime>(
             None
         },
     }
+}
+
+/// Opens the client for `device`, the only way this crate does.
+///
+/// A wgpu device has its server started through
+/// [`crate::gpu_share::register`] first, so uploads can reach the wgpu
+/// queue the server runs on.
+pub(crate) fn load_client<R: Runtime>(device: &R::Device) -> ComputeClient<R> {
+    #[cfg(any(feature = "vulkan", feature = "metal"))]
+    if let Some(device) = (device as &dyn std::any::Any).downcast_ref::<cubecl::wgpu::WgpuDevice>() {
+        crate::gpu_share::register(device);
+    }
+
+    R::client(device)
 }
 
 /// Runs `f`, turning a panic into an `Err` and routing the panic message

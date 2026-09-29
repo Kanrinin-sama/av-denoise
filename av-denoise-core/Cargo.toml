@@ -31,6 +31,7 @@ bon = "3"
 etcetera = "0.11"
 
 cubecl = { version = "0.10", features = ["std"] }
+wgpu = { version = "29", optional = true }
 
 [dev-dependencies]
 futures = "0.3"
@@ -38,8 +39,8 @@ clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 
 [features]
-vulkan = ["cubecl/vulkan"]
-metal = ["cubecl/metal"]
+vulkan = ["cubecl/vulkan", "dep:wgpu"]
+metal = ["cubecl/metal", "dep:wgpu"]
 cuda = ["cubecl/cuda"]
 rocm = ["cubecl/hip"]
 default = ["vulkan"]

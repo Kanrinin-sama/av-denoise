@@ -294,47 +294,35 @@ pub fn push_needs_retry(result: Result<(), DenoiserError>) -> Result<bool, anyho
 ///
 /// Those are always built in [`crate::OutputFormat::Wire`], so the other
 /// variant never reaches here.
-fn expect_wire(out: FrameOutput) -> Vec<u8> {
-    out.into_wire()
-        .expect("PlanarDenoiser builds every Denoiser in wire output format")
-}
-
 fn expect_wire_ref(out: &FrameOutput) -> &[u8] {
     out.as_wire()
         .expect("PlanarDenoiser builds every Denoiser in wire output format")
 }
 
-/// Splits a fused YUV444 wire frame into its three planes.
-///
-/// The pack kernel leaves a three-channel frame interleaved, so this is
-/// the byte-level counterpart of the host converter it replaced. That one
-/// lives in `converter_tests` now, as the oracle this is checked against.
-fn split_yuv_wire(wire: &[u8], depth: Depth) -> Planes {
-    let bytes = depth.bytes_per_sample();
-    let pixels = wire.len() / (3 * bytes);
-
-    let mut y = Vec::with_capacity(pixels * bytes);
-    let mut u = Vec::with_capacity(pixels * bytes);
-    let mut v = Vec::with_capacity(pixels * bytes);
-
-    for pixel in wire.chunks_exact(3 * bytes) {
-        y.extend_from_slice(&pixel[..bytes]);
-        u.extend_from_slice(&pixel[bytes..2 * bytes]);
-        v.extend_from_slice(&pixel[2 * bytes..]);
+/// Collects one half's flushed wire frames into `frames`, refilling its
+/// buffers in place, and returns how many it flushed.
+fn collect_flush(denoiser: Option<&mut Denoiser>, frames: &mut Vec<Vec<u8>>) -> Result<usize, anyhow::Error> {
+    let mut count = 0;
+    if let Some(d) = denoiser {
+        d.flush(|frame| {
+            let wire = expect_wire_ref(frame);
+            match frames.get_mut(count) {
+                Some(buf) => {
+                    buf.clear();
+                    buf.extend_from_slice(wire);
+                },
+                None => frames.push(wire.to_vec()),
+            }
+            count += 1;
+        })?;
     }
-
-    Planes { y, u, v }
+    Ok(count)
 }
 
 /// Splits a chroma wire frame into its U and V planes.
 ///
 /// The pack kernel writes U's whole region first and V's after it, so
 /// each plane is one contiguous half of the buffer.
-fn split_uv_wire(wire: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let (u, v) = wire.split_at(wire.len() / 2);
-    (u.to_vec(), v.to_vec())
-}
-
 fn split_uv_wire_into(wire: &[u8], u: &mut Vec<u8>, v: &mut Vec<u8>) {
     let (first, second) = wire.split_at(wire.len() / 2);
     u.clear();
@@ -343,6 +331,9 @@ fn split_uv_wire_into(wire: &[u8], u: &mut Vec<u8>, v: &mut Vec<u8>) {
     v.extend_from_slice(second);
 }
 
+/// Splits a fused YUV444 wire frame into its three planes.
+///
+/// The pack kernel leaves a three-channel frame interleaved.
 fn split_yuv_wire_into(wire: &[u8], depth: Depth, out: &mut Planes) {
     let bytes = depth.bytes_per_sample();
     let pixels = wire.len() / (3 * bytes);
@@ -416,6 +407,12 @@ pub struct PlanarDenoiser {
     temporal_radius: u32,
     luma_wire: FrameOutput,
     chroma_wire: FrameOutput,
+    /// Where [`Self::flush`] assembles each tail frame and where the
+    /// luma and chroma tails wait to be paired, kept across flushes so
+    /// a flush allocates nothing once the first one has run.
+    flush_out: Planes,
+    luma_flush: Vec<Vec<u8>>,
+    chroma_flush: Vec<Vec<u8>>,
 }
 
 static NEXT_PLANAR_STREAM_ID: AtomicU64 = AtomicU64::new(1 << 63);
@@ -507,6 +504,9 @@ impl PlanarDenoiser {
             temporal_radius,
             luma_wire: FrameOutput::Wire(Vec::new()),
             chroma_wire: FrameOutput::Wire(Vec::new()),
+            flush_out: Planes::default(),
+            luma_flush: Vec::new(),
+            chroma_flush: Vec::new(),
         })
     }
 
@@ -691,52 +691,50 @@ impl PlanarDenoiser {
 
     /// Drains the temporal tail of both halves.
     ///
-    /// `sink` is called once per emitted planar frame.
-    pub fn flush(&mut self, mut sink: impl FnMut(Planes)) -> Result<(), anyhow::Error> {
+    /// `sink` is called once per emitted planar frame. The frame is a
+    /// buffer this denoiser reuses, so a caller keeping it swaps it out
+    /// rather than cloning it.
+    pub fn flush(&mut self, mut sink: impl FnMut(&mut Planes)) -> Result<(), anyhow::Error> {
+        let out = &mut self.flush_out;
+
         if let Some(d) = self.yuv.as_mut() {
             let depth = self.output_layout.depth;
-            d.flush(|packed| sink(split_yuv_wire(&expect_wire(packed), depth)))?;
+            d.flush(|packed| {
+                split_yuv_wire_into(expect_wire_ref(packed), depth, out);
+                sink(out);
+            })?;
             return Ok(());
         }
 
-        let mut luma_buf: Vec<Vec<u8>> = Vec::new();
-        let mut chroma_buf: Vec<Vec<u8>> = Vec::new();
-
-        if let Some(d) = self.luma.as_mut() {
-            d.flush(|v| luma_buf.push(expect_wire(v)))?;
-        }
-
-        if let Some(d) = self.chroma.as_mut() {
-            d.flush(|v| chroma_buf.push(expect_wire(v)))?;
-        }
+        let luma_count = collect_flush(self.luma.as_mut(), &mut self.luma_flush)?;
+        let chroma_count = collect_flush(self.chroma.as_mut(), &mut self.chroma_flush)?;
 
         // The two halves run in lockstep, so they flush the same number
         // of frames. For each emitted frame the disabled side, if there
         // is one, pops the matching source plane from its passthrough
         // queue.
-        let count = luma_buf.len().max(chroma_buf.len());
+        let count = luma_count.max(chroma_count);
 
         for i in 0..count {
-            let y = if let Some(buf) = luma_buf.get_mut(i) {
-                std::mem::take(buf)
+            if i < luma_count {
+                std::mem::swap(&mut out.y, &mut self.luma_flush[i]);
             } else if let Some(src) = self.luma_passthrough.pop_front() {
-                src
+                out.y = src;
             } else {
-                self.output_layout.black_luma_plane()
-            };
+                out.y = self.output_layout.black_luma_plane();
+            }
 
-            let (u, v) = if let Some(packed) = chroma_buf.get(i) {
-                split_uv_wire(packed)
+            if i < chroma_count {
+                split_uv_wire_into(&self.chroma_flush[i], &mut out.u, &mut out.v);
             } else if let Some((src_u, src_v)) = self.chroma_passthrough.pop_front() {
-                (src_u, src_v)
+                out.u = src_u;
+                out.v = src_v;
             } else {
-                (
-                    self.output_layout.neutral_chroma_plane(),
-                    self.output_layout.neutral_chroma_plane(),
-                )
-            };
+                out.u = self.output_layout.neutral_chroma_plane();
+                out.v = self.output_layout.neutral_chroma_plane();
+            }
 
-            sink(Planes { y, u, v });
+            sink(out);
         }
 
         if !self.luma_passthrough.is_empty() || !self.chroma_passthrough.is_empty() {
