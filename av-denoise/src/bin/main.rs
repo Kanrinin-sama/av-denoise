@@ -10,7 +10,7 @@ mod scan_chunks;
 mod scan_source;
 mod scene_scan;
 mod stream_mode;
-mod warm_start;
+mod window_serve;
 mod y4m_format;
 
 use cli::{Args, Command, InputSource, RunOptions, run_list_devices};
@@ -110,14 +110,7 @@ fn main() -> anyhow::Result<()> {
     // Point CubeCL at a kernel cache. This has to run before
     // Denoiser::create, because the first CubeCL client locks the global
     // config the moment it is built.
-    match av_denoise::install_compilation_cache() {
-        Ok(Some(path)) => tracing::info!(?path, "caching compiled kernels"),
-        Ok(None) => tracing::info!(
-            "kernel caching is off, every run recompiles. Unset {} to turn it back on.",
-            av_denoise::COMPILATION_CACHE_ENV,
-        ),
-        Err(err) => return Err(anyhow::Error::new(err).context("unable to install the kernel cache")),
-    }
+    av_denoise_service::install_kernel_cache()?;
 
     let (opts, input, workers, frame_budget, scene_layout, keep_frames, scene_span) = match &args.command {
         Command::Nlmeans(nlm) => (
@@ -152,7 +145,7 @@ fn main() -> anyhow::Result<()> {
         if scene_span.is_some() {
             anyhow::bail!("--window-service-slots cannot be combined with --scene-span");
         }
-        return file_mode::run_window_service(
+        return window_serve::run_window_service(
             &opts,
             path,
             workers.unwrap_or(DEFAULT_WORKERS),

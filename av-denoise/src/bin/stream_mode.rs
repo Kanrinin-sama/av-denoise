@@ -1,8 +1,8 @@
 use std::io::{Read, Write, stdout};
 
 use av_denoise::{FrameLayout, PlaneOptions, Planes, push_needs_retry};
+use av_denoise_service::{create_denoiser, finish_warm_up};
 
-use crate::warm_start::{create_denoiser, finish_warm_up};
 use crate::y4m_format::{subsampling_from_y4m, subsampling_to_y4m, y4m_vendor_extensions};
 
 /// Denoises a y4m stream frame by frame, writing y4m on stdout.

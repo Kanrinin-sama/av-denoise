@@ -31,6 +31,7 @@ required-features = ["binary"]
 
 [dependencies]
 av-denoise-core.workspace = true
+av-denoise-service = { workspace = true, optional = true }
 anyhow.workspace = true
 tracing.workspace = true
 strum.workspace = true
@@ -60,11 +61,12 @@ serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 
 [features]
-vulkan = ["av-denoise-core/vulkan"]
-metal = ["av-denoise-core/metal"]
-cuda = ["av-denoise-core/cuda"]
-rocm = ["av-denoise-core/rocm"]
+vulkan = ["av-denoise-core/vulkan", "av-denoise-service?/vulkan"]
+metal = ["av-denoise-core/metal", "av-denoise-service?/metal"]
+cuda = ["av-denoise-core/cuda", "av-denoise-service?/cuda"]
+rocm = ["av-denoise-core/rocm", "av-denoise-service?/rocm"]
 binary = [
+    "av-denoise-service",
     "bytesize",
     "clap",
     "crossbeam-channel",

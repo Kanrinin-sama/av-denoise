@@ -184,6 +184,7 @@ dependencies = [
  "anyhow",
  "av-decoders",
  "av-denoise-core",
+ "av-denoise-service",
  "av-scenechange",
  "bytesize",
  "clap",
@@ -218,6 +219,21 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "av-denoise-service"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "av-decoders",
+ "av-denoise-core",
+ "bytesize",
+ "crossbeam-channel",
+ "serde",
+ "serde_json",
+ "tracing",
+ "v_frame",
 ]
 
 [[package]]

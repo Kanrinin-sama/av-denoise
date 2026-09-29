@@ -4,15 +4,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use av_decoders::Decoder;
 use av_denoise::{Depth, FrameLayout};
-use av_scenechange::DetectionOptions;
-
-use crate::cli::FrameRange;
-use crate::file_mode::{
+use av_denoise_service::{
+    FrameRange,
     SceneLayout,
     emitted_boundary_to_raw,
     subsampling_from_av_decoders,
     validate_keep_frames,
 };
+use av_scenechange::DetectionOptions;
+
 use crate::frame_index;
 use crate::progress::{self, scene_progress_bar};
 use crate::scan_chunks::{Chunk, ScanContext, THREADS_PER_CHUNK, plan_chunks, scan_chunks};

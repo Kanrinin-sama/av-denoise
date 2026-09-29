@@ -1,0 +1,26 @@
+[package]
+name = "av-denoise-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-process NL4D window service over ffms2 sources"
+publish = false
+
+[dependencies]
+av-denoise-core.workspace = true
+anyhow.workspace = true
+bytesize.workspace = true
+crossbeam-channel.workspace = true
+tracing.workspace = true
+av-decoders = { version = "0.9", features = ["ffms2"] }
+v_frame = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+vulkan = ["av-denoise-core/vulkan"]
+metal = ["av-denoise-core/metal"]
+cuda = ["av-denoise-core/cuda"]
+rocm = ["av-denoise-core/rocm"]
+default = ["vulkan"]

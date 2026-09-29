@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["av-denoise-core", "av-denoise", "av-denoise-vs"]
+members = ["av-denoise-core", "av-denoise", "av-denoise-service", "av-denoise-vs"]
 
 [workspace.package]
 version = "0.4.0"
@@ -20,6 +20,7 @@ strum_macros = "0.28"
 bon = "3"
 cubecl = { version = "0.10", features = ["std"] }
 av-denoise-core = { path = "av-denoise-core", version = "0.4.0", default-features = false }
+av-denoise-service = { path = "av-denoise-service", default-features = false }
 
 [patch.crates-io]
 av-decoders = { path = "crates/av-decoders" }

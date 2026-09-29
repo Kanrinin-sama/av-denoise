@@ -1,3 +1,5 @@
+pub use av_denoise_service::FrameRange;
+
 use super::InputSource;
 
 /// The flags every denoising family takes, whatever it does with the
@@ -73,28 +75,6 @@ pub struct CommonArgs {
     /// Ignored for piped input, which cannot be split by scene.
     #[arg(long, value_name = "SIZE", value_parser = parse_frame_budget)]
     pub frame_budget: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct FrameRange {
-    pub start: usize,
-    pub end: usize,
-}
-
-impl std::str::FromStr for FrameRange {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (start, end) = value
-            .split_once(':')
-            .ok_or_else(|| "frame range must be START:END".to_owned())?;
-        let start = start.parse().map_err(|_| "frame range start is invalid")?;
-        let end = end.parse().map_err(|_| "frame range end is invalid")?;
-        if start >= end {
-            return Err("frame range must have START < END".into());
-        }
-        Ok(Self { start, end })
-    }
 }
 
 /// Reads a size string such as `8GB` into a byte count.
