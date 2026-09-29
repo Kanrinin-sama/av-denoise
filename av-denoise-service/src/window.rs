@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use av_decoders::Rational32;
 use av_denoise_core::{FrameLayout, Planes};
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::budget::CANCEL_POLL;
 use crate::cancel::Cancel;
 use crate::worker::OutputMsg;
 use crate::{FrameRange, SceneLayout};
@@ -16,6 +18,7 @@ pub(crate) struct WindowJob {
     pub(crate) output: Sender<OutputMsg>,
     pub(crate) closed: Receiver<()>,
     pub(crate) cancel: Cancel,
+    pub(crate) abort: Arc<AtomicBool>,
 }
 
 impl WindowJob {
@@ -36,8 +39,11 @@ pub struct Window {
     next: u64,
     output: Receiver<OutputMsg>,
     reorder: BTreeMap<u64, OutputMsg>,
-    done: Receiver<Result<(), anyhow::Error>>,
+    done: Option<Receiver<Result<(), anyhow::Error>>>,
     failure: Option<anyhow::Error>,
+    cancel: Cancel,
+    stop: Arc<AtomicBool>,
+    abort: Arc<AtomicBool>,
     _closed: Sender<()>,
 }
 
@@ -46,8 +52,12 @@ impl Window {
         layout: FrameLayout,
         scenes: Arc<SceneLayout>,
         span: Option<FrameRange>,
-        cancel: Cancel,
+        mut flags: Vec<Arc<AtomicBool>>,
     ) -> (Self, WindowJob, Sender<Result<(), anyhow::Error>>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        flags.extend([Arc::clone(&stop), Arc::clone(&abort)]);
+        let cancel = Cancel::new(flags);
         let total = span.map_or(scenes.total_frames, |span| span.end - span.start);
         let (output_tx, output) = crossbeam_channel::unbounded();
         let (closed_tx, closed) = crossbeam_channel::bounded(0);
@@ -59,8 +69,11 @@ impl Window {
             next: 0,
             output,
             reorder: BTreeMap::new(),
-            done,
+            done: Some(done),
             failure: None,
+            cancel: cancel.clone(),
+            stop,
+            abort: Arc::clone(&abort),
             _closed: closed_tx,
         };
         let job = WindowJob {
@@ -69,6 +82,7 @@ impl Window {
             output: output_tx,
             closed,
             cancel,
+            abort,
         };
         (window, job, done_tx)
     }
@@ -88,6 +102,10 @@ impl Window {
         self.total as usize
     }
 
+    pub fn cancel(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+
     /// The next frame in order, or `None` once the window is done.
     ///
     /// An error ends the window; [`Window::finish`] reports it again.
@@ -104,25 +122,50 @@ impl Window {
                 return Some(Ok(msg.planes));
             }
 
-            match self.output.recv() {
-                Ok(msg) => {
-                    self.reorder.insert(msg.global_idx, msg);
+            if self.cancel.is_set() {
+                let error = if self.abort.load(Ordering::Acquire) {
+                    self.pipeline_error()
+                } else {
+                    anyhow::anyhow!("the window was cancelled")
+                };
+                return Some(Err(self.fail(error)));
+            }
+
+            crossbeam_channel::select! {
+                recv(self.output) -> msg => match msg {
+                    Ok(msg) => {
+                        self.reorder.insert(msg.global_idx, msg);
+                    },
+                    Err(_) => {
+                        let error = self.pipeline_error();
+                        return Some(Err(self.fail(error)));
+                    },
                 },
-                Err(_) => {
-                    let error = self.pipeline_error();
-                    let reported = anyhow::anyhow!("{error:#}");
-                    self.failure = Some(error);
-                    return Some(Err(reported));
-                },
+                default(CANCEL_POLL) => {},
             }
         }
     }
 
+    fn fail(&mut self, error: anyhow::Error) -> anyhow::Error {
+        let reported = anyhow::anyhow!("{error:#}");
+        self.failure = Some(error);
+        reported
+    }
+
+    fn wait_pipeline(&mut self) -> Result<(), anyhow::Error> {
+        match self.done.take() {
+            Some(done) => done
+                .recv()
+                .map_err(|_| anyhow::anyhow!("the window worker stopped without reporting"))?,
+            None => Ok(()),
+        }
+    }
+
     /// Why the workers stopped before the last frame.
-    fn pipeline_error(&self) -> anyhow::Error {
-        match self.done.recv() {
-            Ok(Err(error)) => error,
-            _ => anyhow::anyhow!(
+    fn pipeline_error(&mut self) -> anyhow::Error {
+        match self.wait_pipeline() {
+            Err(error) => error,
+            Ok(()) => anyhow::anyhow!(
                 "wrote {} frames but expected {}. Every worker disconnected \
                  before the stream finished, so a frame index was likely lost",
                 self.next,
@@ -136,13 +179,13 @@ impl Window {
     pub fn finish(mut self) -> Result<usize, anyhow::Error> {
         while self.recv().is_some() {}
 
+        let pipeline = self.wait_pipeline();
+
         if let Some(error) = self.failure.take() {
             return Err(error);
         }
 
-        self.done
-            .recv()
-            .map_err(|_| anyhow::anyhow!("the window worker stopped without reporting"))??;
+        pipeline?;
 
         Ok(self.next as usize)
     }

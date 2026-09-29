@@ -6,7 +6,7 @@ use av_decoders::{Decoder, Rational32};
 use av_denoise_core::{Depth, FrameLayout, Subsampling};
 
 use crate::layout::{merge_adjacent_ranges, subsampling_from_av_decoders};
-use crate::source::open_source;
+use crate::source::SourceIndex;
 use crate::{FrameRange, SceneLayout, emitted_boundary_to_raw, validate_keep_frames};
 
 /// Raw decoder frame ranges, end exclusive.
@@ -230,7 +230,7 @@ impl SceneLayout {
     /// the source and the requested keep frames.
     pub fn read(input: &Path, path: &Path, keep_frames: &[FrameRange]) -> Result<Self, anyhow::Error> {
         let unchecked = UncheckedLayout::load(path, keep_frames)?;
-        unchecked.check(&open_source(input)?)
+        unchecked.check(&SourceIndex::open(input)?.decoder()?)
     }
 
     /// Stores this layout at `output`, replacing it atomically.

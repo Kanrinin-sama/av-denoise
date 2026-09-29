@@ -88,14 +88,14 @@ pub fn run_window_service(
         if !finished {
             std::process::exit(1);
         }
-        service
-            .finish()
-            .unwrap_or_else(|error| control_fatal(&format!("{error:#}")));
         for writer in writers {
             writer
                 .join()
                 .map_err(|_| anyhow::anyhow!("window writer panicked"))??;
         }
+        service
+            .finish()
+            .unwrap_or_else(|error| control_fatal(&format!("{error:#}")));
         Ok(())
     })
 }

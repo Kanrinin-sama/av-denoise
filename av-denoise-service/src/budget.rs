@@ -6,7 +6,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::cancel::Cancel;
 
 /// How often a dispatcher waiting on a permit looks at its cancel flags.
-const CANCEL_POLL: Duration = Duration::from_millis(100);
+pub(crate) const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 pub(crate) fn temporal_radius(mode: DenoisingMode) -> u32 {
     match mode {
@@ -71,7 +71,9 @@ pub(crate) struct FramePermits {
 }
 
 impl FramePermits {
-    /// Frames in flight this run allows, refusing a budget below the floor.
+    /// Frames in flight one of `windows` windows allows, each window
+    /// taking an equal share of the budget, refusing a share below the
+    /// floor.
     ///
     /// A budget the floor has to raise serialises the pipeline, so it fails
     /// here rather than running on with too few frames in flight.
@@ -80,17 +82,19 @@ impl FramePermits {
         frame_bytes: usize,
         workers: usize,
         radius: u32,
+        windows: usize,
     ) -> Result<Self, anyhow::Error> {
-        let afforded = frames_afforded(budget_bytes, frame_bytes);
-        let count = frame_permits(budget_bytes, frame_bytes, workers, radius);
+        let share = budget_bytes / windows as u64;
+        let afforded = frames_afforded(share, frame_bytes);
+        let count = frame_permits(share, frame_bytes, workers, radius);
 
         if count > afforded {
-            let suggestion = suggested_budget(count as u64 * frame_bytes as u64);
+            let suggestion = suggested_budget((count * windows) as u64 * frame_bytes as u64);
 
             anyhow::bail!(
-                "--frame-budget {budget} affords {afforded} frames at {frame_bytes} bytes per frame, \
-                 but {workers} workers at temporal radius {radius} need at least {count}. Pass at \
-                 least --frame-budget {suggestion}.",
+                "--frame-budget {budget} affords {afforded} frames per window at {frame_bytes} bytes \
+                 per frame over {windows} windows, but {workers} workers at temporal radius {radius} \
+                 need at least {count} per window. Pass at least --frame-budget {suggestion}.",
                 budget = size_string(budget_bytes),
             );
         }

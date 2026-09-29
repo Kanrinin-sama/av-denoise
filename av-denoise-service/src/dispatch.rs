@@ -99,7 +99,7 @@ where
 
 /// Stages every frame `decoder` reads.
 pub(crate) fn dispatch_frames(
-    decoder: Decoder,
+    decoder: &mut Decoder,
     scenes: &SceneLayout,
     staging: &Staging<'_>,
 ) -> Result<(), anyhow::Error> {
@@ -110,10 +110,10 @@ pub(crate) fn dispatch_frames(
 ///
 /// Every frame is read, phantom or not, because the decoder walks the
 /// file in order and cannot be told to skip one.
-fn emitted_frames(
-    mut decoder: Decoder,
+fn emitted_frames<'a>(
+    decoder: &'a mut Decoder,
     scenes: &SceneLayout,
-) -> impl Iterator<Item = Result<Planes, anyhow::Error>> + use<> {
+) -> impl Iterator<Item = Result<Planes, anyhow::Error>> + use<'a> {
     let layout = scenes.layout;
     let ranges = scenes.source_ranges.clone();
     let phantom = scenes.phantom.clone();

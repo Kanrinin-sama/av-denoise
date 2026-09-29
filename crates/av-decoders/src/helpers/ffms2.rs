@@ -3,7 +3,7 @@ use std::num::{NonZeroU8, NonZeroUsize};
 use std::path::Path;
 use std::slice;
 use std::str::FromStr;
-use std::sync::{LazyLock, Once};
+use std::sync::{Arc, LazyLock, Once};
 
 use ffms2_sys::{
     FFMS_CreateIndexer,
@@ -56,7 +56,7 @@ pub struct Ffms2Decoder {
     #[allow(missing_docs)]
     pub video_source: *mut FFMS_VideoSource,
     #[expect(dead_code, reason = "Keep alive until drop")]
-    index_handle: FfmsIndex,
+    index_handle: Arc<FfmsIndex>,
 }
 
 impl Drop for Ffms2Decoder {
@@ -69,11 +69,18 @@ impl Drop for Ffms2Decoder {
     }
 }
 
+/// An FFMS2 index over one file, shareable by every decoder of that file.
 pub struct FfmsIndex {
-    pub path: String,
-    pub track: i32,
-    pub idx_handle: *mut FFMS_Index,
+    path: String,
+    track: i32,
+    idx_handle: *mut FFMS_Index,
 }
+
+// SAFETY: an index is read-only once built, and FFMS2 copies what a
+// video source needs out of it when the source is created.
+unsafe impl Send for FfmsIndex {}
+// SAFETY: see `Send` above.
+unsafe impl Sync for FfmsIndex {}
 
 impl Drop for FfmsIndex {
     fn drop(&mut self) {
@@ -114,15 +121,13 @@ impl Ffms2Decoder {
     /// It ensures proper error handling and resource cleanup.
     #[inline]
     pub fn new<P: AsRef<Path>>(input: P) -> Result<Self, DecoderError> {
-        FFMS2_INIT.call_once(|| {
-            // SAFETY: FFI call with infallible parameters
-            unsafe {
-                FFMS_Init(0, 0);
-            }
-        });
+        Self::with_index(Arc::new(Self::index(input.as_ref())?))
+    }
 
-        let index_handle = Self::get_index(input.as_ref())?;
-
+    /// Creates a decoder over an index built by [`Ffms2Decoder::index`],
+    /// so several decoders of one file share a single indexing pass.
+    #[inline]
+    pub fn with_index(index_handle: Arc<FfmsIndex>) -> Result<Self, DecoderError> {
         let threads = std::thread::available_parallelism().map_or(8, std::num::NonZero::get) as i32;
 
         let source = CString::new(index_handle.path.as_str())
@@ -213,7 +218,17 @@ impl Ffms2Decoder {
         Ok(())
     }
 
-    fn get_index(input: &Path) -> Result<FfmsIndex, DecoderError> {
+    /// Reads the `.ffindex` next to `input`, or indexes the file and
+    /// writes one there.
+    #[inline]
+    pub fn index(input: &Path) -> Result<FfmsIndex, DecoderError> {
+        FFMS2_INIT.call_once(|| {
+            // SAFETY: FFI call with infallible parameters
+            unsafe {
+                FFMS_Init(0, 0);
+            }
+        });
+
         // SAFETY: we free this on all branches below
         let mut err = unsafe { empty_error_info() };
 

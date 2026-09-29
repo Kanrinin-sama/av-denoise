@@ -11,6 +11,8 @@ use av_denoise_core::{
     push_needs_retry,
 };
 
+use crate::worker::Resident;
+
 /// Frames a warm-up pushes, enough to fill the temporal window and
 /// compile every kernel a real run dispatches.
 const WARM_FRAMES: usize = 8;
@@ -65,8 +67,15 @@ pub fn finish_warm_up(warm_up: &mut Option<WarmUp>) {
 /// Compiles and caches every kernel a run with `opts` on `layout`
 /// frames needs, by denoising a few synthetic frames.
 pub fn warm(opts: &PlaneOptions, layout: FrameLayout, cancel: &AtomicBool) -> Result<(), anyhow::Error> {
+    warm_resident(&mut create_denoiser(opts, layout)?, layout, cancel)
+}
+
+pub(crate) fn warm_resident(
+    (denoiser, warm_up): &mut Resident,
+    layout: FrameLayout,
+    cancel: &AtomicBool,
+) -> Result<(), anyhow::Error> {
     let planes = synthetic_frame(layout);
-    let (mut denoiser, mut warm_up) = create_denoiser(opts, layout)?;
 
     for _ in 0..WARM_FRAMES {
         if cancel.load(Ordering::Acquire) {
@@ -75,18 +84,18 @@ pub fn warm(opts: &PlaneOptions, layout: FrameLayout, cancel: &AtomicBool) -> Re
 
         if push_needs_retry(denoiser.push(&planes))? {
             if denoiser.recv()?.is_some() {
-                finish_warm_up(&mut warm_up);
+                finish_warm_up(warm_up);
             }
 
             denoiser.push(&planes)?;
         }
 
         if denoiser.recv()?.is_some() {
-            finish_warm_up(&mut warm_up);
+            finish_warm_up(warm_up);
         }
     }
 
-    denoiser.flush(|_| finish_warm_up(&mut warm_up))?;
+    denoiser.flush(|_| finish_warm_up(warm_up))?;
 
     Ok(())
 }

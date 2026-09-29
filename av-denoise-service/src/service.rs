@@ -5,11 +5,11 @@ use std::thread;
 use av_denoise_core::FrameLayout;
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::cancel::Cancel;
 use crate::pipeline::{Pipeline, panic_message};
-use crate::source::open_source;
+use crate::source::SourceIndex;
 use crate::stored_layout::UncheckedLayout;
 use crate::window::{Window, WindowJob};
+use crate::worker::Resident;
 use crate::{FrameRange, SceneLayout, ServiceConfig};
 
 struct SlotRequest {
@@ -30,6 +30,7 @@ pub struct WindowService {
     scenes: Arc<SceneLayout>,
     output_layout: FrameLayout,
     cancel: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
 }
 
 impl WindowService {
@@ -42,21 +43,28 @@ impl WindowService {
         }
         let unchecked = UncheckedLayout::load(&config.scene_layout, &config.keep_frames)?;
         let source_layout = unchecked.frame_layout()?;
+        let index = SourceIndex::open(&config.source)?;
+        let decoder = index.decoder()?;
+        let scenes = unchecked.check(&decoder)?;
         let pipeline = Arc::new(Pipeline::new(
             config.planes,
-            config.source.clone(),
+            index,
             config.workers,
             source_layout,
             config.frame_budget,
             config.slots,
         )?);
+        pipeline.keep_opened(decoder);
+        let mut warmed = Some(pipeline.warmed_resident(source_layout, &cancel)?);
         let slots = (0..config.slots)
             .map(|_| {
                 let (requests, rx) = crossbeam_channel::bounded::<SlotRequest>(1);
                 let busy = Arc::new(AtomicBool::new(false));
                 let pipeline = Arc::clone(&pipeline);
                 let slot_busy = Arc::clone(&busy);
-                let handle = thread::spawn(move || run_slot(&pipeline, source_layout, &slot_busy, &rx));
+                let residents = vec![warmed.take()];
+                let handle =
+                    thread::spawn(move || run_slot(&pipeline, source_layout, &slot_busy, &rx, residents));
                 Slot {
                     requests,
                     busy,
@@ -64,14 +72,12 @@ impl WindowService {
                 }
             })
             .collect();
-        let decoder = open_source(&config.source)?;
-        let scenes = unchecked.check(&decoder)?;
-        pipeline.keep_opened(decoder);
         Ok(Self {
             slots,
             output_layout: pipeline.output_layout(scenes.layout),
             scenes: Arc::new(scenes),
             cancel,
+            stop: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -106,7 +112,7 @@ impl WindowService {
             self.output_layout,
             Arc::clone(&self.scenes),
             Some(FrameRange { start, end }),
-            Cancel::new(vec![Arc::clone(&self.cancel), cancel]),
+            vec![Arc::clone(&self.cancel), Arc::clone(&self.stop), cancel],
         );
         if target.requests.try_send(SlotRequest { job, done }).is_err() {
             target.busy.store(false, Ordering::Release);
@@ -116,27 +122,50 @@ impl WindowService {
     }
 
     /// Stops every slot once no window is active.
-    pub fn finish(self) -> Result<(), anyhow::Error> {
+    pub fn finish(mut self) -> Result<(), anyhow::Error> {
         if self.slots.iter().any(|slot| slot.busy.load(Ordering::Acquire)) {
             anyhow::bail!("finish received while a window is active");
         }
-        for slot in self.slots {
+        self.join_slots()
+    }
+
+    fn join_slots(&mut self) -> Result<(), anyhow::Error> {
+        let mut result = Ok(());
+        for slot in self.slots.drain(..) {
             drop(slot.requests);
-            slot.handle.join().map_err(|panic| {
-                anyhow::anyhow!("window worker panicked: {}", panic_message(panic.as_ref()))
-            })?;
+            if let Err(panic) = slot.handle.join() {
+                result = result.and(Err(anyhow::anyhow!(
+                    "window worker panicked: {}",
+                    panic_message(panic.as_ref())
+                )));
+            }
         }
-        Ok(())
+        result
     }
 }
 
-fn run_slot(pipeline: &Pipeline, layout: FrameLayout, busy: &AtomicBool, requests: &Receiver<SlotRequest>) {
-    let mut denoisers = pipeline.create_denoisers(layout);
+impl Drop for WindowService {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.join_slots();
+    }
+}
+
+fn run_slot(
+    pipeline: &Pipeline,
+    layout: FrameLayout,
+    busy: &AtomicBool,
+    requests: &Receiver<SlotRequest>,
+    mut residents: Vec<Option<Resident>>,
+) {
+    if let Err(error) = pipeline.build_residents(&mut residents, layout) {
+        tracing::warn!(error = format!("{error:#}"), "window slot denoisers failed to build");
+    }
+    let mut decoder = None;
     while let Ok(request) = requests.recv() {
-        let result = match &mut denoisers {
-            Ok(denoisers) => pipeline.run(request.job, denoisers),
-            Err(error) => Err(anyhow::anyhow!("{error:#}")),
-        };
+        let result = pipeline
+            .build_residents(&mut residents, layout)
+            .and_then(|()| pipeline.run(request.job, &mut residents, &mut decoder));
         busy.store(false, Ordering::Release);
         let _ = request.done.send(result);
     }

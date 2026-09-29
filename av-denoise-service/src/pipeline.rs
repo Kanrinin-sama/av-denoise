@@ -8,10 +8,9 @@ use av_denoise_core::{FrameLayout, PlaneOptions};
 
 use crate::SceneLayout;
 use crate::budget::{FramePermits, temporal_radius};
-use crate::cancel::Cancel;
 use crate::dispatch::{Staging, dispatch_frames};
-use crate::source::{OpenedSource, open_source};
-use crate::warm::create_denoiser;
+use crate::source::{OpenedSource, SourceIndex};
+use crate::warm::{create_denoiser, warm_resident};
 use crate::window::{Window, WindowJob};
 use crate::worker::{Resident, spawn_workers};
 
@@ -19,9 +18,11 @@ use crate::worker::{Resident, spawn_workers};
 /// runs with.
 pub(crate) struct Pipeline {
     planes: PlaneOptions,
-    source: PathBuf,
+    index: SourceIndex,
     workers: usize,
-    permits: FramePermits,
+    frame_bytes: usize,
+    frame_budget: u64,
+    streams: usize,
     opened: Mutex<Option<OpenedSource>>,
 }
 
@@ -29,7 +30,7 @@ impl Pipeline {
     /// Sizes the frame budget for `streams` windows running at once.
     pub(crate) fn new(
         planes: PlaneOptions,
-        source: PathBuf,
+        index: SourceIndex,
         workers: usize,
         layout: FrameLayout,
         frame_budget: u64,
@@ -39,28 +40,35 @@ impl Pipeline {
             anyhow::bail!("--workers must be at least 1");
         }
 
-        let frame_bytes = layout.luma_bytes() + 2 * layout.chroma_bytes();
-        let permits = FramePermits::checked(
+        let pipeline = Self {
+            planes,
+            index,
+            workers,
+            frame_bytes: layout.luma_bytes() + 2 * layout.chroma_bytes(),
             frame_budget,
-            frame_bytes,
-            workers * streams,
-            temporal_radius(planes.mode),
-        )?;
+            streams,
+            opened: Mutex::new(None),
+        };
+        let permits = pipeline.permits()?;
 
         tracing::info!(
-            permits = permits.count(),
-            frame_bytes,
-            ceiling_mib = (permits.count() * frame_bytes) / (1 << 20),
+            permits_per_window = permits.count(),
+            frame_bytes = pipeline.frame_bytes,
+            ceiling_mib = (permits.count() * streams * pipeline.frame_bytes) / (1 << 20),
             "frame buffer budget",
         );
 
-        Ok(Self {
-            planes,
-            source,
-            workers,
-            permits,
-            opened: Mutex::new(None),
-        })
+        Ok(pipeline)
+    }
+
+    fn permits(&self) -> Result<FramePermits, anyhow::Error> {
+        FramePermits::checked(
+            self.frame_budget,
+            self.frame_bytes,
+            self.workers,
+            temporal_radius(self.planes.mode),
+            self.streams,
+        )
     }
 
     pub(crate) fn keep_opened(&self, decoder: Decoder) {
@@ -70,37 +78,54 @@ impl Pipeline {
             .expect("the opened source lock is never poisoned") = Some(OpenedSource(decoder));
     }
 
-    fn take_decoder(&self) -> Result<Decoder, anyhow::Error> {
-        let opened = self
-            .opened
-            .lock()
-            .expect("the opened source lock is never poisoned")
-            .take();
-        match opened {
-            Some(OpenedSource(decoder)) => Ok(decoder),
-            None => open_source(&self.source),
+    fn decoder<'a>(&self, decoder: &'a mut Option<Decoder>) -> Result<&'a mut Decoder, anyhow::Error> {
+        if decoder.is_none() {
+            let opened = self
+                .opened
+                .lock()
+                .expect("the opened source lock is never poisoned")
+                .take();
+            *decoder = Some(match opened {
+                Some(OpenedSource(opened)) => opened,
+                None => self.index.decoder()?,
+            });
         }
+        Ok(decoder.as_mut().expect("the decoder was opened above"))
     }
 
-    pub(crate) fn create_denoisers(
+    pub(crate) fn warmed_resident(&self, layout: FrameLayout, cancel: &AtomicBool) -> Result<Resident, anyhow::Error> {
+        let mut resident = create_denoiser(&self.planes, layout)?;
+        warm_resident(&mut resident, layout, cancel)?;
+        Ok(resident)
+    }
+
+    pub(crate) fn build_residents(
         &self,
+        residents: &mut Vec<Option<Resident>>,
         layout: FrameLayout,
-    ) -> Result<Vec<Option<Resident>>, anyhow::Error> {
+    ) -> Result<(), anyhow::Error> {
+        residents.resize_with(self.workers, || None);
         thread::scope(|scope| {
-            let builds: Vec<_> = (0..self.workers)
-                .map(|_| scope.spawn(|| create_denoiser(&self.planes, layout)))
-                .collect();
-            builds
-                .into_iter()
-                .map(|build| {
-                    build
-                        .join()
-                        .map_err(|panic| {
-                            anyhow::anyhow!("denoiser build panicked: {}", panic_message(panic.as_ref()))
-                        })?
-                        .map(Some)
+            let builds: Vec<_> = residents
+                .iter_mut()
+                .filter(|resident| resident.is_none())
+                .map(|resident| {
+                    scope.spawn(move || -> Result<(), anyhow::Error> {
+                        *resident = Some(create_denoiser(&self.planes, layout)?);
+                        Ok(())
+                    })
                 })
-                .collect()
+                .collect();
+            let mut result = Ok(());
+            for build in builds {
+                let built = build.join().map_err(|panic| {
+                    anyhow::anyhow!("denoiser build panicked: {}", panic_message(panic.as_ref()))
+                });
+                if let Err(error) = built.and_then(|built| built) {
+                    result = result.and(Err(error));
+                }
+            }
+            result
         })
     }
 
@@ -114,42 +139,67 @@ impl Pipeline {
     /// Starts the worker pool, then drives the dispatch loop until the
     /// window's last frame is staged.
     ///
-    /// Blocks until every worker has finished, handing their denoisers
-    /// back for the next window.
+    /// Blocks until every worker has finished, whether the window
+    /// succeeded or not, handing their denoisers back for the next
+    /// window. `decoder` is kept open for the next window too.
     pub(crate) fn run(
         &self,
         job: WindowJob,
-        denoisers: &mut Vec<Option<Resident>>,
+        residents: &mut Vec<Option<Resident>>,
+        decoder: &mut Option<Decoder>,
     ) -> Result<(), anyhow::Error> {
         let scenes = job.scenes()?;
+        let permits = self.permits()?;
 
-        denoisers.resize_with(self.workers, || None);
-        let (job_tx, worker_handles) =
-            spawn_workers(&self.planes, scenes.layout, std::mem::take(denoisers), job.output);
+        residents.resize_with(self.workers, || None);
+        let (job_tx, worker_handles) = spawn_workers(
+            &self.planes,
+            scenes.layout,
+            std::mem::take(residents),
+            job.output,
+            &job.cancel,
+            &job.abort,
+        );
 
-        dispatch_frames(
-            self.take_decoder()?,
-            &scenes,
-            &Staging {
-                jobs: &job_tx,
-                permits: &self.permits,
-                closed: &job.closed,
-                cancel: &job.cancel,
-            },
-        )?;
+        let dispatched = self.decoder(decoder).and_then(|opened| {
+            dispatch_frames(
+                opened,
+                &scenes,
+                &Staging {
+                    jobs: &job_tx,
+                    permits: &permits,
+                    closed: &job.closed,
+                    cancel: &job.cancel,
+                },
+            )
+        });
+        if dispatched.is_err() {
+            *decoder = None;
+        }
 
         // Closing the queue is what tells the workers there are no more scenes.
         drop(job_tx);
 
-        for h in worker_handles {
-            denoisers.push(
-                h.join().map_err(|panic| {
-                    anyhow::anyhow!("worker panicked: {}", panic_message(panic.as_ref()))
-                })??,
-            );
+        let mut failure = None;
+        for handle in worker_handles {
+            let resident = match handle.join() {
+                Ok(Ok(resident)) => resident,
+                Ok(Err(error)) => {
+                    failure.get_or_insert(error);
+                    None
+                },
+                Err(panic) => {
+                    failure.get_or_insert(anyhow::anyhow!("worker panicked: {}", panic_message(panic.as_ref())));
+                    None
+                },
+            };
+            residents.push(resident);
         }
 
-        Ok(())
+        match failure {
+            Some(error) => Err(error),
+            None => dispatched,
+        }
     }
 }
 
@@ -170,16 +220,17 @@ pub fn denoise_scenes(
     frame_budget: u64,
     cancel: Arc<AtomicBool>,
 ) -> Result<Window, anyhow::Error> {
-    let pipeline = Pipeline::new(planes, source, workers, scenes.layout, frame_budget, 1)?;
+    let index = SourceIndex::open(&source)?;
+    let pipeline = Pipeline::new(planes, index, workers, scenes.layout, frame_budget, 1)?;
     let (window, job, done) = Window::open(
         pipeline.output_layout(scenes.layout),
         Arc::new(scenes),
         None,
-        Cancel::new(vec![cancel]),
+        vec![cancel],
     );
 
     thread::spawn(move || {
-        let _ = done.send(pipeline.run(job, &mut Vec::new()));
+        let _ = done.send(pipeline.run(job, &mut Vec::new(), &mut None));
     });
 
     Ok(window)

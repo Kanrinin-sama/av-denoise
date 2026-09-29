@@ -1,10 +1,13 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use av_denoise_core::{FrameLayout, PlanarDenoiser, PlaneOptions, Planes, WarmUp, push_needs_retry};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::budget::Permit;
+use crate::cancel::Cancel;
 use crate::dispatch::SceneJob;
 use crate::warm::{create_denoiser, finish_warm_up};
 
@@ -31,12 +34,15 @@ pub(crate) type WorkerJoin = thread::JoinHandle<Result<Option<Resident>, anyhow:
 /// free and at most `workers` scenes are ever in flight.
 ///
 /// Returns the queue's sender and their join handles. Workers emit
-/// denoised frames on `output`.
+/// denoised frames on `output`, stop taking frames once `cancel` is set,
+/// and set `abort` when one of them fails.
 pub(crate) fn spawn_workers(
     opts: &PlaneOptions,
     layout: FrameLayout,
     denoisers: Vec<Option<Resident>>,
     output: Sender<OutputMsg>,
+    cancel: &Cancel,
+    abort: &Arc<AtomicBool>,
 ) -> (Sender<SceneJob>, Vec<WorkerJoin>) {
     let (job_tx, job_rx) = crossbeam_channel::bounded::<SceneJob>(0);
     let mut worker_handles: Vec<WorkerJoin> = Vec::with_capacity(denoisers.len());
@@ -45,9 +51,15 @@ pub(crate) fn spawn_workers(
         let opts = opts.clone();
         let out_tx = output.clone();
         let job_rx = job_rx.clone();
+        let cancel = cancel.clone();
+        let abort = Arc::clone(abort);
 
         worker_handles.push(thread::spawn(move || {
-            run_worker(worker_id, opts, layout, denoiser, job_rx, out_tx)
+            let result = run_worker(worker_id, opts, layout, denoiser, job_rx, out_tx, &cancel);
+            if result.is_err() {
+                abort.store(true, Ordering::Release);
+            }
+            result
         }));
     }
 
@@ -61,8 +73,13 @@ fn run_worker(
     mut wd: Option<Resident>,
     jobs: Receiver<SceneJob>,
     tx: Sender<OutputMsg>,
+    cancel: &Cancel,
 ) -> Result<Option<Resident>, anyhow::Error> {
     while let Ok(job) = jobs.recv() {
+        if cancel.is_set() {
+            continue;
+        }
+
         // Built on the first claimed scene unless the slot built it ahead.
         if wd.is_none() {
             wd = Some(create_denoiser(&opts, layout)?);
@@ -73,6 +90,7 @@ fn run_worker(
         tracing::debug!(worker_id, scene_idx = job.scene_idx, "worker started scene");
 
         let mut pending = Pending::new();
+        let mut pushed = false;
 
         // Nothing is received straight after the push.
         // `push_with_drain` handles backpressure through QueueFull
@@ -81,8 +99,16 @@ fn run_worker(
         // the pipeline back to depth 1 and put the GPU readback in the
         // critical path of the next push.
         for frame in job.frames {
+            if cancel.is_set() {
+                break;
+            }
             pending.push_back((frame.global_idx, frame.permit));
             push_with_drain(denoiser, warm_up, &mut pending, &frame.planes, &tx)?;
+            pushed = true;
+        }
+
+        if !pushed {
+            continue;
         }
 
         // Reuse the PlanarDenoiser across scenes. Flushing here ensures
