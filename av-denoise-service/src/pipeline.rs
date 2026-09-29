@@ -6,8 +6,9 @@ use std::thread;
 use av_decoders::Decoder;
 use av_denoise_core::{FrameLayout, PlaneOptions};
 
-use crate::SceneLayout;
 use crate::budget::{FramePermits, temporal_radius};
+use crate::threads::release_affinity;
+use crate::{CreationGuard, SceneLayout};
 use crate::dispatch::{Staging, dispatch_frames};
 use crate::source::{OpenedSource, SourceIndex};
 use crate::warm::{create_denoiser, warm_resident};
@@ -20,9 +21,8 @@ pub(crate) struct Pipeline {
     planes: PlaneOptions,
     index: SourceIndex,
     workers: usize,
-    frame_bytes: usize,
-    frame_budget: u64,
-    streams: usize,
+    permits: FramePermits,
+    guard: CreationGuard,
     opened: Mutex<Option<OpenedSource>>,
 }
 
@@ -35,40 +35,31 @@ impl Pipeline {
         layout: FrameLayout,
         frame_budget: u64,
         streams: usize,
+        guard: CreationGuard,
     ) -> Result<Self, anyhow::Error> {
         if workers == 0 {
             anyhow::bail!("--workers must be at least 1");
         }
 
-        let pipeline = Self {
-            planes,
-            index,
-            workers,
-            frame_bytes: layout.luma_bytes() + 2 * layout.chroma_bytes(),
-            frame_budget,
-            streams,
-            opened: Mutex::new(None),
-        };
-        let permits = pipeline.permits()?;
+        let frame_bytes = layout.luma_bytes() + 2 * layout.chroma_bytes();
+        let permits = FramePermits::checked(frame_budget, frame_bytes, workers, temporal_radius(planes.mode), streams)?;
 
         tracing::info!(
-            permits_per_window = permits.count(),
-            frame_bytes = pipeline.frame_bytes,
-            ceiling_mib = (permits.count() * streams * pipeline.frame_bytes) / (1 << 20),
+            permits = permits.count(),
+            permits_per_window = permits.cap(),
+            frame_bytes,
+            ceiling_mib = (permits.count() * frame_bytes) / (1 << 20),
             "frame buffer budget",
         );
 
-        Ok(pipeline)
-    }
-
-    fn permits(&self) -> Result<FramePermits, anyhow::Error> {
-        FramePermits::checked(
-            self.frame_budget,
-            self.frame_bytes,
-            self.workers,
-            temporal_radius(self.planes.mode),
-            self.streams,
-        )
+        Ok(Self {
+            planes,
+            index,
+            workers,
+            permits,
+            guard,
+            opened: Mutex::new(None),
+        })
     }
 
     pub(crate) fn keep_opened(&self, decoder: Decoder) {
@@ -87,14 +78,14 @@ impl Pipeline {
                 .take();
             *decoder = Some(match opened {
                 Some(OpenedSource(opened)) => opened,
-                None => self.index.decoder()?,
+                None => self.guard.run(|| self.index.decoder())?,
             });
         }
         Ok(decoder.as_mut().expect("the decoder was opened above"))
     }
 
     pub(crate) fn warmed_resident(&self, layout: FrameLayout, cancel: &AtomicBool) -> Result<Resident, anyhow::Error> {
-        let mut resident = create_denoiser(&self.planes, layout)?;
+        let mut resident = self.guard.run(|| create_denoiser(&self.planes, layout))?;
         warm_resident(&mut resident, layout, cancel)?;
         Ok(resident)
     }
@@ -111,7 +102,8 @@ impl Pipeline {
                 .filter(|resident| resident.is_none())
                 .map(|resident| {
                     scope.spawn(move || -> Result<(), anyhow::Error> {
-                        *resident = Some(create_denoiser(&self.planes, layout)?);
+                        release_affinity();
+                        *resident = Some(self.guard.run(|| create_denoiser(&self.planes, layout))?);
                         Ok(())
                     })
                 })
@@ -149,7 +141,7 @@ impl Pipeline {
         decoder: &mut Option<Decoder>,
     ) -> Result<(), anyhow::Error> {
         let scenes = job.scenes()?;
-        let permits = self.permits()?;
+        let permits = self.permits.window();
 
         residents.resize_with(self.workers, || None);
         let (job_tx, worker_handles) = spawn_workers(
@@ -159,6 +151,7 @@ impl Pipeline {
             job.output,
             &job.cancel,
             &job.abort,
+            &self.guard,
         );
 
         let dispatched = self.decoder(decoder).and_then(|opened| {
@@ -221,7 +214,7 @@ pub fn denoise_scenes(
     cancel: Arc<AtomicBool>,
 ) -> Result<Window, anyhow::Error> {
     let index = SourceIndex::open(&source)?;
-    let pipeline = Pipeline::new(planes, index, workers, scenes.layout, frame_budget, 1)?;
+    let pipeline = Pipeline::new(planes, index, workers, scenes.layout, frame_budget, 1, CreationGuard::default())?;
     let (window, job, done) = Window::open(
         pipeline.output_layout(scenes.layout),
         Arc::new(scenes),
@@ -230,6 +223,7 @@ pub fn denoise_scenes(
     );
 
     thread::spawn(move || {
+        release_affinity();
         let _ = done.send(pipeline.run(job, &mut Vec::new(), &mut None));
     });
 

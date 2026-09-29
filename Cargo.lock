@@ -234,6 +234,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "v_frame",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

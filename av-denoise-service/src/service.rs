@@ -7,6 +7,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::pipeline::{Pipeline, panic_message};
 use crate::source::SourceIndex;
+use crate::threads::release_affinity;
 use crate::stored_layout::UncheckedLayout;
 use crate::window::{Window, WindowJob};
 use crate::worker::Resident;
@@ -43,8 +44,9 @@ impl WindowService {
         }
         let unchecked = UncheckedLayout::load(&config.scene_layout, &config.keep_frames)?;
         let source_layout = unchecked.frame_layout()?;
-        let index = SourceIndex::open(&config.source)?;
-        let decoder = index.decoder()?;
+        let guard = config.creation_guard;
+        let index = guard.run(|| SourceIndex::open(&config.source))?;
+        let decoder = guard.run(|| index.decoder())?;
         let scenes = unchecked.check(&decoder)?;
         let pipeline = Arc::new(Pipeline::new(
             config.planes,
@@ -53,6 +55,7 @@ impl WindowService {
             source_layout,
             config.frame_budget,
             config.slots,
+            guard,
         )?);
         pipeline.keep_opened(decoder);
         let mut warmed = Some(pipeline.warmed_resident(source_layout, &cancel)?);
@@ -63,8 +66,10 @@ impl WindowService {
                 let pipeline = Arc::clone(&pipeline);
                 let slot_busy = Arc::clone(&busy);
                 let residents = vec![warmed.take()];
-                let handle =
-                    thread::spawn(move || run_slot(&pipeline, source_layout, &slot_busy, &rx, residents));
+                let handle = thread::spawn(move || {
+                    release_affinity();
+                    run_slot(&pipeline, source_layout, &slot_busy, &rx, residents)
+                });
                 Slot {
                     requests,
                     busy,

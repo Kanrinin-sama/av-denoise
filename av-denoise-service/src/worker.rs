@@ -6,9 +6,11 @@ use std::thread;
 use av_denoise_core::{FrameLayout, PlanarDenoiser, PlaneOptions, Planes, WarmUp, push_needs_retry};
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::CreationGuard;
 use crate::budget::Permit;
 use crate::cancel::Cancel;
 use crate::dispatch::SceneJob;
+use crate::threads::release_affinity;
 use crate::warm::{create_denoiser, finish_warm_up};
 
 /// One denoised frame on its way to the window, still holding its permit.
@@ -43,6 +45,7 @@ pub(crate) fn spawn_workers(
     output: Sender<OutputMsg>,
     cancel: &Cancel,
     abort: &Arc<AtomicBool>,
+    guard: &CreationGuard,
 ) -> (Sender<SceneJob>, Vec<WorkerJoin>) {
     let (job_tx, job_rx) = crossbeam_channel::bounded::<SceneJob>(0);
     let mut worker_handles: Vec<WorkerJoin> = Vec::with_capacity(denoisers.len());
@@ -53,9 +56,18 @@ pub(crate) fn spawn_workers(
         let job_rx = job_rx.clone();
         let cancel = cancel.clone();
         let abort = Arc::clone(abort);
+        let guard = guard.clone();
 
         worker_handles.push(thread::spawn(move || {
-            let result = run_worker(worker_id, opts, layout, denoiser, job_rx, out_tx, &cancel);
+            release_affinity();
+            let result = run_worker(
+                worker_id,
+                || guard.run(|| create_denoiser(&opts, layout)),
+                denoiser,
+                job_rx,
+                out_tx,
+                &cancel,
+            );
             if result.is_err() {
                 abort.store(true, Ordering::Release);
             }
@@ -68,8 +80,7 @@ pub(crate) fn spawn_workers(
 
 fn run_worker(
     worker_id: usize,
-    opts: PlaneOptions,
-    layout: FrameLayout,
+    create: impl Fn() -> Result<Resident, anyhow::Error>,
     mut wd: Option<Resident>,
     jobs: Receiver<SceneJob>,
     tx: Sender<OutputMsg>,
@@ -82,7 +93,7 @@ fn run_worker(
 
         // Built on the first claimed scene unless the slot built it ahead.
         if wd.is_none() {
-            wd = Some(create_denoiser(&opts, layout)?);
+            wd = Some(create()?);
         }
 
         let (denoiser, warm_up) = wd.as_mut().expect("denoiser exists after the check above");

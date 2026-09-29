@@ -3,7 +3,7 @@ use av_denoise_core::{Depth, Planes};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::SceneLayout;
-use crate::budget::{FramePermits, Permit};
+use crate::budget::{Permit, WindowPermits};
 use crate::cancel::Cancel;
 use crate::planes::{planes_from_v_frame_u8, planes_from_v_frame_u16};
 
@@ -26,7 +26,7 @@ pub(crate) struct SceneJob {
 /// What a dispatcher stages frames through.
 pub(crate) struct Staging<'a> {
     pub(crate) jobs: &'a Sender<SceneJob>,
-    pub(crate) permits: &'a FramePermits,
+    pub(crate) permits: &'a WindowPermits<'a>,
     pub(crate) closed: &'a Receiver<()>,
     pub(crate) cancel: &'a Cancel,
 }

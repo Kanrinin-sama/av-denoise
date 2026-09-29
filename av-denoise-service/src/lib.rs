@@ -9,6 +9,7 @@ mod planes;
 mod service;
 mod source;
 mod stored_layout;
+mod threads;
 mod warm;
 mod window;
 mod worker;
@@ -25,5 +26,6 @@ pub use self::layout::{
 };
 pub use self::pipeline::denoise_scenes;
 pub use self::service::WindowService;
+pub use self::threads::CreationGuard;
 pub use self::warm::{create_denoiser, finish_warm_up, install_kernel_cache, warm};
 pub use self::window::Window;

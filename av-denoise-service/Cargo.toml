@@ -24,3 +24,6 @@ metal = ["av-denoise-core/metal"]
 cuda = ["av-denoise-core/cuda"]
 rocm = ["av-denoise-core/rocm"]
 default = ["vulkan"]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use av_denoise_service::{FrameRange, ServiceConfig, Window, WindowService};
+use av_denoise_service::{CreationGuard, FrameRange, ServiceConfig, Window, WindowService};
 
 use crate::cli::RunOptions;
 use crate::file_mode::write_window;
@@ -52,6 +52,7 @@ pub fn run_window_service(
             slots,
             workers,
             frame_budget: frame_budget_bytes,
+            creation_guard: CreationGuard::default(),
         },
         Arc::new(AtomicBool::new(false)),
     )?;
