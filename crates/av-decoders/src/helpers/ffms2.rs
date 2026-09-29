@@ -128,7 +128,7 @@ impl Ffms2Decoder {
     /// so several decoders of one file share a single indexing pass.
     #[inline]
     pub fn with_index(index_handle: Arc<FfmsIndex>) -> Result<Self, DecoderError> {
-        let threads = std::thread::available_parallelism().map_or(8, std::num::NonZero::get) as i32;
+        let threads = 4;
 
         let source = CString::new(index_handle.path.as_str())
             .map_err(|e| DecoderError::FileReadError { cause: e.to_string() })?;
