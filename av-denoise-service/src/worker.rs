@@ -9,7 +9,8 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::CreationGuard;
 use crate::budget::Permit;
 use crate::cancel::Cancel;
-use crate::dispatch::SceneJob;
+use crate::dispatch::{SceneJob, StagedFrame};
+use crate::pool::SharedPools;
 use crate::threads::release_affinity;
 use crate::warm::{create_denoiser, finish_warm_up};
 
@@ -38,25 +39,32 @@ pub(crate) type WorkerJoin = thread::JoinHandle<Result<Option<Resident>, anyhow:
 /// Returns the queue's sender and their join handles. Workers emit
 /// denoised frames on `output`, stop taking frames once `cancel` is set,
 /// and set `abort` when one of them fails.
+pub(crate) struct WorkerConfig<'a> {
+    pub(crate) opts: &'a PlaneOptions,
+    pub(crate) layout: FrameLayout,
+    pub(crate) output: Sender<OutputMsg>,
+    pub(crate) cancel: &'a Cancel,
+    pub(crate) abort: &'a Arc<AtomicBool>,
+    pub(crate) guard: &'a CreationGuard,
+    pub(crate) pools: &'a Arc<SharedPools>,
+}
+
 pub(crate) fn spawn_workers(
-    opts: &PlaneOptions,
-    layout: FrameLayout,
+    config: &WorkerConfig<'_>,
     denoisers: Vec<Option<Resident>>,
-    output: Sender<OutputMsg>,
-    cancel: &Cancel,
-    abort: &Arc<AtomicBool>,
-    guard: &CreationGuard,
 ) -> (Sender<SceneJob>, Vec<WorkerJoin>) {
     let (job_tx, job_rx) = crossbeam_channel::bounded::<SceneJob>(0);
     let mut worker_handles: Vec<WorkerJoin> = Vec::with_capacity(denoisers.len());
 
     for (worker_id, denoiser) in denoisers.into_iter().enumerate() {
-        let opts = opts.clone();
-        let out_tx = output.clone();
+        let opts = config.opts.clone();
+        let layout = config.layout;
+        let out_tx = config.output.clone();
         let job_rx = job_rx.clone();
-        let cancel = cancel.clone();
-        let abort = Arc::clone(abort);
-        let guard = guard.clone();
+        let cancel = config.cancel.clone();
+        let abort = Arc::clone(config.abort);
+        let guard = config.guard.clone();
+        let pools = Arc::clone(config.pools);
 
         worker_handles.push(thread::spawn(move || {
             release_affinity();
@@ -67,6 +75,7 @@ pub(crate) fn spawn_workers(
                 job_rx,
                 out_tx,
                 &cancel,
+                &pools,
             );
             if result.is_err() {
                 abort.store(true, Ordering::Release);
@@ -85,7 +94,9 @@ fn run_worker(
     jobs: Receiver<SceneJob>,
     tx: Sender<OutputMsg>,
     cancel: &Cancel,
+    pools: &SharedPools,
 ) -> Result<Option<Resident>, anyhow::Error> {
+    let mut emitted = pools.emitted.take();
     while let Ok(job) = jobs.recv() {
         if cancel.is_set() {
             continue;
@@ -113,8 +124,22 @@ fn run_worker(
             if cancel.is_set() {
                 break;
             }
-            pending.push_back((frame.global_idx, frame.permit));
-            push_with_drain(denoiser, warm_up, &mut pending, &frame.planes, &tx)?;
+            let StagedFrame {
+                global_idx,
+                planes: staged,
+                permit,
+            } = frame;
+            pending.push_back((global_idx, permit));
+            push_with_drain(
+                denoiser,
+                warm_up,
+                &mut pending,
+                &staged,
+                pools,
+                &tx,
+                &mut emitted,
+            )?;
+            pools.staged.recycle(staged);
             pushed = true;
         }
 
@@ -136,16 +161,18 @@ fn push_with_drain(
     warm_up: &mut Option<WarmUp>,
     pending: &mut Pending,
     planes: &Planes,
+    pools: &SharedPools,
     tx: &Sender<OutputMsg>,
+    emitted: &mut Planes,
 ) -> Result<(), anyhow::Error> {
     if push_needs_retry(denoiser.push(planes))? {
-        if let Some(out) = denoiser.recv()? {
+        if denoiser.recv_into(emitted)? {
             let (global_idx, permit) = pending
                 .pop_front()
                 .expect("pending has at least one entry on QueueFull recv");
             tx.send(OutputMsg {
                 global_idx,
-                planes: out,
+                planes: std::mem::replace(emitted, pools.emitted.take()),
                 _permit: permit,
             })
             .map_err(|_| anyhow::anyhow!("coordinator disconnected"))?;

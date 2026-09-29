@@ -32,6 +32,7 @@ pub struct WindowService {
     output_layout: FrameLayout,
     cancel: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    pipeline: Arc<Pipeline>,
 }
 
 impl WindowService {
@@ -58,6 +59,8 @@ impl WindowService {
             guard,
         )?);
         pipeline.keep_opened(decoder);
+        let output_layout = pipeline.output_layout(scenes.layout);
+        let scenes = Arc::new(scenes);
         let mut warmed = Some(pipeline.warmed_resident(source_layout, &cancel)?);
         let slots = (0..config.slots)
             .map(|_| {
@@ -79,10 +82,11 @@ impl WindowService {
             .collect();
         Ok(Self {
             slots,
-            output_layout: pipeline.output_layout(scenes.layout),
-            scenes: Arc::new(scenes),
+            output_layout,
+            scenes,
             cancel,
             stop: Arc::new(AtomicBool::new(false)),
+            pipeline,
         })
     }
 
@@ -118,6 +122,7 @@ impl WindowService {
             Arc::clone(&self.scenes),
             Some(FrameRange { start, end }),
             vec![Arc::clone(&self.cancel), Arc::clone(&self.stop), cancel],
+            Arc::clone(&self.pipeline.pools),
         );
         if target.requests.try_send(SlotRequest { job, done }).is_err() {
             target.busy.store(false, Ordering::Release);

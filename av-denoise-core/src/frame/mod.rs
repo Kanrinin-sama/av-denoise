@@ -41,7 +41,7 @@ impl Subsampling {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameLayout {
     pub width: u32,
     pub height: u32,
@@ -104,7 +104,7 @@ pub fn fill_plane(samples: usize, value: u16, depth: Depth) -> Vec<u8> {
 /// Plane lengths come from [`FrameLayout`], so `y.len()` is
 /// `layout.luma_bytes()` and both `u.len()` and `v.len()` are
 /// `layout.chroma_bytes()`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Planes {
     pub y: Vec<u8>,
     pub u: Vec<u8>,
@@ -299,6 +299,11 @@ fn expect_wire(out: FrameOutput) -> Vec<u8> {
         .expect("PlanarDenoiser builds every Denoiser in wire output format")
 }
 
+fn expect_wire_ref(out: &FrameOutput) -> &[u8] {
+    out.as_wire()
+        .expect("PlanarDenoiser builds every Denoiser in wire output format")
+}
+
 /// Splits a fused YUV444 wire frame into its three planes.
 ///
 /// The pack kernel leaves a three-channel frame interleaved, so this is
@@ -328,6 +333,28 @@ fn split_yuv_wire(wire: &[u8], depth: Depth) -> Planes {
 fn split_uv_wire(wire: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let (u, v) = wire.split_at(wire.len() / 2);
     (u.to_vec(), v.to_vec())
+}
+
+fn split_uv_wire_into(wire: &[u8], u: &mut Vec<u8>, v: &mut Vec<u8>) {
+    let (first, second) = wire.split_at(wire.len() / 2);
+    u.clear();
+    u.extend_from_slice(first);
+    v.clear();
+    v.extend_from_slice(second);
+}
+
+fn split_yuv_wire_into(wire: &[u8], depth: Depth, out: &mut Planes) {
+    let bytes = depth.bytes_per_sample();
+    let pixels = wire.len() / (3 * bytes);
+    out.y.resize(pixels * bytes, 0);
+    out.u.resize(pixels * bytes, 0);
+    out.v.resize(pixels * bytes, 0);
+
+    for (index, pixel) in wire.chunks_exact(3 * bytes).enumerate() {
+        out.y[index * bytes..index * bytes + bytes].copy_from_slice(&pixel[..bytes]);
+        out.u[index * bytes..index * bytes + bytes].copy_from_slice(&pixel[bytes..2 * bytes]);
+        out.v[index * bytes..index * bytes + bytes].copy_from_slice(&pixel[2 * bytes..]);
+    }
 }
 
 fn convert_plane_depth(plane: &[u8], source: Depth, output: Depth) -> Vec<u8> {
@@ -387,6 +414,8 @@ pub struct PlanarDenoiser {
     /// The temporal radius every owned denoiser runs at, resolved from
     /// `opts.mode` at construction.
     temporal_radius: u32,
+    luma_wire: FrameOutput,
+    chroma_wire: FrameOutput,
 }
 
 static NEXT_PLANAR_STREAM_ID: AtomicU64 = AtomicU64::new(1 << 63);
@@ -476,6 +505,8 @@ impl PlanarDenoiser {
             luma_passthrough: VecDeque::new(),
             chroma_passthrough: VecDeque::new(),
             temporal_radius,
+            luma_wire: FrameOutput::Wire(Vec::new()),
+            chroma_wire: FrameOutput::Wire(Vec::new()),
         })
     }
 
@@ -573,54 +604,89 @@ impl PlanarDenoiser {
     ///
     /// Returns `Ok(None)` if neither half had pending output.
     pub fn recv(&mut self) -> Result<Option<Planes>, anyhow::Error> {
+        let mut planes = Planes::default();
+        if self.recv_into(&mut planes)? {
+            Ok(Some(planes))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Blocks until each enabled half emits one frame, writing it into
+    /// `out`.
+    ///
+    /// Returns `Ok(false)` if neither half had pending output. `out`
+    /// keeps its allocations, so a caller collecting frame after frame
+    /// allocates once.
+    pub fn recv_into(&mut self, out: &mut Planes) -> Result<bool, anyhow::Error> {
         if let Some(d) = self.yuv.as_mut() {
-            return match d.recv_frame()? {
-                Some(packed) => Ok(Some(split_yuv_wire(
-                    &expect_wire(packed),
-                    self.output_layout.depth,
-                ))),
-                None => Ok(None),
-            };
+            if !d.recv_frame_into(&mut self.luma_wire)? {
+                return Ok(false);
+            }
+            let wire = expect_wire_ref(&self.luma_wire);
+            split_yuv_wire_into(wire, self.output_layout.depth, out);
+            return Ok(true);
         }
 
-        let luma_out = self
+        let luma = self
             .luma
             .as_mut()
-            .map(|d| d.recv_frame())
+            .map(|d| d.recv_frame_into(&mut self.luma_wire))
             .transpose()?
-            .flatten()
-            .map(expect_wire);
+            .unwrap_or(false);
 
-        let chroma_out = self
+        let chroma = self
             .chroma
             .as_mut()
-            .map(|d| d.recv_frame())
+            .map(|d| d.recv_frame_into(&mut self.chroma_wire))
             .transpose()?
-            .flatten()
-            .map(expect_wire);
+            .unwrap_or(false);
 
         // A disabled side has no Denoiser to query. When the enabled side
         // produced output, pop the matching source plane from the
         // disabled side's passthrough queue instead.
-        let luma_passthrough = if self.luma.is_none() && chroma_out.is_some() {
+        let luma_passthrough = if self.luma.is_none() && chroma {
             self.luma_passthrough.pop_front()
         } else {
             None
         };
 
-        let chroma_passthrough = if self.chroma.is_none() && luma_out.is_some() {
+        let chroma_passthrough = if self.chroma.is_none() && luma {
             self.chroma_passthrough.pop_front()
         } else {
             None
         };
 
-        if luma_out.is_none() && chroma_out.is_none() {
-            return Ok(None);
+        if !luma && !chroma {
+            return Ok(false);
         }
 
-        let planes = self.assemble(luma_out, chroma_out, luma_passthrough, chroma_passthrough);
+        match (luma, luma_passthrough) {
+            (true, _) => {
+                let wire = expect_wire_ref(&self.luma_wire);
+                out.y.clear();
+                out.y.extend_from_slice(wire);
+            },
+            (false, Some(src)) => out.y = src,
+            (false, None) => out.y = self.output_layout.black_luma_plane(),
+        }
 
-        Ok(Some(planes))
+        match (chroma, chroma_passthrough) {
+            (true, _) => {
+                let packed = expect_wire_ref(&self.chroma_wire);
+                split_uv_wire_into(packed, &mut out.u, &mut out.v);
+            },
+            (false, Some((src_u, src_v))) => {
+                out.u = src_u;
+                out.v = src_v;
+            },
+            (false, None) => {
+                out.u = self.output_layout.neutral_chroma_plane();
+                out.v = self.output_layout.neutral_chroma_plane();
+            },
+        }
+
+        Ok(true)
     }
 
     /// Drains the temporal tail of both halves.
@@ -784,40 +850,16 @@ impl PlanarDenoiser {
         drop_leading(&mut self.luma_passthrough, radius);
         drop_leading(&mut self.chroma_passthrough, radius);
 
+        let mut scratch = Planes::default();
         let mut result = None;
         for planes in tail {
             self.push(planes)?;
-            if let Some(out) = self.recv()? {
-                result = Some(out);
+            if self.recv_into(&mut scratch)? {
+                result = Some(std::mem::take(&mut scratch));
             }
         }
 
         result.ok_or_else(|| anyhow::anyhow!("a full window produced no frame, this is a bug"))
-    }
-
-    fn assemble(
-        &self,
-        luma: Option<Vec<u8>>,
-        chroma: Option<Vec<u8>>,
-        luma_passthrough: Option<Vec<u8>>,
-        chroma_passthrough: Option<(Vec<u8>, Vec<u8>)>,
-    ) -> Planes {
-        let y = match (luma, luma_passthrough) {
-            (Some(v), _) => v,
-            (None, Some(src)) => src,
-            (None, None) => self.output_layout.black_luma_plane(),
-        };
-
-        let (u, v) = match (chroma, chroma_passthrough) {
-            (Some(packed), _) => split_uv_wire(&packed),
-            (None, Some(src)) => src,
-            (None, None) => (
-                self.output_layout.neutral_chroma_plane(),
-                self.output_layout.neutral_chroma_plane(),
-            ),
-        };
-
-        Planes { y, u, v }
     }
 }
 

@@ -730,6 +730,17 @@ impl BackendPending {
         }
     }
 
+    fn wait_into(self, dst: &mut FrameOutput) -> Result<(), anyhow::Error> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(p) => p.wait_into(dst),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(p) => p.wait_into(dst),
+            #[cfg(any(feature = "vulkan", feature = "metal"))]
+            Self::Wgpu(p) => p.wait_into(dst),
+        }
+    }
+
     /// Polls the readback once. `Ok(Ok(frame))` is a landed frame,
     /// `Ok(Err(self))` is a readback still in flight.
     fn try_wait(self) -> Result<Result<FrameOutput, Self>, anyhow::Error> {
@@ -1186,6 +1197,28 @@ impl Denoiser {
             return Ok(None);
         };
         Ok(Some(pending.wait()?))
+    }
+
+    /// Blocks until the in-flight denoise finishes, writing it into `dst`.
+    ///
+    /// Returns `Ok(false)` when nothing is in flight. `dst` keeps its
+    /// allocation, so a caller collecting frame after frame allocates once.
+    ///
+    /// A failure poisons the denoiser, so every further call returns
+    /// [`DenoiserError::Poisoned`] until [`Self::reset_stream`] clears it.
+    pub fn recv_frame_into(&mut self, dst: &mut FrameOutput) -> Result<bool, DenoiserError> {
+        if self.poisoned {
+            return Err(DenoiserError::Poisoned);
+        }
+        self.recv_frame_into_inner(dst).inspect_err(|_| self.poisoned = true)
+    }
+
+    fn recv_frame_into_inner(&mut self, dst: &mut FrameOutput) -> Result<bool, DenoiserError> {
+        let Some(pending) = self.pending.pop_front() else {
+            return Ok(false);
+        };
+        pending.wait_into(dst)?;
+        Ok(true)
     }
 
     /// Polls the in-flight denoise once.

@@ -8,6 +8,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::budget::CANCEL_POLL;
 use crate::cancel::Cancel;
+use crate::pool::SharedPools;
 use crate::worker::OutputMsg;
 use crate::{FrameRange, SceneLayout};
 
@@ -19,6 +20,7 @@ pub(crate) struct WindowJob {
     pub(crate) closed: Receiver<()>,
     pub(crate) cancel: Cancel,
     pub(crate) abort: Arc<AtomicBool>,
+    pub(crate) pools: Arc<SharedPools>,
 }
 
 impl WindowJob {
@@ -45,6 +47,7 @@ pub struct Window {
     stop: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
     _closed: Sender<()>,
+    pools: Arc<SharedPools>,
 }
 
 impl Window {
@@ -53,6 +56,7 @@ impl Window {
         scenes: Arc<SceneLayout>,
         span: Option<FrameRange>,
         mut flags: Vec<Arc<AtomicBool>>,
+        pools: Arc<SharedPools>,
     ) -> (Self, WindowJob, Sender<Result<(), anyhow::Error>>) {
         let stop = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
@@ -75,6 +79,7 @@ impl Window {
             stop,
             abort: Arc::clone(&abort),
             _closed: closed_tx,
+            pools: Arc::clone(&pools),
         };
         let job = WindowJob {
             scenes,
@@ -83,6 +88,7 @@ impl Window {
             closed,
             cancel,
             abort,
+            pools,
         };
         (window, job, done_tx)
     }
@@ -104,6 +110,12 @@ impl Window {
 
     pub fn cancel(&self) {
         self.stop.store(true, Ordering::Release);
+    }
+
+    /// Hands a received frame's buffers back to the pool, so the next
+    /// staged frame reuses them instead of allocating.
+    pub fn recycle(&self, planes: Planes) {
+        self.pools.emitted.recycle(planes);
     }
 
     /// The next frame in order, or `None` once the window is done.
@@ -177,7 +189,11 @@ impl Window {
     /// Discards any frames not yet received, waits for the pipeline and
     /// returns how many frames the window produced.
     pub fn finish(mut self) -> Result<usize, anyhow::Error> {
-        while self.recv().is_some() {}
+        while let Some(result) = self.recv() {
+            if let Ok(planes) = result {
+                self.recycle(planes);
+            }
+        }
 
         let pipeline = self.wait_pipeline();
 

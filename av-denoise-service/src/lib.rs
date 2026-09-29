@@ -6,6 +6,7 @@ mod frame_range;
 mod layout;
 mod pipeline;
 mod planes;
+mod pool;
 mod service;
 mod source;
 mod stored_layout;

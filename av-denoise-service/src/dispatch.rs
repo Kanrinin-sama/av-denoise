@@ -1,11 +1,14 @@
+use std::sync::Arc;
+
 use av_decoders::Decoder;
-use av_denoise_core::{Depth, Planes};
+use av_denoise_core::Planes;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::SceneLayout;
 use crate::budget::{Permit, WindowPermits};
 use crate::cancel::Cancel;
-use crate::planes::{planes_from_v_frame_u8, planes_from_v_frame_u16};
+use crate::planes::decode_into;
+use crate::pool::SharedPools;
 
 /// One decoded frame, staged for the worker that claims its scene.
 pub(crate) struct StagedFrame {
@@ -29,6 +32,7 @@ pub(crate) struct Staging<'a> {
     pub(crate) permits: &'a WindowPermits<'a>,
     pub(crate) closed: &'a Receiver<()>,
     pub(crate) cancel: &'a Cancel,
+    pub(crate) pools: &'a Arc<SharedPools>,
 }
 
 /// Reads every frame in order and offers each scene to the worker pool.
@@ -103,7 +107,7 @@ pub(crate) fn dispatch_frames(
     scenes: &SceneLayout,
     staging: &Staging<'_>,
 ) -> Result<(), anyhow::Error> {
-    stage_frames(emitted_frames(decoder, scenes), scenes, staging)
+    stage_frames(emitted_frames(decoder, scenes, staging.pools), scenes, staging)
 }
 
 /// Decodes the source ranges in order, reading past phantom frames.
@@ -113,6 +117,7 @@ pub(crate) fn dispatch_frames(
 fn emitted_frames<'a>(
     decoder: &'a mut Decoder,
     scenes: &SceneLayout,
+    pools: &'a SharedPools,
 ) -> impl Iterator<Item = Result<Planes, anyhow::Error>> + use<'a> {
     let layout = scenes.layout;
     let ranges = scenes.source_ranges.clone();
@@ -121,10 +126,15 @@ fn emitted_frames<'a>(
     let mut remaining = 0usize;
     let mut raw_index = 0usize;
     std::iter::from_fn(move || -> Option<Result<Planes, anyhow::Error>> {
+        let mut planes = pools.staged.take();
         loop {
             if remaining == 0 {
-                let &(start, end) = ranges.get(range_index)?;
+                let Some(&(start, end)) = ranges.get(range_index) else {
+                    pools.staged.recycle(planes);
+                    return None;
+                };
                 if let Err(error) = decoder.seek_video_frame(start) {
+                    pools.staged.recycle(planes);
                     return Some(Err(error.into()));
                 }
                 raw_index = start;
@@ -135,30 +145,20 @@ fn emitted_frames<'a>(
             let current = raw_index;
             raw_index += 1;
             if phantom.contains(&current) {
-                let skipped = match layout.depth {
-                    Depth::Eight => decoder.read_video_frame::<u8>().map(|_| ()),
-                    Depth::Ten | Depth::Twelve => decoder.read_video_frame::<u16>().map(|_| ()),
-                };
-                if let Err(error) = skipped {
-                    return Some(Err(error.into()));
+                if let Err(error) = decode_into(decoder, layout, &mut planes) {
+                    pools.staged.recycle(planes);
+                    return Some(Err(error));
                 }
                 continue;
             }
             break;
         }
-        match layout.depth {
-            Depth::Eight => Some(
-                decoder
-                    .read_video_frame::<u8>()
-                    .map_err(Into::into)
-                    .and_then(|frame| planes_from_v_frame_u8(&frame, layout)),
-            ),
-            Depth::Ten | Depth::Twelve => Some(
-                decoder
-                    .read_video_frame::<u16>()
-                    .map_err(Into::into)
-                    .and_then(|frame| planes_from_v_frame_u16(&frame, layout)),
-            ),
+        match decode_into(decoder, layout, &mut planes) {
+            Ok(()) => Some(Ok(planes)),
+            Err(error) => {
+                pools.staged.recycle(planes);
+                Some(Err(error))
+            },
         }
     })
 }

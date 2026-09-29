@@ -692,6 +692,29 @@ clip.set_output()
         result
     }
 
+    /// Decodes the next frame into packed wire-byte planes, reusing the buffers.
+    #[inline]
+    pub fn read_video_planes_into(
+        &mut self,
+        y: &mut Vec<u8>,
+        u: &mut Vec<u8>,
+        v: &mut Vec<u8>,
+    ) -> Result<(), DecoderError> {
+        let result = self.decoder.read_video_planes_into(
+            &self.video_details,
+            #[cfg(any(feature = "ffmpeg", feature = "vapoursynth", feature = "ffms2"))]
+            self.frames_read,
+            self.config.luma_only,
+            y,
+            u,
+            v,
+        );
+        if result.is_ok() {
+            self.frames_read += 1;
+        }
+        result
+    }
+
     #[cfg(feature = "ffms2")]
     #[allow(missing_docs)]
     pub fn seek_video_frame(&mut self, frame_index: usize) -> Result<(), DecoderError> {
@@ -1049,6 +1072,55 @@ impl DecoderImpl {
         }
     }
 
+    pub(crate) fn read_video_planes_into(
+        &mut self,
+        cfg: &VideoDetails,
+        #[cfg(any(feature = "ffmpeg", feature = "vapoursynth", feature = "ffms2"))] frame_index: usize,
+        luma_only: bool,
+        y: &mut Vec<u8>,
+        u: &mut Vec<u8>,
+        v: &mut Vec<u8>,
+    ) -> Result<(), DecoderError> {
+        match self {
+            Self::Y4m(dec) => {
+                if cfg.bit_depth > 8 {
+                    let frame =
+                        helpers::y4m::read_video_frame::<Box<dyn Read>, u16>(dec, cfg, luma_only)?;
+                    collect_frame_into(&frame, y, u, v);
+                } else {
+                    let frame =
+                        helpers::y4m::read_video_frame::<Box<dyn Read>, u8>(dec, cfg, luma_only)?;
+                    collect_frame_into(&frame, y, u, v);
+                }
+                Ok(())
+            },
+            #[cfg(feature = "vapoursynth")]
+            Self::Vapoursynth(dec) => {
+                if cfg.bit_depth > 8 {
+                    let frame = dec.read_video_frame::<u16>(cfg, frame_index, luma_only)?;
+                    collect_frame_into(&frame, y, u, v);
+                } else {
+                    let frame = dec.read_video_frame::<u8>(cfg, frame_index, luma_only)?;
+                    collect_frame_into(&frame, y, u, v);
+                }
+                Ok(())
+            },
+            #[cfg(feature = "ffmpeg")]
+            Self::Ffmpeg(dec) => {
+                if cfg.bit_depth > 8 {
+                    let frame = dec.read_video_frame::<u16>(frame_index, luma_only)?;
+                    collect_frame_into(&frame, y, u, v);
+                } else {
+                    let frame = dec.read_video_frame::<u8>(frame_index, luma_only)?;
+                    collect_frame_into(&frame, y, u, v);
+                }
+                Ok(())
+            },
+            #[cfg(feature = "ffms2")]
+            Self::Ffms2(dec) => dec.read_video_planes_into(frame_index, luma_only, y, u, v),
+        }
+    }
+
     #[cfg(feature = "vapoursynth")]
     pub(crate) fn get_video_frame<T: Pixel>(
         &mut self,
@@ -1060,6 +1132,64 @@ impl DecoderImpl {
             #[cfg(feature = "vapoursynth")]
             Self::Vapoursynth(dec) => dec.read_video_frame::<T>(cfg, frame_index, luma_only),
             _ => Err(DecoderError::UnsupportedDecoder),
+        }
+    }
+}
+
+fn collect_frame_into<T: PackPlane>(frame: &Frame<T>, y: &mut Vec<u8>, u: &mut Vec<u8>, v: &mut Vec<u8>) {
+    T::pack(frame, y, u, v);
+}
+
+trait PackPlane: Pixel {
+    fn pack(frame: &Frame<Self>, y: &mut Vec<u8>, u: &mut Vec<u8>, v: &mut Vec<u8>);
+}
+
+impl PackPlane for u8 {
+    fn pack(frame: &Frame<Self>, y: &mut Vec<u8>, u: &mut Vec<u8>, v: &mut Vec<u8>) {
+        pack_plane_u8(&frame.y_plane, y);
+        match (&frame.u_plane, &frame.v_plane) {
+            (Some(u_plane), Some(v_plane)) => {
+                pack_plane_u8(u_plane, u);
+                pack_plane_u8(v_plane, v);
+            },
+            _ => {
+                u.clear();
+                v.clear();
+            },
+        }
+    }
+}
+
+impl PackPlane for u16 {
+    fn pack(frame: &Frame<Self>, y: &mut Vec<u8>, u: &mut Vec<u8>, v: &mut Vec<u8>) {
+        pack_plane_u16(&frame.y_plane, y);
+        match (&frame.u_plane, &frame.v_plane) {
+            (Some(u_plane), Some(v_plane)) => {
+                pack_plane_u16(u_plane, u);
+                pack_plane_u16(v_plane, v);
+            },
+            _ => {
+                u.clear();
+                v.clear();
+            },
+        }
+    }
+}
+
+fn pack_plane_u8(plane: &v_frame::plane::Plane<u8>, dst: &mut Vec<u8>) {
+    dst.clear();
+    dst.reserve(plane.width().get() * plane.height().get());
+    for row in plane.rows() {
+        dst.extend_from_slice(row);
+    }
+}
+
+fn pack_plane_u16(plane: &v_frame::plane::Plane<u16>, dst: &mut Vec<u8>) {
+    dst.clear();
+    dst.reserve(plane.width().get() * plane.height().get() * 2);
+    for row in plane.rows() {
+        for &sample in row {
+            dst.extend_from_slice(&sample.to_le_bytes());
         }
     }
 }

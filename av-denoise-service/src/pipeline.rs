@@ -7,13 +7,14 @@ use av_decoders::Decoder;
 use av_denoise_core::{FrameLayout, PlaneOptions};
 
 use crate::budget::{FramePermits, temporal_radius};
+use crate::pool::SharedPools;
 use crate::threads::release_affinity;
 use crate::{CreationGuard, SceneLayout};
 use crate::dispatch::{Staging, dispatch_frames};
 use crate::source::{OpenedSource, SourceIndex};
 use crate::warm::{create_denoiser, warm_resident};
 use crate::window::{Window, WindowJob};
-use crate::worker::{Resident, spawn_workers};
+use crate::worker::{Resident, WorkerConfig, spawn_workers};
 
 /// The decode, denoise and budget settings every window of one source
 /// runs with.
@@ -24,6 +25,7 @@ pub(crate) struct Pipeline {
     permits: FramePermits,
     guard: CreationGuard,
     opened: Mutex<Option<OpenedSource>>,
+    pub(crate) pools: Arc<SharedPools>,
 }
 
 impl Pipeline {
@@ -52,6 +54,12 @@ impl Pipeline {
             "frame buffer budget",
         );
 
+        let emitted = FrameLayout {
+            depth: planes.output_depth.unwrap_or(layout.depth),
+            ..layout
+        };
+        let pools = Arc::new(SharedPools::new(layout, emitted));
+
         Ok(Self {
             planes,
             index,
@@ -59,6 +67,7 @@ impl Pipeline {
             permits,
             guard,
             opened: Mutex::new(None),
+            pools,
         })
     }
 
@@ -144,15 +153,16 @@ impl Pipeline {
         let permits = self.permits.window();
 
         residents.resize_with(self.workers, || None);
-        let (job_tx, worker_handles) = spawn_workers(
-            &self.planes,
-            scenes.layout,
-            std::mem::take(residents),
-            job.output,
-            &job.cancel,
-            &job.abort,
-            &self.guard,
-        );
+        let config = WorkerConfig {
+            opts: &self.planes,
+            layout: scenes.layout,
+            output: job.output.clone(),
+            cancel: &job.cancel,
+            abort: &job.abort,
+            guard: &self.guard,
+            pools: &job.pools,
+        };
+        let (job_tx, worker_handles) = spawn_workers(&config, std::mem::take(residents));
 
         let dispatched = self.decoder(decoder).and_then(|opened| {
             dispatch_frames(
@@ -163,6 +173,7 @@ impl Pipeline {
                     permits: &permits,
                     closed: &job.closed,
                     cancel: &job.cancel,
+                    pools: &job.pools,
                 },
             )
         });
@@ -220,6 +231,7 @@ pub fn denoise_scenes(
         Arc::new(scenes),
         None,
         vec![cancel],
+        Arc::clone(&pipeline.pools),
     );
 
     thread::spawn(move || {

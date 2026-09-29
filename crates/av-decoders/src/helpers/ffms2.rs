@@ -496,6 +496,132 @@ impl Ffms2Decoder {
 
         Ok(frame)
     }
+
+    pub(crate) fn read_video_planes_into(
+        &mut self,
+        frame_index: usize,
+        luma_only: bool,
+        y: &mut Vec<u8>,
+        u: &mut Vec<u8>,
+        v: &mut Vec<u8>,
+    ) -> Result<(), DecoderError> {
+        if frame_index
+            >= self
+                .video_details
+                .total_frames
+                .expect("ffms2 decoder knows frame count")
+        {
+            return Err(DecoderError::EndOfFile);
+        }
+        let width = self.video_details.width;
+        let height = self.video_details.height;
+        if width == 0 || height == 0 {
+            return Err(DecoderError::GenericDecodeError {
+                cause: "Zero-width resolution is not supported".to_string(),
+            });
+        }
+        let bytes = if self.video_details.bit_depth > 8 { 2 } else { 1 };
+        let mut err = unsafe { empty_error_info() };
+        let raw_frame = unsafe {
+            FFMS_GetFrame(
+                self.video_source,
+                i32::try_from(frame_index).unwrap_or(0),
+                std::ptr::addr_of_mut!(err),
+            )
+        };
+        if raw_frame.is_null() {
+            let error_msg = get_error_message(err);
+            free_error_info(&mut err);
+            return Err(DecoderError::Ffms2InternalError {
+                cause: format!("Failed to read frame: {error_msg}"),
+            });
+        }
+        free_error_info(&mut err);
+
+        // SAFETY: we assume that the values provided by FFMS2 are correct
+        unsafe {
+            copy_packed_plane(
+                y,
+                (*raw_frame).Data[0],
+                (*raw_frame).Linesize[0],
+                width,
+                height,
+                bytes,
+            )?;
+        }
+        if luma_only || matches!(self.video_details.chroma_sampling, ChromaSubsampling::Monochrome) {
+            u.clear();
+            v.clear();
+            return Ok(());
+        }
+        let (x_div, y_div) = self
+            .video_details
+            .chroma_sampling
+            .subsample_ratio()
+            .map_or((1, 1), |(x, y)| (x.get() as usize, y.get() as usize));
+        if width % x_div != 0 || height % y_div != 0 {
+            return Err(DecoderError::GenericDecodeError {
+                cause: "Resolution is not divisible by the chroma subsampling".to_string(),
+            });
+        }
+        // SAFETY: we assume that the values provided by FFMS2 are correct
+        unsafe {
+            copy_packed_plane(
+                u,
+                (*raw_frame).Data[1],
+                (*raw_frame).Linesize[1],
+                width / x_div,
+                height / y_div,
+                bytes,
+            )?;
+            copy_packed_plane(
+                v,
+                (*raw_frame).Data[2],
+                (*raw_frame).Linesize[2],
+                width / x_div,
+                height / y_div,
+                bytes,
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+fn copy_packed_plane(
+    dst: &mut Vec<u8>,
+    src: *const u8,
+    stride: i32,
+    width: usize,
+    height: usize,
+    bytes: usize,
+) -> Result<(), DecoderError> {
+    let stride = usize::try_from(stride).map_err(|_| DecoderError::GenericDecodeError {
+        cause: "FFMS2 reported a negative plane stride".to_string(),
+    })?;
+    let row = width * bytes;
+    if stride < row {
+        return Err(DecoderError::GenericDecodeError {
+            cause: "FFMS2 reported a stride shorter than the visible row".to_string(),
+        });
+    }
+    dst.reserve(row * height);
+    // SAFETY: every byte below the new length is written by the row loop.
+    unsafe {
+        dst.set_len(row * height);
+    }
+    for index in 0..height {
+        // SAFETY: the caller verified the FFMS2 pointers and strides, and
+        // both regions hold this row.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.add(index * stride),
+                dst.as_mut_ptr().add(index * row),
+                row,
+            );
+        }
+    }
+    Ok(())
 }
 
 // FFmpeg pixel format constants (from libavutil/pixfmt.h)
