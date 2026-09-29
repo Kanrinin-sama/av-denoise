@@ -75,6 +75,10 @@ impl WindowService {
         })
     }
 
+    pub fn source_layout(&self) -> FrameLayout {
+        self.scenes.layout
+    }
+
     /// Starts denoising the retained frames `start..end` on `slot`.
     ///
     /// Both ends have to fall on scene boundaries of the stored layout.
