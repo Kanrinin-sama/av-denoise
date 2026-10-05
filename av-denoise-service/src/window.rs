@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use av_decoders::Rational32;
-use av_denoise_core::{FrameLayout, Planes};
+use av_denoise_core::{FrameLayout, Planes, SceneGrain};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::budget::CANCEL_POLL;
@@ -21,6 +21,7 @@ pub(crate) struct WindowJob {
     pub(crate) cancel: Cancel,
     pub(crate) abort: Arc<AtomicBool>,
     pub(crate) pools: Arc<SharedPools>,
+    pub(crate) grain: Arc<Mutex<Vec<SceneGrain>>>,
 }
 
 impl WindowJob {
@@ -48,6 +49,7 @@ pub struct Window {
     abort: Arc<AtomicBool>,
     _closed: Sender<()>,
     pools: Arc<SharedPools>,
+    grain: Arc<Mutex<Vec<SceneGrain>>>,
 }
 
 impl Window {
@@ -66,6 +68,7 @@ impl Window {
         let (output_tx, output) = crossbeam_channel::unbounded();
         let (closed_tx, closed) = crossbeam_channel::bounded(0);
         let (done_tx, done) = crossbeam_channel::bounded(1);
+        let grain = Arc::new(Mutex::new(Vec::new()));
         let window = Self {
             layout,
             frame_rate: scenes.framerate,
@@ -80,6 +83,7 @@ impl Window {
             abort: Arc::clone(&abort),
             _closed: closed_tx,
             pools: Arc::clone(&pools),
+            grain: Arc::clone(&grain),
         };
         let job = WindowJob {
             scenes,
@@ -89,6 +93,7 @@ impl Window {
             cancel,
             abort,
             pools,
+            grain,
         };
         (window, job, done_tx)
     }
@@ -188,7 +193,11 @@ impl Window {
 
     /// Discards any frames not yet received, waits for the pipeline and
     /// returns how many frames the window produced.
-    pub fn finish(mut self) -> Result<usize, anyhow::Error> {
+    pub fn finish(self) -> Result<usize, anyhow::Error> {
+        self.finish_with_grain().map(|(frames, _)| frames)
+    }
+
+    pub fn finish_with_grain(mut self) -> Result<(usize, Vec<SceneGrain>), anyhow::Error> {
         while let Some(result) = self.recv() {
             if let Ok(planes) = result {
                 self.recycle(planes);
@@ -203,6 +212,13 @@ impl Window {
 
         pipeline?;
 
-        Ok(self.next as usize)
+        let mut grain = std::mem::take(
+            &mut *self
+                .grain
+                .lock()
+                .map_err(|_| anyhow::anyhow!("grain collection failed"))?,
+        );
+        grain.sort_by_key(|scene| scene.first_frame);
+        Ok((self.next as usize, grain))
     }
 }

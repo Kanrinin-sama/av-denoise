@@ -2,16 +2,17 @@ use std::io::{IsTerminal, Write, stdout};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
 
+use av_denoise::SceneGrain;
 use av_denoise_service::{FrameRange, SceneLayout, Window, denoise_scenes};
 use indicatif::ProgressBar;
 use y4m::Frame as Y4mFrame;
 
 use crate::cli::RunOptions;
+use crate::grain_table::TablePath;
 use crate::progress::{self, denoise_bar_visible, denoise_progress_bar};
 use crate::scene_scan;
-use crate::y4m_format::subsampling_to_y4m;
+use crate::y4m_format::create_encoder;
 
 pub fn run_file(
     opts: &RunOptions,
@@ -22,6 +23,7 @@ pub fn run_file(
     keep_frames: &[FrameRange],
     scene_span: Option<FrameRange>,
 ) -> Result<(), anyhow::Error> {
+    let table = opts.grain_table.as_deref().map(TablePath::create).transpose()?;
     // Scene detection finishes before a single frame is written, so its
     // bar has the terminal to itself and needs no opt-in. The denoising
     // bar shares the terminal with whatever consumes our output, so it
@@ -53,7 +55,12 @@ pub fn run_file(
         frame_budget_bytes,
         Arc::new(AtomicBool::new(false)),
     )?;
-    write_window(window, stdout(), denoise_bar_visible(opts.progress, is_terminal))?;
+    let framerate = window.frame_rate();
+    let (_, grain) =
+        write_window_with_grain(window, stdout(), denoise_bar_visible(opts.progress, is_terminal))?;
+    if let Some(table) = table {
+        table.write(&grain, (*framerate.numer() as u64, *framerate.denom() as u64))?;
+    }
 
     Ok(())
 }
@@ -68,38 +75,41 @@ pub fn write_scene_layout(
 }
 
 /// Writes a window's frames as y4m, returning how many it produced.
-pub fn write_window(mut window: Window, output: impl Write, visible: bool) -> Result<usize, anyhow::Error> {
+pub fn write_window(window: Window, output: impl Write, visible: bool) -> Result<usize, anyhow::Error> {
+    write_window_with_grain(window, output, visible).map(|(frames, _)| frames)
+}
+
+fn write_window_with_grain(
+    mut window: Window,
+    output: impl Write,
+    visible: bool,
+) -> Result<(usize, Vec<SceneGrain>), anyhow::Error> {
     let layout = window.layout();
     let framerate = window.frame_rate();
 
     // No `XCOLORRANGE=` tag is emitted here. `av_decoders::VideoDetails`
     // doesn't surface the source's color range for any of its backends
     // (ffms2 included), so there's nothing to forward.
-    let mut encoder = y4m::encode(
-        layout.width as usize,
-        layout.height as usize,
+    let mut encoder = create_encoder(
+        layout,
         y4m::Ratio::new((*framerate.numer()) as usize, (*framerate.denom()) as usize),
-    )
-    .with_colorspace(subsampling_to_y4m(layout.subsampling, layout.depth))
-    .write_header(output)?;
+        None,
+        Vec::new(),
+        output,
+    )?;
 
     // Counts frames written to the output, which lags the frames read by
     // the depth of the worker pipelines. Emitted frames are the honest
     // measure of progress, because the count stalls whenever whatever
     // consumes our output stops reading.
-    let pb = denoise_progress_bar(window.frames(), visible);
-
-    // The first frame only lands once a worker has compiled its
-    // kernels, which takes seconds. A steady tick draws the bar right
-    // away and keeps its elapsed time moving until then.
-    pb.enable_steady_tick(Duration::from_millis(250));
+    let pb = denoise_progress_bar(Some(window.frames()), visible);
 
     let result = write_frames(&mut encoder, &mut window, &pb);
 
     progress::finish(&pb);
 
     result?;
-    window.finish()
+    window.finish_with_grain()
 }
 
 fn write_frames<W: Write>(

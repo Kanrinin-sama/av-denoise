@@ -113,7 +113,7 @@ pub(crate) fn shift_insert8_gated(
 /// The spatial row pass needs a row and a lane owns a column, so this
 /// runs once before it and once after its inverse.
 #[cube]
-pub(crate) fn transpose8(buf: &mut SharedMemory<f32>, v: &mut Array<f32>, sub: u32, slot: u32) {
+pub(crate) fn transpose8(buf: &mut Shared<[f32]>, v: &mut Array<f32>, sub: u32, slot: u32) {
     let base = slot * 65u32;
     #[unroll]
     for i in 0..8u32 {

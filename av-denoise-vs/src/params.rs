@@ -169,8 +169,6 @@ pub struct RawParams {
     pub chroma_strength: Option<f64>,
     pub luma_lambda_ht: Option<f64>,
     pub chroma_lambda_ht: Option<f64>,
-    pub luma_mismatch_scale: Option<f64>,
-    pub chroma_mismatch_scale: Option<f64>,
     pub device: Option<String>,
     pub accelerators: Option<Vec<String>>,
     pub search_radius: Option<i64>,
@@ -183,6 +181,12 @@ pub struct RawParams {
     pub lambda_ht_scale: Option<f64>,
     pub spatial_radius: Option<i64>,
     pub refine: Option<i64>,
+    pub noise_map: Option<bool>,
+    pub flat_boost: Option<f64>,
+    pub chroma_flat_boost: Option<f64>,
+    pub shadow_soften: Option<f64>,
+    pub flat_texture_cut: Option<f64>,
+    pub pooled_threshold: Option<bool>,
 }
 
 /// Turns a nonnegative script integer into a `u32`, naming `field` in
@@ -215,11 +219,11 @@ fn parse_channel_mode(raw: &str, layout: FrameLayout) -> Result<ChannelIntent, a
 /// belongs to. Core's own `DenoiserOptions::to_nlm_params` builds the
 /// `Nl4d` arm from `NlmParams::default()` for exactly this group of
 /// fields, so none of them reach an `Nl4d` run at all, no matter what a
-/// caller sets. `lambda_ht` and `mismatch_scale` and their per-plane
-/// overrides only feed nl4d's temporal grouping stage. Setting one on
-/// the algorithm that ignores it would silently do nothing, which a
-/// script parameter dictionary has no way to warn about on its own, so
-/// this rejects it instead.
+/// caller sets. `lambda_ht` and its per-plane overrides only feed
+/// nl4d's temporal grouping stage. Setting one on the algorithm that
+/// ignores it would silently do nothing, which a script parameter
+/// dictionary has no way to warn about on its own, so this rejects it
+/// instead.
 ///
 /// `sigma` and `sigma_scale` both pin or nudge the noise level an HQ
 /// front end would otherwise measure. nl4d always runs that front end,
@@ -264,12 +268,16 @@ fn reject_mismatched_params(
     let nl4d_only_params: &[(&str, bool)] = &[
         ("luma_lambda_ht", raw.luma_lambda_ht.is_some()),
         ("chroma_lambda_ht", raw.chroma_lambda_ht.is_some()),
-        ("luma_mismatch_scale", raw.luma_mismatch_scale.is_some()),
-        ("chroma_mismatch_scale", raw.chroma_mismatch_scale.is_some()),
         ("lambda_ht", raw.lambda_ht.is_some()),
         ("lambda_ht_scale", raw.lambda_ht_scale.is_some()),
         ("spatial_radius", raw.spatial_radius.is_some()),
         ("refine", raw.refine.is_some()),
+        ("noise_map", raw.noise_map.is_some()),
+        ("flat_boost", raw.flat_boost.is_some()),
+        ("chroma_flat_boost", raw.chroma_flat_boost.is_some()),
+        ("shadow_soften", raw.shadow_soften.is_some()),
+        ("flat_texture_cut", raw.flat_texture_cut.is_some()),
+        ("pooled_threshold", raw.pooled_threshold.is_some()),
     ];
 
     match algorithm_kind {
@@ -499,6 +507,30 @@ pub fn plane_options_from(
                 Some(r) => nonnegative(r, "refine")?,
                 None => Nl4dOptions::default().refine,
             },
+            noise_map: match raw.noise_map {
+                Some(enabled) => enabled,
+                None => Nl4dOptions::default().noise_map,
+            },
+            flat_boost: raw
+                .flat_boost
+                .map(|v| v as f32)
+                .unwrap_or_else(|| Nl4dOptions::default().flat_boost),
+            chroma_flat_boost: raw
+                .chroma_flat_boost
+                .map(|v| v as f32)
+                .unwrap_or_else(|| Nl4dOptions::default().chroma_flat_boost),
+            shadow_soften: raw
+                .shadow_soften
+                .map(|v| v as f32)
+                .unwrap_or_else(|| Nl4dOptions::default().shadow_soften),
+            flat_texture_cut: raw
+                .flat_texture_cut
+                .map(|v| v as f32)
+                .unwrap_or_else(|| Nl4dOptions::default().flat_texture_cut),
+            pooled_threshold: match raw.pooled_threshold {
+                Some(enabled) => enabled,
+                None => Nl4dOptions::default().pooled_threshold,
+            },
             ..Nl4dOptions::default()
         }),
     };
@@ -514,7 +546,5 @@ pub fn plane_options_from(
         chroma_strength: raw.chroma_strength.map(|v| v as f32),
         luma_lambda_ht: raw.luma_lambda_ht.map(|v| v as f32),
         chroma_lambda_ht: raw.chroma_lambda_ht.map(|v| v as f32),
-        luma_mismatch_scale: raw.luma_mismatch_scale.map(|v| v as f32),
-        chroma_mismatch_scale: raw.chroma_mismatch_scale.map(|v| v as f32),
     })
 }

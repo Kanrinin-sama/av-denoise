@@ -13,8 +13,8 @@ anyhow.workspace = true
 bytesize.workspace = true
 crossbeam-channel.workspace = true
 tracing.workspace = true
-av-decoders = { version = "0.9", features = ["ffms2"] }
-v_frame = "0.5"
+av-decoders = { version = "0.11", features = ["ffms2"] }
+v_frame = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

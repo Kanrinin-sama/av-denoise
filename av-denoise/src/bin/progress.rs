@@ -37,8 +37,7 @@ pub fn tracing_writer() -> IndicatifWriter<Stderr> {
 ///
 /// It runs for the whole encode, alongside whatever the consumer of our
 /// output is printing, so leaving it off by default keeps a piped run
-/// readable. The scene-detection bar has no such conflict and only
-/// checks the terminal.
+/// readable.
 ///
 /// The terminal check is a parameter rather than read directly here so
 /// this stays unit-testable without a real tty.
@@ -69,18 +68,14 @@ fn bar(total_frames: Option<usize>, message: &str, visible: bool) -> ProgressBar
     multi().add(pb)
 }
 
-/// Builds the scene-detection progress bar.
-///
-/// The frame count is optional because the decoder does not always know
-/// the length of the input up front.
-pub fn scene_progress_bar(total_frames: Option<usize>, visible: bool) -> ProgressBar {
-    bar(total_frames, "scene detection", visible)
-}
-
 /// Builds the denoising progress bar, tracking frames written to the
 /// output.
-pub fn denoise_progress_bar(total_frames: usize, visible: bool) -> ProgressBar {
-    bar(Some(total_frames), "denoising", visible)
+pub fn denoise_progress_bar(total_frames: Option<usize>, visible: bool) -> ProgressBar {
+    bar(total_frames, "denoising", visible)
+}
+
+pub fn scene_progress_bar(total_frames: Option<usize>, visible: bool) -> ProgressBar {
+    bar(total_frames, "scene detection", visible)
 }
 
 /// Clears a finished bar and drops it from the shared [`multi`], so it

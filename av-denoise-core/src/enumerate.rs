@@ -1,5 +1,5 @@
+use crate::runtime::Runtime;
 use cubecl::device::DeviceId;
-use cubecl::prelude::*;
 
 use crate::accelerate::Accelerator;
 use crate::device::Device;
@@ -78,7 +78,7 @@ fn unavailable(accelerator: Accelerator) -> BackendDevices {
 /// libraries are missing, is reported as unavailable rather than
 /// allowed to take the process down. See [`probe`](crate::probe).
 fn query_runtime<R: Runtime>(accelerator: Accelerator, device: &R::Device) -> BackendDevices {
-    let Some(client) = open_client::<R>(accelerator, device) else {
+    let Some(_client) = open_client::<R>(accelerator, device) else {
         return unavailable(accelerator);
     };
 
@@ -90,7 +90,7 @@ fn query_runtime<R: Runtime>(accelerator: Accelerator, device: &R::Device) -> Ba
     // device comes back on every pass and is kept only once.
     let mut devices: Vec<Device> = Vec::new();
     for type_id in 0..=3 {
-        for id in client.enumerate_devices(type_id) {
+        for id in R::enumerate_devices(type_id) {
             if let Some(device) = to_device(id)
                 && !devices.contains(&device)
             {

@@ -13,12 +13,12 @@ use super::helpers::{accumulate_pair, clamp_coord};
 /// still read a valid weight.
 #[cube(launch_unchecked)]
 pub fn nlm_accumulate<N: Size>(
-    input: &Array<Vector<f32, N>>,
-    accum: &mut Array<Vector<f32, N>>,
-    weight_sum: &mut Array<f32>,
-    weights_fwd: &Array<f32>,
-    weights_bwd: &Array<f32>,
-    max_weight: &mut Array<f32>,
+    input: &[Vector<f32, N>],
+    accum: &mut [Vector<f32, N>],
+    weight_sum: &mut [f32],
+    weights_fwd: &[f32],
+    weights_bwd: &[f32],
+    max_weight: &mut [f32],
     frame_fwd: u32,
     frame_bwd: u32,
     q_x: i32,
@@ -61,11 +61,11 @@ pub fn nlm_accumulate<N: Size>(
 /// its own alignment boundaries.
 #[cube(launch_unchecked)]
 pub fn nlm_finish<N: Size>(
-    input: &Array<Vector<f32, N>>,
-    output: &mut Array<Vector<f32, N>>,
-    accum: &Array<Vector<f32, N>>,
-    weight_sum: &Array<f32>,
-    max_weight: &Array<f32>,
+    input: &[Vector<f32, N>],
+    output: &mut [Vector<f32, N>],
+    accum: &[Vector<f32, N>],
+    weight_sum: &[f32],
+    max_weight: &[f32],
     center_frame: u32,
     output_frame: u32,
     wref: f32,
@@ -97,12 +97,15 @@ pub fn nlm_finish<N: Size>(
         let inv_denominator = 1.0f32 / denominator;
         #[unroll]
         for c in 0..channels {
-            out[c as usize] = (original[c as usize] * m + accumulated[c as usize]) * inv_denominator;
+            out.insert(
+                c as usize,
+                (original.extract(c as usize) * m + accumulated.extract(c as usize)) * inv_denominator,
+            );
         }
     } else {
         #[unroll]
         for c in 0..channels {
-            out[c as usize] = original[c as usize];
+            out.insert(c as usize, original.extract(c as usize));
         }
     }
 

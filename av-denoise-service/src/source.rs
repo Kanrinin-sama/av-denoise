@@ -12,7 +12,7 @@ impl SourceIndex {
     pub(crate) fn open(input: &Path) -> Result<Self, anyhow::Error> {
         let index_path = PathBuf::from(format!("{}.ffindex", input.to_string_lossy()));
         let index_existed = index_path.try_exists()?;
-        let index = Ffms2Decoder::index(input);
+        let index = Ffms2Decoder::index(input, None);
         let created = (!index_existed).then_some(index_path);
         let index = match index {
             Ok(index) => index,
@@ -21,7 +21,7 @@ impl SourceIndex {
                     let _ = std::fs::remove_file(created);
                 }
                 return Err(error.into());
-            },
+            }
         };
         Ok(Self {
             index: Arc::new(index),

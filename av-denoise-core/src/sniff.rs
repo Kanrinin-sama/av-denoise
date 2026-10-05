@@ -29,7 +29,7 @@
 //! }
 //! ```
 
-use cubecl::prelude::*;
+use crate::runtime::Runtime;
 
 use crate::accelerate::Accelerator;
 use crate::device::Device;

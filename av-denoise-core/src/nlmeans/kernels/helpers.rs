@@ -18,7 +18,7 @@ pub(super) fn clamp_coord(value: i32, #[comptime] limit: u32) -> u32 {
 /// physical slot that holds loaded data.
 #[cube]
 pub(crate) fn read_clamped_line<N: Size>(
-    buf: &Array<Vector<f32, N>>,
+    buf: &[Vector<f32, N>],
     x: i32,
     y: i32,
     frame: u32,
@@ -37,7 +37,7 @@ pub(crate) fn read_clamped_line<N: Size>(
 /// `[0, height)`.
 #[cube]
 pub(crate) fn read_line<N: Size>(
-    buf: &Array<Vector<f32, N>>,
+    buf: &[Vector<f32, N>],
     x: u32,
     y: u32,
     frame: u32,
@@ -57,7 +57,7 @@ pub(crate) fn line_sum_sq<N: Size>(diff: Vector<f32, N>, #[comptime] channels: u
     let mut sum = 0.0f32;
     #[unroll]
     for c in 0..channels {
-        sum += diff[c as usize] * diff[c as usize];
+        sum += diff.extract(c as usize) * diff.extract(c as usize);
     }
     sum
 }
@@ -76,15 +76,6 @@ pub(crate) fn channel_scale(#[comptime] channels: u32) -> f32 {
         scale = 1.5f32;
     }
     scale
-}
-
-/// The host mirror of [`channel_scale`].
-pub fn channel_scale_host(channels: u32) -> f32 {
-    match channels {
-        1 => 3.0,
-        2 => 1.5,
-        _ => 1.0,
-    }
 }
 
 /// The Welsch weight for a box-summed patch distance.
@@ -111,10 +102,10 @@ pub(super) fn welsch_weight(sum: f32, h2_inv_norm: f32, noise_offset: f32) -> f3
 /// clamped reads at the border.
 #[cube]
 pub(super) fn accumulate_pair<N: Size>(
-    input: &Array<Vector<f32, N>>,
-    accum: &mut Array<Vector<f32, N>>,
-    weight_sum: &mut Array<f32>,
-    max_weight: &mut Array<f32>,
+    input: &[Vector<f32, N>],
+    accum: &mut [Vector<f32, N>],
+    weight_sum: &mut [f32],
+    max_weight: &mut [f32],
     global_x: u32,
     global_y: u32,
     q_x: i32,

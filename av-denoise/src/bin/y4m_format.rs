@@ -1,4 +1,24 @@
-use av_denoise::{Depth, Subsampling};
+use std::io::Write;
+
+use av_denoise::{Depth, FrameLayout, Subsampling};
+
+pub fn create_encoder<W: Write>(
+    layout: FrameLayout,
+    framerate: y4m::Ratio,
+    pixel_aspect: Option<y4m::Ratio>,
+    extensions: Vec<y4m::VendorExtensionString>,
+    output: W,
+) -> Result<y4m::Encoder<W>, anyhow::Error> {
+    let mut builder = y4m::encode(layout.width as usize, layout.height as usize, framerate)
+        .with_colorspace(subsampling_to_y4m(layout.subsampling, layout.depth));
+    if let Some(pixel_aspect) = pixel_aspect {
+        builder = builder.with_pixel_aspect(pixel_aspect);
+    }
+    for extension in extensions {
+        builder = builder.append_vendor_extension(extension);
+    }
+    Ok(builder.write_header(output)?)
+}
 
 /// Maps our [`Subsampling`] and [`Depth`] onto the [`y4m::Colorspace`]
 /// used to read the input and write the output header.

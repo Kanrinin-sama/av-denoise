@@ -5,11 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use av_decoders::Decoder;
 use av_denoise::{Depth, FrameLayout};
 use av_denoise_service::{
-    FrameRange,
-    SceneLayout,
-    emitted_boundary_to_raw,
-    subsampling_from_av_decoders,
-    validate_keep_frames,
+    FrameRange, SceneLayout, emitted_boundary_to_raw, subsampling_from_av_decoders, validate_keep_frames,
 };
 use av_scenechange::DetectionOptions;
 

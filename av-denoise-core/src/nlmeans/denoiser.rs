@@ -1,3 +1,4 @@
+use crate::runtime::{ComputeClient, Runtime};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
@@ -5,24 +6,11 @@ use super::align::StorageAlign;
 use super::kernels::{gpu_copy, gpu_unpack_wire};
 use super::motion::{self, MotionCtx, MotionEstimation, build_pyramid_for_slot, run_pyramid_build};
 use super::noise::{
-    EMA_ALPHA,
-    NoiseCtx,
-    NoiseEstimator,
-    TemporalNoiseSample,
-    TemporalStatsCtx,
-    aggregate_temporal_noise_stats,
-    build_spatial_offset_lut,
-    correlation_factor,
-    noise_partials_slot_stride_bytes,
-    partials_len,
-    run_noise_estimate,
-    run_temporal_noise_stats,
-    sigma_block_p25_from_partials,
-    sigma_from_abs_sum,
-    spatial_offset_lut_len,
-    temporal_stats_buf_bytes,
-    temporal_stats_slot_len,
-    temporal_stats_slot_stride_bytes,
+    EMA_ALPHA, NoiseCtx, NoiseCurve, NoiseEstimator, QuarterClasses, TemporalNoiseReading,
+    TemporalNoiseSample, TemporalStatsCtx, build_spatial_offset_lut, correlation_factor,
+    noise_partials_slot_stride_bytes, partials_len, run_noise_estimate, run_temporal_noise_stats,
+    sigma_block_p25_from_partials, sigma_from_abs_sum, spatial_offset_lut_len, temporal_noise_reading,
+    temporal_stats_buf_bytes, temporal_stats_slot_len, temporal_stats_slot_stride_bytes,
     zero_temporal_stats_slot,
 };
 use super::params::{NlmParams, SEPARABLE_THRESHOLD, sigma_eff, validate_dimensions};
@@ -54,8 +42,7 @@ pub struct GpuOutput {
 
 /// Handles and geometry a collaborative stage needs to read the ring.
 ///
-/// [`NlmDenoiser::submit_machinery`] and
-/// [`NlmDenoiser::flush_step_machinery`] build this instead of running
+/// [`NlmDenoiser::submit_machinery`] builds this instead of running
 /// any NLM denoising kernel, so a caller that wants the frame ring, the
 /// motion fields, and the confidence scores without the NLM weighting
 /// itself can read them straight from here.
@@ -72,8 +59,8 @@ pub(crate) struct RingView {
     pub confidence: Handle,
     /// Physical ring slot of the centre frame.
     pub centre_slot: u32,
-    /// Physical ring slot per logical offset k, indexed by
-    /// `neighbour_idx_for_k(radius, k)`.
+    /// Physical ring slot per neighbour, in logical ring order around
+    /// the centre frame, skipping the centre itself.
     ///
     /// This stays a host `Vec` rather than a GPU buffer, because the
     /// grouping kernel that consumes it indexes it per candidate on the
@@ -278,7 +265,7 @@ pub struct NlmDenoiser<R: Runtime> {
     ///
     /// It is inert under the same condition as `noise_estimator`.
     pub(super) noise_estimator_low_unboosted: NoiseEstimator,
-    /// Smooths the temporal reading on its own, with no maximum taken
+    /// Smooths the temporal median on its own, with no maximum taken
     /// against an Immerkær spatial reading and no correlation boost.
     ///
     /// It only updates on a fold that has a temporal sample trustworthy
@@ -298,6 +285,14 @@ pub struct NlmDenoiser<R: Runtime> {
     ///
     /// It is inert under the same condition as `noise_estimator`.
     pub(super) noise_estimator_temporal_only: NoiseEstimator,
+    /// The latest centre frame's luma noise curve, or `None` when no
+    /// curve could be built.
+    ///
+    /// [Self::update_noise_estimate] updates it alongside the estimator
+    /// chains, and [Self::reset_stream_state] clears it.
+    pub(super) noise_curve: Option<NoiseCurve>,
+    /// The latest centre frame's quarter classes, present exactly when `noise_curve` is.
+    pub(super) quarter_classes: Option<QuarterClasses>,
 
     /// The motion-compensation geometry, present while motion
     /// compensation is active.
@@ -373,6 +368,23 @@ pub struct NlmDenoiser<R: Runtime> {
     /// at construction, while automatic estimation refreshes it every
     /// submit.
     pub(super) sigma_y: f32,
+
+    /// Whether `run_temporal_stats_for_slot` asks the stats kernel for
+    /// its four luma-only lanes.
+    ///
+    /// It defaults to off, and [Self::set_luma_noise_fields] is the
+    /// only way to change it. Leaving it off roughly halves the stats
+    /// kernel's cost at 1080p.
+    pub(super) luma_noise_fields: bool,
+
+    /// The cut the luma flat map vetoes textured quarters at, or `None` for no veto.
+    pub(super) flat_texture_cut: Option<f32>,
+
+    /// Whether the stream's edges run off-centre passes instead of copied padding.
+    ///
+    /// Set by nl4d. With it on, a stream gets no leading copies and a
+    /// centre with no temporal reading borrows the nearest one ahead.
+    pub(super) shifted_edges: bool,
 }
 
 impl<R: Runtime> NlmDenoiser<R> {
@@ -449,7 +461,7 @@ impl<R: Runtime> NlmDenoiser<R> {
                     client.empty(words * size_of::<u32>()),
                     client.empty(words * size_of::<u32>()),
                 ])
-            },
+            }
         };
 
         let h2_inv_norm = params.h2_inv_norm();
@@ -665,6 +677,8 @@ impl<R: Runtime> NlmDenoiser<R> {
             noise_estimator_low: NoiseEstimator::default(),
             noise_estimator_low_unboosted: NoiseEstimator::default(),
             noise_estimator_temporal_only: NoiseEstimator::default(),
+            noise_curve: None,
+            quarter_classes: None,
             mc_ctx,
             compensated_input_buf,
             compensated_reference_buf,
@@ -678,6 +692,9 @@ impl<R: Runtime> NlmDenoiser<R> {
             confidence_mv_scratch,
             confidence_dummy,
             sigma_y,
+            luma_noise_fields: false,
+            flat_texture_cut: None,
+            shifted_edges: false,
         }
     }
 
@@ -887,12 +904,12 @@ impl<R: Runtime> NlmDenoiser<R> {
         let pack = depth.wire_pack();
 
         unsafe {
-            gpu_unpack_wire::launch_unchecked::<R>(
+            gpu_unpack_wire::launch_unchecked(
                 &self.client,
                 CubeCount::new_1d(grid),
                 CubeDim::new_1d(BLOCK_1D),
-                ArrayArg::from_raw_parts(src, words),
-                ArrayArg::from_raw_parts(dst.clone(), total_frames * elements as usize),
+                BufferArg::from_raw_parts(src, words),
+                BufferArg::from_raw_parts(dst.clone(), total_frames * elements as usize),
                 pack.max(),
                 slot as u32 * elements,
                 pixels,
@@ -1130,10 +1147,9 @@ impl<R: Runtime> NlmDenoiser<R> {
     /// Queues the temporal residual statistics for `slot`, comparing it
     /// against the slot immediately before it in the ring.
     ///
-    /// This does nothing unless the temporal estimator is active, and it
-    /// also does nothing for a stream's very first frame, which has no
-    /// predecessor to compare against. That matches the check in
-    /// [`Self::run_pair_analyse_for_slot`].
+    /// This does nothing unless the temporal estimator is active. A
+    /// stream's very first frame has no predecessor, so its record is
+    /// zeroed instead.
     ///
     /// The centre slot's statistics are read back and combined later, in
     /// [`Self::update_noise_estimate`].
@@ -1142,6 +1158,7 @@ impl<R: Runtime> NlmDenoiser<R> {
             return;
         };
         if self.ring_head == 0 {
+            self.zero_temporal_stats_for_slot(slot);
             return;
         }
 
@@ -1160,7 +1177,39 @@ impl<R: Runtime> NlmDenoiser<R> {
             align: self.align,
         };
 
-        run_temporal_noise_stats::<R>(&self.client, &ctx).expect("temporal noise stats dispatch failed");
+        run_temporal_noise_stats::<R>(&self.client, &ctx, self.luma_noise_fields)
+            .expect("temporal noise stats dispatch failed");
+    }
+
+    /// Turns the temporal-stats kernel's four luma-only lanes on or off.
+    ///
+    /// It defaults to off.
+    pub(crate) fn set_luma_noise_fields(&mut self, on: bool) {
+        self.luma_noise_fields = on;
+    }
+
+    /// Sets the cut the luma flat map vetoes textured quarters at.
+    ///
+    /// It defaults to `None`, which leaves every flat quarter flat.
+    pub(crate) fn set_flat_texture_cut(&mut self, cut: Option<f32>) {
+        self.flat_texture_cut = cut;
+    }
+
+    /// The latest frame's luma noise curve, or `None` when no curve is
+    /// available.
+    pub(crate) fn current_noise_curve(&self) -> Option<NoiseCurve> {
+        self.noise_curve
+    }
+
+    /// The latest frame's quarter classes, present exactly when
+    /// [Self::current_noise_curve] is.
+    pub(crate) fn current_quarter_classes(&self) -> Option<&QuarterClasses> {
+        self.quarter_classes.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flat_texture_cut(&self) -> Option<f32> {
+        self.flat_texture_cut
     }
 
     /// Fills a duplicated slot's temporal-stats region with zeroes.
@@ -1214,11 +1263,10 @@ impl<R: Runtime> NlmDenoiser<R> {
             return;
         }
 
-        // The stream's first frame has no predecessor, so
-        // `run_temporal_stats_for_slot` never ran for it and this
-        // slot's stats region is unwritten. Seed from Immerkær alone.
-        self.read_and_fold_noise_estimate(slot, false)
+        let (data, imm_low) = self
+            .read_spatial_noise(slot)
             .expect("noise-estimate seed readback failed");
+        self.fold_noise_estimate(f32::from_bytes(&data), slot as usize, None, imm_low);
     }
 
     /// Folds one ring slot's noise totals into both estimator chains and
@@ -1264,7 +1312,7 @@ impl<R: Runtime> NlmDenoiser<R> {
     /// already tracks that grain directly.
     ///
     /// A fourth estimator, `noise_estimator_temporal_only`, folds the
-    /// temporal reading by itself, with neither the maximum against the
+    /// temporal median by itself, with neither the maximum against the
     /// Immerkær spatial reading nor the correlation boost. It exists for
     /// the same squaring consumer, for a stronger reason than the boost
     /// alone: a spatial mask reads regularly repeating texture the same
@@ -1329,17 +1377,15 @@ impl<R: Runtime> NlmDenoiser<R> {
                 raw_low[c] = raw_low[c].max(sample.sigma_low[c] * factor);
                 raw_low_unboosted[c] = raw_low_unboosted[c].max(sample.sigma_low[c]);
             }
-            raw_temporal_only = Some(sample.sigma_low);
-            self.rho_smoothed = Some(
-                if windowed {
-                    sample.rho
-                } else {
-                    match self.rho_smoothed {
-                        None => sample.rho,
-                        Some(prev) => EMA_ALPHA * sample.rho + (1.0 - EMA_ALPHA) * prev,
-                    }
-                },
-            );
+            raw_temporal_only = Some(sample.sigma);
+            self.rho_smoothed = Some(if windowed {
+                sample.rho
+            } else {
+                match self.rho_smoothed {
+                    None => sample.rho,
+                    Some(prev) => EMA_ALPHA * sample.rho + (1.0 - EMA_ALPHA) * prev,
+                }
+            });
         } else if windowed {
             // Window-local estimation must not let an earlier push's
             // correlation reading leak into a fold that has no temporal
@@ -1386,7 +1432,7 @@ impl<R: Runtime> NlmDenoiser<R> {
             Some(raw_t) => {
                 self.noise_estimator_temporal_only
                     .update(&raw_t[..channels], windowed);
-            },
+            }
             // Window-local estimation must not let an earlier push's
             // trustworthy reading leak into a fold that has none of its
             // own, or the target frame's result would depend on how
@@ -1394,7 +1440,7 @@ impl<R: Runtime> NlmDenoiser<R> {
             // dependence window-local estimation exists to remove from
             // the other chains. See `noise_estimator_temporal_only`.
             None if windowed => self.noise_estimator_temporal_only.reset(),
-            None => {},
+            None => {}
         }
 
         let eff = sigma_eff(&smoothed[..channels], self.params.channels);
@@ -1447,12 +1493,12 @@ impl<R: Runtime> NlmDenoiser<R> {
         let total_threads = grid * BLOCK_1D;
 
         unsafe {
-            gpu_copy::launch_unchecked::<R>(
+            gpu_copy::launch_unchecked(
                 &self.client,
                 CubeCount::new_1d(grid),
                 CubeDim::new_1d(BLOCK_1D),
-                ArrayArg::from_raw_parts(src.clone(), src_slots * frame_size as usize),
-                ArrayArg::from_raw_parts(dst.clone(), dst_slots * frame_size as usize),
+                BufferArg::from_raw_parts(src.clone(), src_slots * frame_size as usize),
+                BufferArg::from_raw_parts(dst.clone(), dst_slots * frame_size as usize),
                 src_slot as u32 * frame_size,
                 slot as u32 * frame_size,
                 frame_size,
@@ -1466,8 +1512,13 @@ impl<R: Runtime> NlmDenoiser<R> {
     /// the opening frames.
     ///
     /// [`Self::flush`] does the same thing at the other end of the
-    /// stream.
+    /// stream. Does nothing with shifted edges on, since that mode
+    /// stops windows at the clip start instead of padding them.
     fn prime_leading_edge_if_first(&mut self) {
+        if self.shifted_edges {
+            return;
+        }
+
         let r = self.params.temporal_radius as usize;
 
         if r == 0 || self.frames_loaded != 1 {
@@ -1489,7 +1540,7 @@ impl<R: Runtime> NlmDenoiser<R> {
     ///
     /// The reference ring is copied in step when it exists, so the
     /// weights are never computed from a stale slot.
-    fn duplicate_last_frame(&mut self) {
+    pub(super) fn duplicate_last_frame(&mut self) {
         let total_frames = self.params.total_frames() as usize;
         let last_slot = (self.ring_head - 1) % total_frames;
         let next_slot = self.ring_head % total_frames;
@@ -1547,7 +1598,7 @@ impl<R: Runtime> NlmDenoiser<R> {
         }
 
         if self.noise_results.is_some() {
-            self.update_noise_estimate()?;
+            self.update_noise_estimate(self.params.temporal_radius)?;
         }
         self.rebuild_spatial_offset_lut();
 
@@ -1577,22 +1628,29 @@ impl<R: Runtime> NlmDenoiser<R> {
     /// Returns `Ok(None)` while the temporal window is still filling, the
     /// same condition [`Self::denoise_submit_gpu`] checks.
     ///
+    /// The returned [`RingView`] is centred on logical ring position
+    /// `center_t`.
+    ///
     /// # Errors
     ///
     /// Returns an error if the denoiser was not built with motion
     /// compensation and temporal confidence both active, since a
     /// [`RingView`] has nothing meaningful to hand back otherwise.
-    pub(crate) fn submit_machinery(&mut self) -> Result<Option<RingView>, DenoiserError> {
+    pub(crate) fn submit_machinery(&mut self, center_t: u32) -> Result<Option<RingView>, DenoiserError> {
+        debug_assert!(
+            center_t < self.params.total_frames(),
+            "center_t must be a logical ring position"
+        );
+
         let total_frames = self.params.total_frames() as usize;
         if self.frames_loaded < total_frames {
             return Ok(None);
         }
 
         if self.noise_results.is_some() {
-            self.update_noise_estimate()?;
+            self.update_noise_estimate(center_t)?;
         }
 
-        let center_t = self.params.temporal_radius;
         let neighbour_slots = self.run_motion_machinery(center_t)?;
 
         let mc = self.mc_ctx.as_ref().ok_or_else(|| {
@@ -1634,26 +1692,8 @@ impl<R: Runtime> NlmDenoiser<R> {
         }))
     }
 
-    /// Flush-mode counterpart of [`Self::submit_machinery`], duplicating
-    /// the trailing frame the same way [`Self::flush_step_gpu`] does,
-    /// minus the NLM launches.
-    ///
-    /// Returns `Ok(None)` while the very first duplicates are still
-    /// filling out a window that never reached its full size during
-    /// pushing, the same condition [`Self::flush_step_gpu`] documents.
-    pub(crate) fn flush_step_machinery(&mut self) -> Result<Option<RingView>, DenoiserError> {
-        let total_frames = self.params.total_frames() as usize;
-
-        self.duplicate_last_frame();
-        if self.frames_loaded < total_frames {
-            self.frames_loaded += 1;
-        }
-
-        self.submit_machinery()
-    }
-
     /// The motion-compensation geometry the last [`Self::submit_machinery`]
-    /// or [`Self::flush_step_machinery`] call used.
+    /// call used.
     ///
     /// # Panics
     ///
@@ -1694,8 +1734,13 @@ impl<R: Runtime> NlmDenoiser<R> {
     /// The compute client this denoiser dispatches kernels through, for
     /// a collaborative stage that reads a [`RingView`]'s handles back or
     /// launches its own kernels against them.
-    pub(crate) fn compute_client(&self) -> &cubecl::client::ComputeClient<R> {
+    pub(crate) fn compute_client(&self) -> &ComputeClient<R> {
         &self.client
+    }
+
+    /// The whole input ring, indexable by physical frame slot.
+    pub(crate) fn input_ring(&self) -> &Handle {
+        &self.input_buf
     }
 
     /// Queues the denoise kernels for the current window and starts the
@@ -1786,7 +1831,7 @@ impl<R: Runtime> NlmDenoiser<R> {
         sigmas
     }
 
-    /// The smoothed per-channel sigma estimate from the temporal reading
+    /// The smoothed per-channel sigma estimate from the temporal median
     /// alone, with no maximum taken against an Immerkær spatial reading
     /// and no correlation boost.
     ///
@@ -1834,18 +1879,33 @@ impl<R: Runtime> NlmDenoiser<R> {
     /// The blocking read therefore lands on work the GPU has already
     /// finished, rather than stalling the pipeline behind a fresh
     /// dispatch.
-    fn update_noise_estimate(&mut self) -> Result<(), anyhow::Error> {
-        let center_t = self.params.temporal_radius;
+    fn update_noise_estimate(&mut self, center_t: u32) -> Result<(), anyhow::Error> {
         let center_slot = self.phys_frame(center_t as i32);
-        self.read_and_fold_noise_estimate(center_slot, true)
+        let (data, imm_low) = self.read_spatial_noise(center_slot)?;
+        let reading = self.borrow_reading_ahead(center_t)?;
+        let windowed = self.params.hq.is_some_and(|hq| hq.windowed_noise_estimation);
+        match (&reading.sample, reading.curve, reading.classes) {
+            (Some(_), curve, classes) => {
+                self.noise_curve = curve;
+                self.quarter_classes = classes;
+            }
+            (None, _, _) if windowed => {
+                self.noise_curve = None;
+                self.quarter_classes = None;
+            }
+            (None, _, _) => {}
+        }
+        self.fold_noise_estimate(
+            f32::from_bytes(&data),
+            center_slot as usize,
+            reading.sample,
+            imm_low,
+        );
+        Ok(())
     }
 
-    fn read_and_fold_noise_estimate(
-        &mut self,
-        slot: u32,
-        include_temporal: bool,
-    ) -> Result<(), anyhow::Error> {
-        let results_buf = self
+    fn read_spatial_noise(&self, slot: u32) -> Result<(cubecl::bytes::Bytes, [f32; 3]), anyhow::Error> {
+        let results = self
             .noise_results
             .as_ref()
             .expect("noise_results allocated when auto noise is active")
@@ -1854,60 +1914,51 @@ impl<R: Runtime> NlmDenoiser<R> {
             .noise_partials
             .as_ref()
             .expect("noise_partials allocated when auto noise is active");
-        let stored_ch = self.params.channels.storage_count();
         let frame_count = self.params.total_frames();
-        let partials_stride = noise_partials_slot_stride_bytes(self.width, self.height, self.align);
-        let partials_start = slot as u64 * partials_stride;
-        let partials_size = partials_len(self.width, self.height) as u64 * size_of::<f32>() as u64;
-        let partials_end = frame_count as u64 * partials_stride - partials_start - partials_size;
-        let partials = partials_buf
-            .clone()
-            .offset_start(partials_start)
-            .offset_end(partials_end);
-
-        let temporal_stats = if include_temporal {
-            self.temporal_stats_buf.as_ref()
-        } else {
-            None
-        };
-        let mut handles = vec![results_buf];
-        let temporal_index = if let Some(stats_buf) = temporal_stats {
-            let stats_stride =
-                temporal_stats_slot_stride_bytes(self.width, self.height, stored_ch, self.align);
-            let stats_start = slot as u64 * stats_stride;
-            let stats_size =
-                temporal_stats_slot_len(self.width, self.height, stored_ch) as u64 * size_of::<f32>() as u64;
-            let stats_end = frame_count as u64 * stats_stride - stats_start - stats_size;
-            let index = handles.len();
-            handles.push(stats_buf.clone().offset_start(stats_start).offset_end(stats_end));
-            Some(index)
-        } else {
-            None
-        };
-        let partials_index = handles.len();
-        handles.push(partials);
-
-        let readbacks = cubecl::future::block_on(self.client.read_async(handles))
+        let stride = noise_partials_slot_stride_bytes(self.width, self.height, self.align);
+        let start = slot as u64 * stride;
+        let size = partials_len(self.width, self.height) as u64 * size_of::<f32>() as u64;
+        let end = frame_count as u64 * stride - start - size;
+        let partials = partials_buf.clone().offset_start(start).offset_end(end);
+        let mut readbacks = cubecl::future::block_on(self.client.read_async(vec![results, partials]))
             .map_err(|e| anyhow::anyhow!("noise-estimate readback failed: {e}"))?;
-        let results = f32::from_bytes(&readbacks[0]);
-        let temporal = temporal_index.and_then(|index| {
-            aggregate_temporal_noise_stats(
-                f32::from_bytes(&readbacks[index]),
-                self.params.channels.count(),
-                stored_ch,
-                self.width,
-                self.height,
-            )
-        });
         let imm_low = sigma_block_p25_from_partials(
-            f32::from_bytes(&readbacks[partials_index]),
+            f32::from_bytes(&readbacks[1]),
             self.params.channels.count(),
             self.width,
             self.height,
         );
+        Ok((readbacks.remove(0), imm_low))
+    }
 
-        self.fold_noise_estimate(results, slot as usize, temporal, imm_low);
-        Ok(())
+    pub(super) fn read_temporal_noise(&self, slot: u32) -> Result<TemporalNoiseReading, anyhow::Error> {
+        let Some(stats_buf) = self.temporal_stats_buf.as_ref() else {
+            return Ok(TemporalNoiseReading {
+                sample: None,
+                curve: None,
+                classes: None,
+            });
+        };
+        let stored_ch = self.params.channels.storage_count();
+        let stride = temporal_stats_slot_stride_bytes(self.width, self.height, stored_ch, self.align);
+        let start = slot as u64 * stride;
+        let size =
+            temporal_stats_slot_len(self.width, self.height, stored_ch) as u64 * size_of::<f32>() as u64;
+        let end = self.params.total_frames() as u64 * stride - start - size;
+        let handle = stats_buf.clone().offset_start(start).offset_end(end);
+        let bytes = self
+            .client
+            .read_one(handle)
+            .map_err(|e| anyhow::anyhow!("temporal noise readback failed: {e}"))?;
+        Ok(temporal_noise_reading(
+            f32::from_bytes(&bytes),
+            self.params.channels.count(),
+            stored_ch,
+            self.width,
+            self.height,
+            self.luma_noise_fields,
+            self.flat_texture_cut,
+        ))
     }
 
     /// Rebuilds `spatial_offset_lut` from the current `noise_offset` and
@@ -2081,6 +2132,8 @@ impl<R: Runtime> NlmDenoiser<R> {
         self.noise_estimator_low.reset();
         self.noise_estimator_low_unboosted.reset();
         self.noise_estimator_temporal_only.reset();
+        self.noise_curve = None;
+        self.quarter_classes = None;
         self.rho_smoothed = None;
     }
 
@@ -2158,7 +2211,10 @@ fn frame_uploader<'a, R: Runtime>(
     client: &ComputeClient<R>,
     len: usize,
 ) -> &'a mut Uploader<R> {
-    if frame_upload.as_ref().is_none_or(|upload| upload.capacity(0) < len) {
+    if frame_upload
+        .as_ref()
+        .is_none_or(|upload| upload.capacity(0) < len)
+    {
         *frame_upload = Some(Uploader::new(client, &[len]));
     }
     frame_upload.as_mut().expect("the frame uploader was just built")

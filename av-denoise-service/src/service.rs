@@ -7,8 +7,8 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::pipeline::{Pipeline, panic_message};
 use crate::source::SourceIndex;
-use crate::threads::release_affinity;
 use crate::stored_layout::UncheckedLayout;
+use crate::threads::release_affinity;
 use crate::window::{Window, WindowJob};
 use crate::worker::Resident;
 use crate::{FrameRange, SceneLayout, ServiceConfig};
@@ -169,7 +169,10 @@ fn run_slot(
     mut residents: Vec<Option<Resident>>,
 ) {
     if let Err(error) = pipeline.build_residents(&mut residents, layout) {
-        tracing::warn!(error = format!("{error:#}"), "window slot denoisers failed to build");
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "window slot denoisers failed to build"
+        );
     }
     let mut decoder = None;
     while let Ok(request) = requests.recv() {

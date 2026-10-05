@@ -17,6 +17,7 @@ pub mod nl4d;
 #[doc(hidden)]
 pub mod nlmeans;
 mod probe;
+pub mod runtime;
 pub mod sniff;
 pub mod stack;
 #[cfg(any(feature = "vulkan", feature = "metal"))]
@@ -25,61 +26,24 @@ mod upload;
 pub mod warmup;
 
 pub use cache::{
-    COMPILATION_CACHE_ENV,
-    CacheError,
-    compilation_cache_dir,
-    default_cache_dir,
-    install_compilation_cache,
-    install_compilation_cache_at,
-    install_compilation_cache_once,
+    COMPILATION_CACHE_ENV, CacheError, compilation_cache_dir, default_cache_dir, install_compilation_cache,
+    install_compilation_cache_at, install_compilation_cache_once,
 };
 pub use denoiser::{
-    Algorithm,
-    Denoiser,
-    DenoiserError,
-    DenoiserOptions,
-    DenoisingMode,
-    FrameOutput,
-    MAX_PENDING,
-    Nl4dOptions,
-    NlmTuning,
-    NlmeansHqOptions,
-    NlmeansOptions,
-    NlmeansVariant,
-    OutputFormat,
-    Preset,
-    WindowSpan,
-    nl4d_default_lambda_ht,
-    nl4d_spatial_radius_for,
-    nl4d_temporal_radius_for,
-    nlmeans_search_radius_for,
-    nlmeans_temporal_radius_for,
-    nlmeans_variant_for,
+    Algorithm, Denoiser, DenoiserError, DenoiserOptions, DenoisingMode, EdgePadding, FrameOutput,
+    MAX_PENDING, Nl4dOptions, NlmTuning, NlmeansHqOptions, NlmeansOptions, NlmeansVariant, OutputFormat,
+    Preset, WindowSpan, nl4d_default_lambda_ht, nl4d_spatial_radius_for, nl4d_temporal_radius_for,
+    nlmeans_search_radius_for, nlmeans_temporal_radius_for, nlmeans_variant_for,
 };
 pub use device::Device;
 pub use frame::{
-    ChannelIntent,
-    FrameLayout,
-    PlanarDenoiser,
-    PlaneOptions,
-    Planes,
-    Subsampling,
+    ChannelIntent, FrameLayout, PlanarDenoiser, PlaneOptions, Planes, ReseedWindow, Subsampling,
     push_needs_retry,
 };
+pub use nl4d::grain::{GrainChunk, SceneGrain, build_table};
 pub use nlmeans::{
-    ChannelMode,
-    DEFAULT_PILOT_STRENGTH_SCALE,
-    Depth,
-    HqParams,
-    MotionCompensationMode,
-    MotionEstimation,
-    MotionSearch,
-    PrefilterMode,
-    UnsupportedDepthError,
-    WirePack,
-    denormalize,
-    normalize,
-    parse_prefilter,
+    ChannelMode, DEFAULT_PILOT_STRENGTH_SCALE, Depth, HqParams, MotionCompensationMode, MotionEstimation,
+    MotionSearch, PrefilterMode, UnsupportedDepthError, WirePack, denormalize, normalize, parse_prefilter,
 };
 pub use stack::{CODEGEN_STACK_BYTES, codegen_stack_is_sufficient, raise_codegen_stack_limit};
 pub use warmup::{WarmUp, kernel_key};

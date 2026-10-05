@@ -4,6 +4,8 @@ use tracing_subscriber::EnvFilter;
 mod cli;
 mod file_mode;
 mod frame_index;
+#[path = "pipeline/grain_table.rs"]
+mod grain_table;
 mod nvdec_source;
 mod progress;
 mod scan_chunks;
@@ -58,7 +60,7 @@ fn run_input(
 
             tracing::info!(input = %stream, "reading a y4m stream");
 
-            stream_mode::run_stream(&opts.planes, stream.open_reader()?)
+            stream_mode::run_stream(opts, stream.open_reader()?)
         },
     }
 }

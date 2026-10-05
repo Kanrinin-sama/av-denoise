@@ -1,23 +1,11 @@
 use std::ffi::{CString, c_char};
-use std::num::{NonZeroU8, NonZeroUsize};
 use std::path::Path;
 
 use av_decoders::VideoDetails;
 use ffms2_sys::{
-    FFMS_CreateVideoSource,
-    FFMS_DestroyIndex,
-    FFMS_DestroyVideoSource,
-    FFMS_ErrorInfo,
-    FFMS_Frame,
-    FFMS_GetFirstIndexedTrackOfType,
-    FFMS_GetFrame,
-    FFMS_GetPixFmt,
-    FFMS_Index,
-    FFMS_ReadIndex,
-    FFMS_Resizers,
-    FFMS_SetOutputFormatV2,
-    FFMS_TrackType,
-    FFMS_VideoSource,
+    FFMS_CreateVideoSource, FFMS_DestroyIndex, FFMS_DestroyVideoSource, FFMS_ErrorInfo, FFMS_Frame,
+    FFMS_GetFirstIndexedTrackOfType, FFMS_GetFrame, FFMS_GetPixFmt, FFMS_Index, FFMS_ReadIndex,
+    FFMS_Resizers, FFMS_SetOutputFormatV2, FFMS_TrackType, FFMS_VideoSource,
 };
 use v_frame::chroma::ChromaSubsampling;
 use v_frame::frame::{Frame, FrameBuilder};
@@ -95,17 +83,12 @@ impl ScanFormat {
     }
 
     pub(crate) fn blank_frame<T: Pixel>(&self) -> Result<Frame<T>, anyhow::Error> {
-        let frame = FrameBuilder::new(
-            NonZeroUsize::new(self.width).ok_or_else(|| anyhow::anyhow!("zero analysis width"))?,
-            NonZeroUsize::new(self.height).ok_or_else(|| anyhow::anyhow!("zero analysis height"))?,
-            self.chroma,
-            NonZeroU8::new(self.bit_depth as u8).ok_or_else(|| anyhow::anyhow!("zero bit depth"))?,
-        )
-        .luma_padding_left(LUMA_PADDING)
-        .luma_padding_right(LUMA_PADDING)
-        .luma_padding_top(LUMA_PADDING)
-        .luma_padding_bottom(LUMA_PADDING)
-        .build()?;
+        let frame = FrameBuilder::new(self.width, self.height, self.chroma, self.bit_depth as u8)
+            .luma_padding_left(LUMA_PADDING)
+            .luma_padding_right(LUMA_PADDING)
+            .luma_padding_top(LUMA_PADDING)
+            .luma_padding_bottom(LUMA_PADDING)
+            .build()?;
 
         Ok(frame)
     }
@@ -234,10 +217,7 @@ impl FfmsSource {
             let stride = decoded.Linesize[index] as usize;
             // SAFETY: ffms2 hands over `height` rows of `stride` bytes for this plane.
             let bytes = unsafe { std::slice::from_raw_parts(decoded.Data[index], stride * height) };
-            plane.copy_from_u8_slice_with_stride(
-                bytes,
-                NonZeroUsize::new(stride).expect("ffms2 plane stride is non-zero"),
-            )?;
+            plane.copy_from_u8_slice_with_stride(bytes, stride)?;
         }
 
         Ok(frame)

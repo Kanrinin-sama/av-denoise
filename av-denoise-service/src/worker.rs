@@ -1,9 +1,11 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-use av_denoise_core::{FrameLayout, PlanarDenoiser, PlaneOptions, Planes, WarmUp, push_needs_retry};
+use av_denoise_core::{
+    FrameLayout, PlanarDenoiser, PlaneOptions, Planes, SceneGrain, WarmUp, push_needs_retry,
+};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::CreationGuard;
@@ -47,6 +49,7 @@ pub(crate) struct WorkerConfig<'a> {
     pub(crate) abort: &'a Arc<AtomicBool>,
     pub(crate) guard: &'a CreationGuard,
     pub(crate) pools: &'a Arc<SharedPools>,
+    pub(crate) grain: &'a Arc<Mutex<Vec<SceneGrain>>>,
 }
 
 pub(crate) fn spawn_workers(
@@ -65,6 +68,7 @@ pub(crate) fn spawn_workers(
         let abort = Arc::clone(config.abort);
         let guard = config.guard.clone();
         let pools = Arc::clone(config.pools);
+        let grain = Arc::clone(config.grain);
 
         worker_handles.push(thread::spawn(move || {
             release_affinity();
@@ -76,6 +80,7 @@ pub(crate) fn spawn_workers(
                 out_tx,
                 &cancel,
                 &pools,
+                &grain,
             );
             if result.is_err() {
                 abort.store(true, Ordering::Release);
@@ -95,6 +100,7 @@ fn run_worker(
     tx: Sender<OutputMsg>,
     cancel: &Cancel,
     pools: &SharedPools,
+    grain: &Mutex<Vec<SceneGrain>>,
 ) -> Result<Option<Resident>, anyhow::Error> {
     let mut emitted = pools.emitted.take();
     while let Ok(job) = jobs.recv() {
@@ -113,6 +119,7 @@ fn run_worker(
 
         let mut pending = Pending::new();
         let mut pushed = false;
+        let mut first_frame = None;
 
         // Nothing is received straight after the push.
         // `push_with_drain` handles backpressure through QueueFull
@@ -129,16 +136,9 @@ fn run_worker(
                 planes: staged,
                 permit,
             } = frame;
+            first_frame.get_or_insert(global_idx);
             pending.push_back((global_idx, permit));
-            push_with_drain(
-                denoiser,
-                warm_up,
-                &mut pending,
-                &staged,
-                pools,
-                &tx,
-                &mut emitted,
-            )?;
+            push_with_drain(denoiser, warm_up, &mut pending, &staged, pools, &tx, &mut emitted)?;
             pools.staged.recycle(staged);
             pushed = true;
         }
@@ -150,6 +150,16 @@ fn run_worker(
         // Reuse the PlanarDenoiser across scenes. Flushing here ensures
         // no temporal window spans two of them.
         flush_worker(denoiser, warm_up, &mut pending, pools, &tx)?;
+        let chunks = denoiser.drain_grain_chunks()?;
+        if !chunks.is_empty() {
+            grain
+                .lock()
+                .map_err(|_| anyhow::anyhow!("grain collection failed"))?
+                .push(SceneGrain {
+                    first_frame: first_frame.expect("a pushed scene has a first frame"),
+                    chunks,
+                });
+        }
     }
 
     Ok(wd)

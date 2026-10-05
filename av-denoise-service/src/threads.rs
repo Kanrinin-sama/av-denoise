@@ -40,10 +40,7 @@ pub(crate) fn release_affinity() {
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::System::Threading::{
-            GetCurrentProcess,
-            GetCurrentThread,
-            GetProcessAffinityMask,
-            SetThreadAffinityMask,
+            GetCurrentProcess, GetCurrentThread, GetProcessAffinityMask, SetThreadAffinityMask,
         };
 
         let mut process = 0;

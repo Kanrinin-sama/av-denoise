@@ -1,14 +1,11 @@
+use crate::runtime::{ComputeClient, Runtime};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use super::kernels::nl4d_mv_regularise;
 use crate::nlmeans::RingView;
 use crate::nlmeans::motion::{
-    MotionCtx,
-    THSAD_PIXEL,
-    confidence_byte_offset,
-    level_dims,
-    mv_field_byte_offset,
+    MotionCtx, THSAD_PIXEL, confidence_byte_offset, level_dims, mv_field_byte_offset,
     pyramid_slot_byte_offset,
 };
 
@@ -59,15 +56,15 @@ pub(super) fn run_regularise<R: Runtime>(
         let conf_dst = conf_out.clone().offset_start(confidence_byte_offset(mc, t));
 
         unsafe {
-            nl4d_mv_regularise::launch_unchecked::<R>(
+            nl4d_mv_regularise::launch_unchecked(
                 client,
                 CubeCount::new_2d(mc.blocks_x, mc.blocks_y),
                 CubeDim::new_2d(8, 8),
-                ArrayArg::from_raw_parts(centre.clone(), level_len),
-                ArrayArg::from_raw_parts(neighbour, level_len),
-                ArrayArg::from_raw_parts(mv_in, 2 * blocks),
-                ArrayArg::from_raw_parts(mv_dst, 2 * blocks),
-                ArrayArg::from_raw_parts(conf_dst, blocks),
+                BufferArg::from_raw_parts(centre.clone(), level_len),
+                BufferArg::from_raw_parts(neighbour, level_len),
+                BufferArg::from_raw_parts(mv_in, 2 * blocks),
+                BufferArg::from_raw_parts(mv_dst, 2 * blocks),
+                BufferArg::from_raw_parts(conf_dst, blocks),
                 lambda_pixel,
                 sad_noise_floor,
                 thsad,

@@ -6,8 +6,7 @@
 //! of uploads allocates nothing on the host or the device. Any other
 //! client falls back to a fresh CubeCL buffer per upload.
 
-use cubecl::client::ComputeClient;
-use cubecl::prelude::*;
+use crate::runtime::{ComputeClient, Runtime};
 use cubecl::server::Handle;
 
 #[cfg(any(feature = "vulkan", feature = "metal"))]

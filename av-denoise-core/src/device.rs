@@ -142,13 +142,13 @@ impl Device {
 #[cfg(any(feature = "vulkan", feature = "metal"))]
 impl Device {
     pub fn to_wgpu(&self) -> Result<cubecl::wgpu::WgpuDevice, anyhow::Error> {
-        use cubecl::wgpu::WgpuDevice;
+        use cubecl::wgpu::{WgpuDevice, WgpuDeviceKind};
         Ok(match self {
-            Device::Default => WgpuDevice::DefaultDevice,
-            Device::Discrete { index } => WgpuDevice::DiscreteGpu(*index),
-            Device::Integrated { index } => WgpuDevice::IntegratedGpu(*index),
-            Device::Virtual { index } => WgpuDevice::VirtualGpu(*index),
-            Device::Cpu => WgpuDevice::Cpu,
+            Device::Default => WgpuDevice::new(WgpuDeviceKind::DefaultDevice),
+            Device::Discrete { index } => WgpuDevice::new(WgpuDeviceKind::DiscreteGpu(*index)),
+            Device::Integrated { index } => WgpuDevice::new(WgpuDeviceKind::IntegratedGpu(*index)),
+            Device::Virtual { index } => WgpuDevice::new(WgpuDeviceKind::VirtualGpu(*index)),
+            Device::Cpu => WgpuDevice::new(WgpuDeviceKind::Cpu),
         })
     }
 }

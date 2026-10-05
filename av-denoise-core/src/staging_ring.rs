@@ -5,12 +5,11 @@
 //! `vkAllocateMemory` per frame. This ring allocates its staging buffers
 //! once and cycles through them instead.
 
+use crate::runtime::{ComputeClient, Runtime};
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use cubecl::client::ComputeClient;
-use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
 
 use crate::gpu_share;
@@ -46,7 +45,11 @@ impl StagingRing {
     /// A ring of `depth` staging buffers, each big enough for every
     /// region at once, or `None` when `client` is not a wgpu client
     /// [`gpu_share::register`] started.
-    pub(crate) fn for_client<R: Runtime>(client: &ComputeClient<R>, regions: &[Region], depth: usize) -> Option<Self> {
+    pub(crate) fn for_client<R: Runtime>(
+        client: &ComputeClient<R>,
+        regions: &[Region],
+        depth: usize,
+    ) -> Option<Self> {
         let client = (client as &dyn Any).downcast_ref::<ComputeClient<WgpuRuntime>>()?;
         let (device, queue) = gpu_share::device_and_queue(client)?;
 
@@ -55,7 +58,7 @@ impl StagingRing {
             .iter()
             .map(|region| {
                 let resource = client
-                    .get_resource(region.handle.clone())
+                    .get_resource::<<WgpuRuntime as Runtime>::Server>(region.handle.clone())
                     .expect("an upload target has a wgpu resource");
                 let target = Target {
                     buffer: resource.resource().buffer.clone(),
@@ -119,7 +122,11 @@ impl StagingRing {
         }
 
         {
-            let mut view = slot.buffer.slice(..).get_mapped_range_mut();
+            let mut view = slot
+                .buffer
+                .slice(..)
+                .get_mapped_range_mut()
+                .expect("an upload staging buffer is mapped");
             for (target, parts) in self.targets.iter().zip(contents) {
                 let mut cursor = target.staging_offset;
                 for part in *parts {
@@ -129,14 +136,17 @@ impl StagingRing {
 
                 // A copy moves whole words, so a region ending mid-word
                 // has its last word zero-filled.
-                view.slice(cursor..target.staging_offset + copy_len(parts)).fill(0);
+                view.slice(cursor..target.staging_offset + copy_len(parts))
+                    .fill(0);
             }
         }
         slot.buffer.unmap();
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("av-denoise upload"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("av-denoise upload"),
+            });
         for (target, parts) in self.targets.iter().zip(contents) {
             let copy_len = copy_len(parts);
             if copy_len > 0 {
@@ -150,14 +160,18 @@ impl StagingRing {
             }
         }
 
-        client.flush().expect("submitting queued launches ahead of an upload failed");
+        client
+            .flush()
+            .expect("submitting queued launches ahead of an upload failed");
         slot.submission = Some(self.queue.submit([encoder.finish()]));
 
         slot.state.store(PENDING, Ordering::Release);
         let state = slot.state.clone();
-        slot.buffer.slice(..).map_async(wgpu::MapMode::Write, move |result| {
-            state.store(if result.is_ok() { MAPPED } else { FAILED }, Ordering::Release);
-        });
+        slot.buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Write, move |result| {
+                state.store(if result.is_ok() { MAPPED } else { FAILED }, Ordering::Release);
+            });
     }
 }
 

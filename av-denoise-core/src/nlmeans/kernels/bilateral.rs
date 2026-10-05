@@ -19,8 +19,8 @@ use super::helpers::{read_clamped_line, read_line};
 /// distance kernels.
 #[cube(launch_unchecked)]
 pub fn nlm_bilateral<N: Size>(
-    input: &Array<Vector<f32, N>>,
-    output: &mut Array<Vector<f32, N>>,
+    input: &[Vector<f32, N>],
+    output: &mut [Vector<f32, N>],
     frame: u32,
     inv_two_sigma_s_sq: f32,
     inv_two_sigma_r_sq: f32,
@@ -33,7 +33,7 @@ pub fn nlm_bilateral<N: Size>(
 ) {
     let tile_width = comptime!(block_x + 2 * radius);
     let tile_elems = comptime!((block_x + 2 * radius) * (block_y + 2 * radius));
-    let mut smem = SharedMemory::<Vector<f32, N>>::new(tile_elems as usize);
+    let mut smem = Shared::<[Vector<f32, N>]>::new_slice(tile_elems as usize);
 
     let local_x = UNIT_POS_X;
     let local_y = UNIT_POS_Y;
@@ -96,7 +96,7 @@ pub fn nlm_bilateral<N: Size>(
             let mut range_sq = 0.0f32;
             #[unroll]
             for c in 0..channels {
-                range_sq += diff[c as usize] * diff[c as usize];
+                range_sq += diff.extract(c as usize) * diff.extract(c as usize);
             }
             let spatial = (dx * dx + dy * dy) as f32 * inv_two_sigma_s_sq;
             let w = f32::exp(-(spatial + range_sq * inv_two_sigma_r_sq));

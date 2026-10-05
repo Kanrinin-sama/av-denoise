@@ -84,14 +84,13 @@ fn release_key(key: u128) {
 /// sharing. That costs one extra warm-up and is the safe direction to
 /// err in.
 ///
-/// This crate's version goes into the key as well, because a release
-/// that changes a kernel changes what CubeCL caches under it, and
-/// CubeCL files its own cache under the CubeCL version on top of that.
-/// Without the version a stamp written before an upgrade would tell
-/// every process after it that a cache emptied by that upgrade is warm,
-/// and the whole first wave would compile at once again with nothing
-/// said about it. Rebuilding a kernel without changing the version is
-/// the one case this misses, and deleting the cache directory clears it.
+/// This crate's version goes into the key as well, because a release can
+/// upgrade CubeCL, which files its own cache under the CubeCL version.
+/// Without the version a stamp written before an upgrade would tell every
+/// process after it that a cache emptied by that upgrade is warm, and the
+/// whole first wave would compile at once again with nothing said about
+/// it. A rebuild of the kernel sources needs nothing here, because the
+/// stamps live in that build's own cache directory.
 pub fn kernel_key(options: &PlaneOptions, layout: FrameLayout) -> u128 {
     StableHasher::hash_one(&format!("{}|{options:?}|{layout:?}", env!("CARGO_PKG_VERSION")))
 }
@@ -216,7 +215,7 @@ fn open_lock_file(path: &Path) -> Option<File> {
         Err(err) => {
             tracing::debug!(?path, %err, "cannot open the kernel warm-up lock, compiling unqueued");
             None
-        },
+        }
     }
 }
 
@@ -232,11 +231,11 @@ fn wait_for_lock(lock: &File, wait_limit: Duration) -> bool {
     loop {
         match lock.try_lock() {
             Ok(()) => return true,
-            Err(TryLockError::WouldBlock) => {},
+            Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Error(err)) => {
                 tracing::debug!(%err, "cannot take the kernel warm-up lock, compiling unqueued");
                 return false;
-            },
+            }
         }
 
         if start.elapsed() >= wait_limit {

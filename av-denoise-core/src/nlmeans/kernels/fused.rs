@@ -17,8 +17,8 @@ use super::helpers::{channel_scale, line_sum_sq, read_clamped_line, read_line, w
 /// block, so the branch costs nothing in divergence.
 #[cube(launch_unchecked)]
 pub fn nlm_dist_2d_weight<N: Size>(
-    input: &Array<Vector<f32, N>>,
-    output: &mut Array<f32>,
+    input: &[Vector<f32, N>],
+    output: &mut [f32],
     frame_t: u32,
     frame_q: u32,
     q_x: i32,
@@ -35,7 +35,7 @@ pub fn nlm_dist_2d_weight<N: Size>(
     let tile_width = comptime!(block_x + 2 * patch_radius);
     let tile_height = comptime!(block_y + 2 * patch_radius);
     let tile_elems = comptime!((block_x + 2 * patch_radius) * (block_y + 2 * patch_radius));
-    let mut smem = SharedMemory::<f32>::new(comptime!(
+    let mut smem = Shared::<[f32]>::new_slice(comptime!(
         (block_x + 2 * patch_radius) * (block_y + 2 * patch_radius)
     ) as usize);
 
@@ -127,8 +127,8 @@ pub fn nlm_dist_2d_weight<N: Size>(
 /// from a cleaner image than the noisy input.
 #[cube(launch_unchecked)]
 pub fn nlm_dist_2d_weight_ref<N: Size>(
-    reference: &Array<Vector<f32, N>>,
-    output: &mut Array<f32>,
+    reference: &[Vector<f32, N>],
+    output: &mut [f32],
     frame_t: u32,
     frame_q: u32,
     q_x: i32,
@@ -145,7 +145,7 @@ pub fn nlm_dist_2d_weight_ref<N: Size>(
     let tile_width = comptime!(block_x + 2 * patch_radius);
     let tile_height = comptime!(block_y + 2 * patch_radius);
     let tile_elems = comptime!((block_x + 2 * patch_radius) * (block_y + 2 * patch_radius));
-    let mut smem = SharedMemory::<f32>::new(comptime!(
+    let mut smem = Shared::<[f32]>::new_slice(comptime!(
         (block_x + 2 * patch_radius) * (block_y + 2 * patch_radius)
     ) as usize);
 
@@ -265,12 +265,12 @@ pub fn nlm_dist_2d_weight_ref<N: Size>(
 /// dropped at compile time, and the confidence buffers are never read.
 #[cube(launch_unchecked)]
 pub fn nlm_fused_pair_accumulate_window<N: Size>(
-    input: &Array<Vector<f32, N>>,
-    accum: &mut Array<Vector<f32, N>>,
-    weight_sum: &mut Array<f32>,
-    max_weight: &mut Array<f32>,
-    conf_fwd: &Array<f32>,
-    conf_bwd: &Array<f32>,
+    input: &[Vector<f32, N>],
+    accum: &mut [Vector<f32, N>],
+    weight_sum: &mut [f32],
+    max_weight: &mut [f32],
+    conf_fwd: &[f32],
+    conf_bwd: &[f32],
     #[comptime] use_confidence: bool,
     frame_t: u32,
     frame_fwd: u32,
@@ -294,9 +294,9 @@ pub fn nlm_fused_pair_accumulate_window<N: Size>(
     let expanded_elems = comptime!(
         (block_x + 2 * patch_radius + 2 * search_radius) * (block_y + 2 * patch_radius + 2 * search_radius)
     );
-    let mut smem_center = SharedMemory::<Vector<f32, N>>::new(expanded_elems as usize);
-    let mut smem_fwd = SharedMemory::<f32>::new(tile_elems as usize);
-    let mut smem_bwd = SharedMemory::<f32>::new(tile_elems as usize);
+    let mut smem_center = Shared::<[Vector<f32, N>]>::new_slice(expanded_elems as usize);
+    let mut smem_fwd = Shared::<[f32]>::new_slice(tile_elems as usize);
+    let mut smem_bwd = Shared::<[f32]>::new_slice(tile_elems as usize);
 
     let local_x = UNIT_POS_X;
     let local_y = UNIT_POS_Y;
@@ -473,13 +473,13 @@ pub fn nlm_fused_pair_accumulate_window<N: Size>(
 /// `noise::build_spatial_offset_lut`.
 #[cube(launch_unchecked)]
 pub fn nlm_fused_single_window<N: Size>(
-    input: &Array<Vector<f32, N>>,
-    accum: &mut Array<Vector<f32, N>>,
-    weight_sum: &mut Array<f32>,
-    max_weight: &mut Array<f32>,
+    input: &[Vector<f32, N>],
+    accum: &mut [Vector<f32, N>],
+    weight_sum: &mut [f32],
+    max_weight: &mut [f32],
     frame_t: u32,
     h2_inv_norm: f32,
-    spatial_offset_lut: &Array<f32>,
+    spatial_offset_lut: &[f32],
     #[comptime] width: u32,
     #[comptime] height: u32,
     #[comptime] channels: u32,
@@ -494,8 +494,8 @@ pub fn nlm_fused_single_window<N: Size>(
     let expanded_elems = comptime!(
         (block_x + 2 * patch_radius + 2 * search_radius) * (block_y + 2 * patch_radius + 2 * search_radius)
     );
-    let mut smem_center = SharedMemory::<Vector<f32, N>>::new(expanded_elems as usize);
-    let mut smem_dist = SharedMemory::<f32>::new(tile_elems as usize);
+    let mut smem_center = Shared::<[Vector<f32, N>]>::new_slice(expanded_elems as usize);
+    let mut smem_dist = Shared::<[f32]>::new_slice(tile_elems as usize);
 
     let local_x = UNIT_POS_X;
     let local_y = UNIT_POS_Y;
@@ -620,13 +620,13 @@ pub fn nlm_fused_single_window<N: Size>(
 /// Confidence weighting works the same way as in the plain version.
 #[cube(launch_unchecked)]
 pub fn nlm_fused_pair_accumulate_window_ref<N: Size>(
-    input: &Array<Vector<f32, N>>,
-    reference: &Array<Vector<f32, N>>,
-    accum: &mut Array<Vector<f32, N>>,
-    weight_sum: &mut Array<f32>,
-    max_weight: &mut Array<f32>,
-    conf_fwd: &Array<f32>,
-    conf_bwd: &Array<f32>,
+    input: &[Vector<f32, N>],
+    reference: &[Vector<f32, N>],
+    accum: &mut [Vector<f32, N>],
+    weight_sum: &mut [f32],
+    max_weight: &mut [f32],
+    conf_fwd: &[f32],
+    conf_bwd: &[f32],
     #[comptime] use_confidence: bool,
     frame_t: u32,
     frame_fwd: u32,
@@ -650,9 +650,9 @@ pub fn nlm_fused_pair_accumulate_window_ref<N: Size>(
     let expanded_elems = comptime!(
         (block_x + 2 * patch_radius + 2 * search_radius) * (block_y + 2 * patch_radius + 2 * search_radius)
     );
-    let mut smem_center = SharedMemory::<Vector<f32, N>>::new(expanded_elems as usize);
-    let mut smem_fwd = SharedMemory::<f32>::new(tile_elems as usize);
-    let mut smem_bwd = SharedMemory::<f32>::new(tile_elems as usize);
+    let mut smem_center = Shared::<[Vector<f32, N>]>::new_slice(expanded_elems as usize);
+    let mut smem_fwd = Shared::<[f32]>::new_slice(tile_elems as usize);
+    let mut smem_bwd = Shared::<[f32]>::new_slice(tile_elems as usize);
 
     let local_x = UNIT_POS_X;
     let local_y = UNIT_POS_Y;
@@ -806,14 +806,14 @@ pub fn nlm_fused_pair_accumulate_window_ref<N: Size>(
 /// `nlm_fused_single_window`.
 #[cube(launch_unchecked)]
 pub fn nlm_fused_single_window_ref<N: Size>(
-    input: &Array<Vector<f32, N>>,
-    reference: &Array<Vector<f32, N>>,
-    accum: &mut Array<Vector<f32, N>>,
-    weight_sum: &mut Array<f32>,
-    max_weight: &mut Array<f32>,
+    input: &[Vector<f32, N>],
+    reference: &[Vector<f32, N>],
+    accum: &mut [Vector<f32, N>],
+    weight_sum: &mut [f32],
+    max_weight: &mut [f32],
     frame_t: u32,
     h2_inv_norm: f32,
-    spatial_offset_lut: &Array<f32>,
+    spatial_offset_lut: &[f32],
     #[comptime] width: u32,
     #[comptime] height: u32,
     #[comptime] channels: u32,
@@ -828,8 +828,8 @@ pub fn nlm_fused_single_window_ref<N: Size>(
     let expanded_elems = comptime!(
         (block_x + 2 * patch_radius + 2 * search_radius) * (block_y + 2 * patch_radius + 2 * search_radius)
     );
-    let mut smem_center = SharedMemory::<Vector<f32, N>>::new(expanded_elems as usize);
-    let mut smem_dist = SharedMemory::<f32>::new(tile_elems as usize);
+    let mut smem_center = Shared::<[Vector<f32, N>]>::new_slice(expanded_elems as usize);
+    let mut smem_dist = Shared::<[f32]>::new_slice(tile_elems as usize);
 
     let local_x = UNIT_POS_X;
     let local_y = UNIT_POS_Y;

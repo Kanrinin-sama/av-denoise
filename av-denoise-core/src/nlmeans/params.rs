@@ -376,7 +376,7 @@ impl NlmParams {
                 let count = self.channels.count() as usize;
                 let sum_sq: f32 = sigmas.iter().take(count).map(|&s| s * s).sum();
                 2.0 * scale * sum_sq * s_size as f32
-            },
+            }
             _ => 0.0,
         }
     }
@@ -391,7 +391,7 @@ impl NlmParams {
             Some(sigma) => {
                 let sigmas = [sigma; 3];
                 self.noise_offset_with(Some(&sigmas[..self.channels.count() as usize]))
-            },
+            }
             None => 0.0,
         }
     }

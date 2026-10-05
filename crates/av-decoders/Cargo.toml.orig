@@ -1,8 +1,8 @@
 [package]
 name = "av-decoders"
-version = "0.9.1"
+version = "0.11.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 description = "Decoders for use in the rust-av ecosystem"
 repository = "https://github.com/rust-av/av-decoders"
 license = "MIT"
@@ -13,19 +13,19 @@ harness = false
 name = "decoders_bench"
 
 [dependencies]
-ffmpeg-the-third = { version = "4.0.1", default-features = false, features = [
+ffmpeg-the-third = { version = "6.0.0", default-features = false, features = [
   "codec",
   "format",
 ], optional = true }
 ffms2-sys = { version = "0.3.0", optional = true }
-num-rational = "0.4.2"
-thiserror = "2.0.17"
-v_frame = "0.5"
+num-rational = { version = "0.4.2", default-features = false }
+thiserror = "2.0.21"
+v_frame = "0.7"
 vapoursynth = { version = "0.5", optional = true }
 y4m = "0.8"
 
 [dev-dependencies]
-criterion = "0.8.0"
+criterion = "0.8.2"
 
 [features]
 # Support decoding via ffmpeg

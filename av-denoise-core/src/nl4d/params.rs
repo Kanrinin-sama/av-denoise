@@ -1,17 +1,5 @@
 use crate::nlmeans::{ChannelMode, HqParams, MotionCompensationMode, MotionEstimation, NlmParams};
 
-/// The largest [`Nl4dParams::mismatch_scale`] worth accepting.
-///
-/// A member's own match distance never exceeds `3 * PATCH_AREA` in the
-/// search's units, so its mismatch variance never exceeds
-/// `mismatch_scale^2` in absolute pixel-value units. The mechanism caps
-/// at [`crate::collab::kernels::fused::MEMBER_SIGMA2_CAP`] times the
-/// channel variance, so even the worst possible mismatch saturates by a
-/// scale of `8 * sigma`. Even a source noisy enough to measure `sigma =
-/// 0.05` saturates well under 1, so nothing above this can move a pixel
-/// and accepting it would only promise a range that is not there.
-pub const MAX_MISMATCH_SCALE: f32 = 16.0;
-
 /// The largest [`Nl4dParams::kaiser_beta`] worth accepting.
 ///
 /// A Kaiser window's taps fall off faster the larger `beta` is. By 8 the
@@ -64,29 +52,14 @@ pub struct Nl4dParams {
     /// Higher shrinks more coefficients, so it removes more noise and
     /// more fine detail.
     ///
-    /// Defaults to 5.2. Note that in reality luma and chroma want separately
+    /// Defaults to 4.158. Note that in reality luma and chroma want separately
     /// tuned values. See [nl4d_default_lambda_ht](crate::nl4d_default_lambda_ht).
     pub lambda_ht: f32,
     /// The confidence floor below which a whole neighbour block is
-    /// skipped rather than scored, in `[0, 1)`. Only affects how much
-    /// compute a submit spends, never which candidates are admitted once
-    /// they are scored.
+    /// skipped rather than scored, in `[0, 1)`. A block below the floor
+    /// is never scored, and a volume left short of frames by the skip
+    /// makes its group filter from the centre frame alone.
     pub c_min: f32,
-    /// A multiplier on the mismatch variance a temporal member carries
-    /// into the hard threshold.
-    ///
-    /// A member matched in a neighbour frame is treated as a noisier
-    /// observation of the reference, and its extra variance is its own
-    /// match distance, per channel and per pixel, with the noise floor
-    /// removed. The variance grows with the square of this, so `2.0` is
-    /// a four-fold increase. `1.0`, the default, is the shipped
-    /// calibration. `0.0` matches `confidence_variance: false`.
-    ///
-    /// The mechanism saturates. A member's extra variance is capped at
-    /// [`crate::collab::kernels::fused::MEMBER_SIGMA2_CAP`] times the
-    /// channel variance, so raising this past the point where a
-    /// member's distance reaches the cap stops changing anything.
-    pub mismatch_scale: f32,
     /// The `beta` of the Kaiser window each filtered patch is tapered
     /// with as it is aggregated, in `0..=8`.
     ///
@@ -99,14 +72,6 @@ pub struct Nl4dParams {
     /// aggregation, which is what this did before the window existed.
     /// See [`crate::collab::kernels::aggregate::kaiser_window`].
     pub kaiser_beta: f32,
-    /// Whether a temporal member's mismatch variance reaches the
-    /// hard-threshold shrinkage.
-    ///
-    /// `true`, the default, treats a poorly matched member as a noisier
-    /// observation, so the threshold trusts it less. `false` gives every
-    /// member the plain channel sigma instead, which is what an ablation
-    /// needs to isolate the effect of this mechanism.
-    pub confidence_variance: bool,
     /// The penalty on a block's vector deviating from its
     /// neighbourhood's median, in the field regularisation pass.
     ///
@@ -120,6 +85,44 @@ pub struct Nl4dParams {
     /// so `1.0` sits inside that plateau rather than at its edge. `0.0`
     /// skips the pass.
     pub field_lambda: f32,
+    /// Scales the luma threshold by how noisy each brightness level is in the current frame.
+    ///
+    /// On by default.
+    pub noise_map: bool,
+    /// How much harder flat, grainy 8x8 areas are filtered, as a multiplier on the luma threshold.
+    ///
+    /// An area counts as flat when its texture is small next to its own grain. Only takes effect
+    /// with `noise_map` on. `1.0` turns it off. Between 1.0 and 3.0, defaults to 1.75.
+    pub flat_boost: f32,
+    /// [Self::flat_boost] for the chroma planes, with flatness measured on the first chroma plane.
+    ///
+    /// Only takes effect with `noise_map` on. `1.0` turns it off. Between 1.0 and 3.0, defaults
+    /// to 1.5.
+    pub chroma_flat_boost: f32,
+    /// How much more gently textured dark areas are filtered, as a multiplier on the luma
+    /// threshold.
+    ///
+    /// It applies in full at or below luma 128 of 255 and fades back to 1.0 by 160. Only takes
+    /// effect with `noise_map` on. `1.0` turns it off. Between 0.1 and 1.0, defaults to 0.65.
+    pub shadow_soften: f32,
+    /// How strongly the grain in a flat area may line up before the area counts as texture instead.
+    ///
+    /// Grain points every which way, while faint lines and edges share one direction. A flat area
+    /// whose surroundings line up at or above this cut loses the flat boost and is filtered as
+    /// texture. Lower keeps more texture, higher filters more areas as flat. Only takes effect
+    /// with `noise_map` on, and only on luma. `1.0` turns it off. Between 0.0 and 1.0, defaults
+    /// to 0.21.
+    pub flat_texture_cut: f32,
+    /// Judges each transform coefficient together with its frequency neighbours instead of alone.
+    ///
+    /// Faint texture spreads over several neighbouring frequencies, so it survives where each
+    /// coefficient alone would fall under the threshold. On by default.
+    pub pooled_threshold: bool,
+    /// Whether the denoiser measures the source's film grain for an AV1 grain table.
+    ///
+    /// Off by default. Only a denoiser that filters luma measures. It never changes the output.
+    /// Measured chunks stay on the GPU until drained, so callers drain after each flush.
+    pub grain_export: bool,
 }
 
 impl Default for Nl4dParams {
@@ -141,12 +144,17 @@ impl Default for Nl4dParams {
             temporal_radius: 2,
             refine: 2,
             spatial_radius: 9,
-            lambda_ht: 5.2,
+            lambda_ht: 4.158,
             c_min: 0.05,
-            mismatch_scale: 1.0,
             kaiser_beta: 2.0,
-            confidence_variance: true,
             field_lambda: 1.0,
+            noise_map: true,
+            flat_boost: 1.75,
+            chroma_flat_boost: 1.5,
+            shadow_soften: 0.65,
+            flat_texture_cut: 0.21,
+            pooled_threshold: true,
+            grain_export: false,
         }
     }
 }
@@ -230,13 +238,6 @@ impl Nl4dParams {
             return Err(format!("c_min must be finite and in [0, 1), got {}", self.c_min));
         }
 
-        if !(self.mismatch_scale.is_finite() && (0.0..=MAX_MISMATCH_SCALE).contains(&self.mismatch_scale)) {
-            return Err(format!(
-                "mismatch_scale must be finite and in [0, {MAX_MISMATCH_SCALE}], got {}",
-                self.mismatch_scale
-            ));
-        }
-
         if !(self.kaiser_beta.is_finite() && (0.0..=MAX_KAISER_BETA).contains(&self.kaiser_beta)) {
             return Err(format!(
                 "kaiser_beta must be finite and in 0..={MAX_KAISER_BETA}, got {}",
@@ -248,6 +249,29 @@ impl Nl4dParams {
             return Err(format!(
                 "field_lambda must be finite and at least 0, got {}",
                 self.field_lambda
+            ));
+        }
+
+        for (name, value) in [
+            ("flat_boost", self.flat_boost),
+            ("chroma_flat_boost", self.chroma_flat_boost),
+        ] {
+            if !(value.is_finite() && (1.0..=3.0).contains(&value)) {
+                return Err(format!("{name} must be finite and in 1.0..=3.0, got {value}"));
+            }
+        }
+
+        if !(self.shadow_soften.is_finite() && (0.1..=1.0).contains(&self.shadow_soften)) {
+            return Err(format!(
+                "shadow_soften must be finite and in 0.1..=1.0, got {}",
+                self.shadow_soften
+            ));
+        }
+
+        if !(self.flat_texture_cut.is_finite() && (0.0..=1.0).contains(&self.flat_texture_cut)) {
+            return Err(format!(
+                "flat_texture_cut must be finite and in 0.0..=1.0, got {}",
+                self.flat_texture_cut
             ));
         }
 

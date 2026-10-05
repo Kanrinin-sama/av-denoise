@@ -22,9 +22,9 @@ use cubecl::terminate;
 /// raised-cosine blend.
 #[cube(launch_unchecked)]
 pub fn nlm_mc_warp<N: Size>(
-    src: &Array<Vector<f32, N>>,
-    dst: &mut Array<Vector<f32, N>>,
-    mv_field: &Array<i32>,
+    src: &[Vector<f32, N>],
+    dst: &mut [Vector<f32, N>],
+    mv_field: &[i32],
     src_frame: u32,
     dst_frame: u32,
     #[comptime] step: u32,

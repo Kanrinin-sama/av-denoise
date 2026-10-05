@@ -1,13 +1,11 @@
 use std::io::Read;
-use std::num::{NonZeroU8, NonZeroUsize};
 
-use num_rational::Rational32;
-use v_frame::chroma::ChromaSubsampling;
-use v_frame::frame::{Frame, FrameBuilder};
-use v_frame::pixel::Pixel;
-
+use crate::VideoDetails;
 use crate::error::DecoderError;
-use crate::{LUMA_PADDING, VideoDetails};
+use num_rational::Rational32;
+use v_frame::{chroma::ChromaSubsampling, frame::Frame, pixel::Pixel};
+
+use super::frame_builder::new_padded_frame;
 
 pub fn get_video_details<R: Read>(dec: &y4m::Decoder<R>) -> VideoDetails {
     let width = dec.get_width();
@@ -30,20 +28,8 @@ pub fn get_video_details<R: Read>(dec: &y4m::Decoder<R>) -> VideoDetails {
 
 const fn map_y4m_color_space(color_space: y4m::Colorspace) -> ChromaSubsampling {
     use y4m::Colorspace::{
-        C420,
-        C420jpeg,
-        C420mpeg2,
-        C420p10,
-        C420p12,
-        C420paldv,
-        C422,
-        C422p10,
-        C422p12,
-        C444,
-        C444p10,
-        C444p12,
-        Cmono,
-        Cmono12,
+        C420, C420jpeg, C420mpeg2, C420p10, C420p12, C420paldv, C422, C422p10, C422p12, C444, C444p10,
+        C444p12, Cmono, Cmono12,
     };
     match color_space {
         Cmono | Cmono12 => ChromaSubsampling::Monochrome,
@@ -64,28 +50,7 @@ pub fn read_video_frame<R: Read, T: Pixel>(
         _ => DecoderError::GenericDecodeError { cause: e.to_string() },
     })?;
 
-    let mut frame: Frame<T> = FrameBuilder::new(
-        NonZeroUsize::new(cfg.width).ok_or_else(|| DecoderError::GenericDecodeError {
-            cause: "Zero-width resolution is not supported".to_string(),
-        })?,
-        NonZeroUsize::new(cfg.height).ok_or_else(|| DecoderError::GenericDecodeError {
-            cause: "Zero-height resolution is not supported".to_string(),
-        })?,
-        if luma_only {
-            ChromaSubsampling::Monochrome
-        } else {
-            cfg.chroma_sampling
-        },
-        NonZeroU8::new(cfg.bit_depth as u8).ok_or_else(|| DecoderError::GenericDecodeError {
-            cause: "Zero-bit-depth is not supported".to_string(),
-        })?,
-    )
-    .luma_padding_bottom(LUMA_PADDING)
-    .luma_padding_top(LUMA_PADDING)
-    .luma_padding_left(LUMA_PADDING)
-    .luma_padding_right(LUMA_PADDING)
-    .build()
-    .map_err(|e| DecoderError::GenericDecodeError { cause: e.to_string() })?;
+    let mut frame: Frame<T> = new_padded_frame(cfg, luma_only)?;
 
     frame
         .y_plane

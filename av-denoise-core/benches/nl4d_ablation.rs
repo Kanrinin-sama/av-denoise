@@ -6,7 +6,7 @@
 //! full resolution would report four times the real work. Both planes are
 //! measured here and summed, so the total is one frame's kernel cost.
 
-use av_denoise_core::collab::geometry::{fused_cubes_x, ref_count, refs_along};
+use av_denoise_core::collab::geometry::{fused_cubes_x, ref_count, refs_along, strength_map_dims};
 use av_denoise_core::collab::kernels::aggregate::{
     collab_normalise,
     collab_zero_accum,
@@ -14,10 +14,10 @@ use av_denoise_core::collab::kernels::aggregate::{
     kaiser_window,
     weight_scale,
 };
-use av_denoise_core::collab::kernels::fused::collab_fused;
+use av_denoise_core::collab::kernels::fused::{STRENGTH_MAP_OFF, collab_fused};
 use av_denoise_core::collab::kernels::transforms::dct_noise_profile;
-use av_denoise_core::collab::{PATCH_SIZE, needs_warp_uniform_search};
-use av_denoise_core::nlmeans::{BLOCK_X, BLOCK_Y};
+use av_denoise_core::collab::{PATCH_SIZE, grid_frames, needs_warp_uniform_search};
+use av_denoise_core::nlmeans::{BLOCK_X, BLOCK_Y, NOISE_CURVE_BINS};
 use cubecl::benchmark::{Benchmark, BenchmarkComputations, TimingMethod};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -54,15 +54,12 @@ const SPATIAL_RADIUS: u32 = 9;
 const K_MAX: u32 = 8;
 const BLK_STEP: u32 = 8;
 const BLKSIZE: u32 = 16;
-/// `Nl4dParams::default().mismatch_scale` squared, the kernel's
-/// `mismatch_scale2` argument.
-const MISMATCH_SCALE2: f32 = 1.0;
 const N_FRAMES: u32 = 2 * RADIUS + 1;
 const CENTRE_SLOT: u32 = RADIUS;
 const NEIGHBOUR_SLOTS: [u32; 4] = [0, 1, 3, 4];
 const SIGMA: f32 = 0.02;
 /// `Nl4dParams::default().lambda_ht`.
-const LAMBDA_HT: f32 = 5.2;
+const LAMBDA_HT: f32 = 4.158;
 
 fn frame_data(g: Geom) -> Vec<f32> {
     let mut data = Vec::with_capacity((g.w * g.h * g.stored) as usize);
@@ -106,6 +103,12 @@ struct Rig<R: Runtime> {
     group_weight: Handle,
     sigma: Handle,
     dct_profile: Handle,
+    /// An all-zero noise curve, passed with `curve_valid = 0` where the
+    /// kernel never applies it.
+    zero_curve: Handle,
+    /// A strength map of ones, passed with the map off.
+    unit_map: Handle,
+    map_len: usize,
     /// The uniform aggregation window, which the `fused` row runs with.
     kaiser_off: Handle,
     /// A `beta = 2` window, which the `fused_kaiser` row runs with. The
@@ -150,6 +153,10 @@ impl<R: Runtime> Rig<R> {
         let mut sigma_host = vec![0.0f32; g.stored as usize];
         sigma_host[..g.ch as usize].fill(SIGMA);
 
+        let (map_cols, map_rows) = strength_map_dims(g.w, g.h);
+        let map_len = (map_cols * map_rows) as usize;
+        let unit_map = vec![1.0f32; map_len];
+
         Self {
             mv_field: client.create_from_slice(i32::as_bytes(&vec![0i32; mv_len])),
             confidence: client.create_from_slice(f32::as_bytes(&vec![1.0f32; conf_len])),
@@ -160,6 +167,9 @@ impl<R: Runtime> Rig<R> {
             group_weight: client.empty(refs * size_of::<f32>()),
             sigma: client.create_from_slice(f32::as_bytes(&sigma_host)),
             dct_profile: client.create_from_slice(f32::as_bytes(&dct_noise_profile(0.0))),
+            zero_curve: client.create_from_slice(f32::as_bytes(&[0.0f32; NOISE_CURVE_BINS])),
+            unit_map: client.create_from_slice(f32::as_bytes(&unit_map)),
+            map_len,
             kaiser_off: client.create_from_slice(f32::as_bytes(&kaiser_window(0.0))),
             kaiser_on: client.create_from_slice(f32::as_bytes(&kaiser_window(2.0))),
             ring_len: ring_data.len(),
@@ -194,6 +204,8 @@ impl<R: Runtime> Rig<R> {
         let refs_x = refs_along(g.w);
         let pixels = (g.w * g.h) as usize;
         let frame_len = pixels * g.stored as usize;
+        let (map_cols, map_rows) = strength_map_dims(g.w, g.h);
+
         unsafe {
             collab_fused::launch_unchecked::<R>(
                 &self.client,
@@ -205,6 +217,8 @@ impl<R: Runtime> Rig<R> {
                 ArrayArg::from_raw_parts(self.confidence.clone(), self.conf_len),
                 ArrayArg::from_raw_parts(self.neighbour_slots.clone(), NEIGHBOUR_SLOTS.len()),
                 ArrayArg::from_raw_parts(self.sigma.clone(), g.stored as usize),
+                ArrayArg::from_raw_parts(self.zero_curve.clone(), NOISE_CURVE_BINS),
+                ArrayArg::from_raw_parts(self.unit_map.clone(), self.map_len),
                 ArrayArg::from_raw_parts(self.dct_profile.clone(), 8),
                 ArrayArg::from_raw_parts(kaiser.clone(), PATCH_SIZE as usize),
                 ArrayArg::from_raw_parts(self.accum.clone(), frame_len * N_FRAMES as usize),
@@ -212,14 +226,14 @@ impl<R: Runtime> Rig<R> {
                 ArrayArg::from_raw_parts(self.group_weight.clone(), refs),
                 CENTRE_SLOT,
                 0.0f32,
-                0.0f32,
-                MISMATCH_SCALE2,
                 LAMBDA_HT,
+                0u32,
+                STRENGTH_MAP_OFF,
                 weight_scale(SIGMA, &dct_noise_profile(0.0)),
                 cross_frame_accum_scale(SPATIAL_RADIUS, RADIUS),
-                true,
                 needs_warp_uniform_search(&self.client),
                 RADIUS,
+                grid_frames(RADIUS),
                 REFINE,
                 self.mv_stride,
                 self.conf_stride,
@@ -234,6 +248,10 @@ impl<R: Runtime> Rig<R> {
                 g.stored,
                 SPATIAL_RADIUS,
                 refs_x,
+                map_cols,
+                map_rows,
+                0.0f32,
+                false,
             );
         }
     }

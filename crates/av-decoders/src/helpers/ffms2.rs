@@ -1,55 +1,32 @@
-use std::ffi::{CString, c_char};
-use std::num::{NonZeroU8, NonZeroUsize};
-use std::path::Path;
-use std::slice;
-use std::str::FromStr;
-use std::sync::{Arc, LazyLock, Once};
+use std::{
+    ffi::CString,
+    ffi::c_char,
+    path::Path,
+    slice,
+    str::FromStr,
+    sync::{Arc, LazyLock, Once},
+};
 
 use ffms2_sys::{
-    FFMS_CreateIndexer,
-    FFMS_CreateVideoSource,
-    FFMS_DestroyIndex,
-    FFMS_DestroyVideoSource,
-    FFMS_DoIndexing2,
-    FFMS_ErrorInfo,
-    FFMS_GetFirstIndexedTrackOfType,
-    FFMS_GetFrame,
-    FFMS_GetPixFmt,
-    FFMS_GetVideoProperties,
-    FFMS_Index,
-    FFMS_IndexBelongsToFile,
-    FFMS_Init,
-    FFMS_ReadIndex,
-    FFMS_Resizers,
-    FFMS_SetOutputFormatV2,
-    FFMS_TrackType,
-    FFMS_TrackTypeIndexSettings,
-    FFMS_VideoSource,
-    FFMS_WriteIndex,
+    FFMS_CreateIndexer, FFMS_CreateVideoSource, FFMS_DestroyIndex, FFMS_DestroyVideoSource, FFMS_DoIndexing2,
+    FFMS_ErrorInfo, FFMS_GetFirstIndexedTrackOfType, FFMS_GetFrame, FFMS_GetPixFmt, FFMS_GetTrackFromIndex,
+    FFMS_GetTrackType, FFMS_GetVideoProperties, FFMS_Index, FFMS_IndexBelongsToFile, FFMS_Init,
+    FFMS_ReadIndex, FFMS_Resizers, FFMS_SetOutputFormatV2, FFMS_TrackType, FFMS_TrackTypeIndexSettings,
+    FFMS_VideoSource, FFMS_WriteIndex,
 };
 use num_rational::Rational32;
-use v_frame::chroma::ChromaSubsampling;
-use v_frame::frame::{Frame, FrameBuilder};
-use v_frame::pixel::Pixel;
+use v_frame::{chroma::ChromaSubsampling, frame::Frame, pixel::Pixel};
 
-use crate::{DecoderError, LUMA_PADDING, VideoDetails};
+use crate::{DecoderError, VideoDetails};
+
+use super::frame_builder::new_padded_frame;
 
 /// Ensures FFMS2 is initialized only once per process
 static FFMS2_INIT: Once = Once::new();
 
-/// A decoder for video files using the FFMS2 library.
+/// Video decoder using the FFMS2 library.
 ///
-/// This struct represents a video decoder that uses the FFMS2 library to decode video files.
-/// It holds video details, a video source handle, and an index handle for efficient frame access.
-///
-/// # Fields
-/// * `video_details` - Contains information about the video such as width, height, frame rate, etc.
-/// * `video_source` - A pointer to the FFMS2 video source.
-/// * `index_handle` - A handle to the index used for efficient frame access.
-///
-/// # Safety
-/// This struct contains raw pointers and should be used with care. The `Drop` implementation
-/// ensures proper cleanup of resources.
+/// Contains raw pointers; cleaned up via `Drop`.
 pub struct Ffms2Decoder {
     /// Contains the resolution and bit depth of the loaded video stream
     pub video_details: VideoDetails,
@@ -69,17 +46,14 @@ impl Drop for Ffms2Decoder {
     }
 }
 
-/// An FFMS2 index over one file, shareable by every decoder of that file.
+#[allow(missing_docs)]
 pub struct FfmsIndex {
     path: String,
     track: i32,
     idx_handle: *mut FFMS_Index,
 }
 
-// SAFETY: an index is read-only once built, and FFMS2 copies what a
-// video source needs out of it when the source is created.
 unsafe impl Send for FfmsIndex {}
-// SAFETY: see `Send` above.
 unsafe impl Sync for FfmsIndex {}
 
 impl Drop for FfmsIndex {
@@ -94,46 +68,30 @@ impl Drop for FfmsIndex {
 }
 
 impl Ffms2Decoder {
-    /// Creates a new `Ffms2Decoder` instance for the given input file.
+    /// Creates a new FFMS2 decoder for the given video file.
     ///
-    /// This function initializes the FFMS2 library, creates an index for the input file,
-    /// and sets up a video source for decoding. It returns a new `Ffms2Decoder` instance
-    /// if successful, or an error if any step fails.
-    ///
-    /// # Arguments
-    ///
-    /// * `input` - A path to the input video file.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<Self, DecoderError>` - A new `Ffms2Decoder` instance on success, or a `DecoderError` on failure.
+    /// Initializes FFMS2, creates/reads an index, and sets up a video source.
+    /// `track_index` defaults to the first video track if `None`.
     ///
     /// # Errors
     ///
-    /// This function can return the following errors:
-    /// * `DecoderError::FileReadError` - If there's an error converting the input path to a `CString`.
-    /// * `DecoderError::GenericDecodeError` - If there's an error creating the video source, indexer, or indexing the input file.
-    /// * `DecoderError::UnsupportedFormat` - If the pixel format of the video is not supported.
-    ///
-    /// # Safety
-    ///
-    /// This function performs unsafe operations to interact with the FFMS2 library.
-    /// It ensures proper error handling and resource cleanup.
+    /// Returns [`DecoderError::NoVideoStream`] if no video track is found,
+    /// [`DecoderError::UnsupportedFormat`] for unsupported pixel formats,
+    /// [`DecoderError::GenericDecodeError`] on indexing or source creation failure.
     #[inline]
-    pub fn new<P: AsRef<Path>>(input: P) -> Result<Self, DecoderError> {
-        Self::with_index(Arc::new(Self::index(input.as_ref())?))
+    pub fn new<P: AsRef<Path>>(input: P, track_index: Option<u8>) -> Result<Self, DecoderError> {
+        Self::with_index(Arc::new(Self::index(input.as_ref(), track_index)?))
     }
 
-    /// Creates a decoder over an index built by [`Ffms2Decoder::index`],
-    /// so several decoders of one file share a single indexing pass.
     #[inline]
+    #[allow(missing_docs)]
     pub fn with_index(index_handle: Arc<FfmsIndex>) -> Result<Self, DecoderError> {
         let threads = 4;
 
         let source = CString::new(index_handle.path.as_str())
             .map_err(|e| DecoderError::FileReadError { cause: e.to_string() })?;
-        // SAFETY: we free this on all branches below
-        let mut err = unsafe { empty_error_info() };
+        let mut err_buffer: [c_char; ERR_BUFFER_SIZE] = [0; ERR_BUFFER_SIZE];
+        let mut err = empty_error_info(&mut err_buffer);
         // SAFETY: `source` is not null since we just created it
         let video_source = unsafe {
             FFMS_CreateVideoSource(
@@ -148,13 +106,10 @@ impl Ffms2Decoder {
 
         if video_source.is_null() {
             let error_msg = get_error_message(err);
-            free_error_info(&mut err);
             return Err(DecoderError::GenericDecodeError {
                 cause: format!("Failed to create video source: {}", error_msg),
             });
         }
-
-        free_error_info(&mut err);
 
         // SAFETY: verified that `video_source` is not null
         let video_details = unsafe { Self::get_video_details(video_source)? };
@@ -191,8 +146,8 @@ impl Ffms2Decoder {
         bit_depth: u8,
         chroma_subsampling: ChromaSubsampling,
     ) -> Result<(), DecoderError> {
-        // SAFETY: we free this on all branches below
-        let mut err = unsafe { empty_error_info() };
+        let mut err_buffer: [c_char; ERR_BUFFER_SIZE] = [0; ERR_BUFFER_SIZE];
+        let mut err = empty_error_info(&mut err_buffer);
         // SAFETY: `self.video_source` cannot be null here
         unsafe {
             FFMS_SetOutputFormatV2(
@@ -207,10 +162,8 @@ impl Ffms2Decoder {
         }
         if err.ErrorType != 0 {
             let msg = get_error_message(err);
-            free_error_info(&mut err);
             return Err(DecoderError::Ffms2InternalError { cause: msg });
         }
-        free_error_info(&mut err);
 
         // SAFETY: `self.video_source` cannot be null here
         self.video_details = unsafe { Self::get_video_details(self.video_source)? };
@@ -218,19 +171,11 @@ impl Ffms2Decoder {
         Ok(())
     }
 
-    /// Reads the `.ffindex` next to `input`, or indexes the file and
-    /// writes one there.
-    #[inline]
-    pub fn index(input: &Path) -> Result<FfmsIndex, DecoderError> {
-        FFMS2_INIT.call_once(|| {
-            // SAFETY: FFI call with infallible parameters
-            unsafe {
-                FFMS_Init(0, 0);
-            }
-        });
-
-        // SAFETY: we free this on all branches below
-        let mut err = unsafe { empty_error_info() };
+    #[allow(missing_docs)]
+    pub fn index(input: &Path, track_index: Option<u8>) -> Result<FfmsIndex, DecoderError> {
+        FFMS2_INIT.call_once(|| unsafe { FFMS_Init(0, 0) });
+        let mut err_buffer: [c_char; ERR_BUFFER_SIZE] = [0; ERR_BUFFER_SIZE];
+        let mut err = empty_error_info(&mut err_buffer);
 
         let input_cstr = CString::from_str(&input.to_string_lossy())
             .map_err(|e| DecoderError::FileReadError { cause: e.to_string() })?;
@@ -267,7 +212,6 @@ impl Ffms2Decoder {
             let idxer = unsafe { FFMS_CreateIndexer(input_cstr.as_ptr(), std::ptr::addr_of_mut!(err)) };
             if idxer.is_null() {
                 let error_msg = get_error_message(err);
-                free_error_info(&mut err);
                 return Err(DecoderError::GenericDecodeError {
                     cause: format!("Failed to create indexer: {}", error_msg),
                 });
@@ -286,7 +230,6 @@ impl Ffms2Decoder {
 
             if idx.is_null() {
                 let error_msg = get_error_message(err);
-                free_error_info(&mut err);
                 return Err(DecoderError::GenericDecodeError {
                     cause: format!("Failed to index input file: {}", error_msg),
                 });
@@ -302,23 +245,19 @@ impl Ffms2Decoder {
             ));
             let temporary_cstr = CString::new(temporary_path.to_string_lossy().as_bytes())
                 .map_err(|e| DecoderError::FileReadError { cause: e.to_string() })?;
-            free_error_info(&mut err);
-            err = unsafe { empty_error_info() };
-            let write_result = unsafe {
-                FFMS_WriteIndex(temporary_cstr.as_ptr(), idx, std::ptr::addr_of_mut!(err))
-            };
+            err = empty_error_info(&mut err_buffer);
+            let write_result =
+                unsafe { FFMS_WriteIndex(temporary_cstr.as_ptr(), idx, std::ptr::addr_of_mut!(err)) };
             if write_result != 0 {
                 let error_msg = get_error_message(err);
                 let _ = std::fs::remove_file(&temporary_path);
                 unsafe { FFMS_DestroyIndex(idx) };
-                free_error_info(&mut err);
                 return Err(DecoderError::FileReadError { cause: error_msg });
             }
             if let Err(error) = std::fs::rename(&temporary_path, &idx_path) {
                 let _ = std::fs::remove_file(&temporary_path);
                 if !idx_path.exists() {
                     unsafe { FFMS_DestroyIndex(idx) };
-                    free_error_info(&mut err);
                     return Err(DecoderError::FileReadError {
                         cause: error.to_string(),
                     });
@@ -330,9 +269,19 @@ impl Ffms2Decoder {
         };
 
         // SAFETY: verified `idx` is not null
-        let track = unsafe { FFMS_GetFirstIndexedTrackOfType(idx, 0, std::ptr::addr_of_mut!(err)) };
+        let track = unsafe {
+            let track_index = track_index.map_or_else(
+                || FFMS_GetFirstIndexedTrackOfType(idx, 0, std::ptr::addr_of_mut!(err)),
+                |index| index as i32,
+            );
 
-        free_error_info(&mut err);
+            let track = FFMS_GetTrackFromIndex(idx, track_index);
+            if FFMS_GetTrackType(track) != (FFMS_TrackType::FFMS_TYPE_VIDEO as i32) {
+                return Err(DecoderError::NoVideoStream);
+            }
+
+            track_index
+        };
 
         Ok(FfmsIndex {
             path: input.to_string_lossy().to_string(),
@@ -345,7 +294,8 @@ impl Ffms2Decoder {
     unsafe fn get_video_details(video: *mut FFMS_VideoSource) -> Result<VideoDetails, DecoderError> {
         // SAFETY: caller must verify that `video` is not null
         unsafe {
-            let mut err = std::mem::zeroed::<FFMS_ErrorInfo>();
+            let mut err_buffer: [c_char; ERR_BUFFER_SIZE] = [0; ERR_BUFFER_SIZE];
+            let mut err = empty_error_info(&mut err_buffer);
 
             let props = FFMS_GetVideoProperties(video);
             let frame = FFMS_GetFrame(video, 0, std::ptr::addr_of_mut!(err));
@@ -393,8 +343,8 @@ impl Ffms2Decoder {
         {
             return Err(DecoderError::EndOfFile);
         }
-        // SAFETY: we free `err` on all branches below
-        let mut err = unsafe { empty_error_info() };
+        let mut err_buffer: [c_char; ERR_BUFFER_SIZE] = [0; ERR_BUFFER_SIZE];
+        let mut err = empty_error_info(&mut err_buffer);
         // SAFETY: `self.video_source` cannot be null
         let raw_frame = unsafe {
             FFMS_GetFrame(
@@ -405,41 +355,12 @@ impl Ffms2Decoder {
         };
         if raw_frame.is_null() {
             let error_msg = get_error_message(err);
-            free_error_info(&mut err);
             return Err(DecoderError::Ffms2InternalError {
                 cause: format!("Failed to read frame: {error_msg}"),
             });
         }
-        free_error_info(&mut err);
 
-        let width = self.video_details.width;
-        let height = self.video_details.height;
-        let bit_depth = self.video_details.bit_depth;
-        let chroma_sampling = self.video_details.chroma_sampling;
-        let mut frame: Frame<T> = FrameBuilder::new(
-            NonZeroUsize::new(width).ok_or_else(|| DecoderError::GenericDecodeError {
-                cause: "Zero-width resolution is not supported".to_string(),
-            })?,
-            NonZeroUsize::new(height).ok_or_else(|| DecoderError::GenericDecodeError {
-                cause: "Zero-height resolution is not supported".to_string(),
-            })?,
-            if luma_only {
-                ChromaSubsampling::Monochrome
-            } else {
-                chroma_sampling
-            },
-            NonZeroU8::new(bit_depth as u8).ok_or_else(|| DecoderError::GenericDecodeError {
-                cause: "Zero-bit-depth is not supported".to_string(),
-            })?,
-        )
-        .luma_padding_bottom(LUMA_PADDING)
-        .luma_padding_top(LUMA_PADDING)
-        .luma_padding_left(LUMA_PADDING)
-        .luma_padding_right(LUMA_PADDING)
-        .build()
-        .map_err(|e| DecoderError::GenericDecodeError {
-            cause: format!("Failed to build frame struct: {e}"),
-        })?;
+        let mut frame: Frame<T> = new_padded_frame(&self.video_details, luma_only)?;
 
         let chroma_height = self.video_details.height
             / self
@@ -454,8 +375,7 @@ impl Ffms2Decoder {
                     (*raw_frame).Data[0],
                     (*raw_frame).Linesize[0] as usize * self.video_details.height,
                 ),
-                NonZeroUsize::new((*raw_frame).Linesize[0] as usize)
-                    .expect("zero stride should be impossible"),
+                (*raw_frame).Linesize[0] as usize,
             )
         }
         .map_err(|e| DecoderError::GenericDecodeError {
@@ -469,8 +389,7 @@ impl Ffms2Decoder {
                         (*raw_frame).Data[1],
                         (*raw_frame).Linesize[1] as usize * chroma_height,
                     ),
-                    NonZeroUsize::new((*raw_frame).Linesize[1] as usize)
-                        .expect("zero stride should be impossible"),
+                    (*raw_frame).Linesize[1] as usize,
                 )
             }
             .map_err(|e| DecoderError::GenericDecodeError {
@@ -485,8 +404,7 @@ impl Ffms2Decoder {
                         (*raw_frame).Data[2],
                         (*raw_frame).Linesize[2] as usize * chroma_height,
                     ),
-                    NonZeroUsize::new((*raw_frame).Linesize[2] as usize)
-                        .expect("zero stride should be impossible"),
+                    (*raw_frame).Linesize[2] as usize,
                 )
             }
             .map_err(|e| DecoderError::GenericDecodeError {
@@ -521,7 +439,8 @@ impl Ffms2Decoder {
             });
         }
         let bytes = if self.video_details.bit_depth > 8 { 2 } else { 1 };
-        let mut err = unsafe { empty_error_info() };
+        let mut err_buffer: [c_char; ERR_BUFFER_SIZE] = [0; ERR_BUFFER_SIZE];
+        let mut err = empty_error_info(&mut err_buffer);
         let raw_frame = unsafe {
             FFMS_GetFrame(
                 self.video_source,
@@ -531,12 +450,10 @@ impl Ffms2Decoder {
         };
         if raw_frame.is_null() {
             let error_msg = get_error_message(err);
-            free_error_info(&mut err);
             return Err(DecoderError::Ffms2InternalError {
                 cause: format!("Failed to read frame: {error_msg}"),
             });
         }
-        free_error_info(&mut err);
 
         // SAFETY: we assume that the values provided by FFMS2 are correct
         unsafe {
@@ -614,11 +531,7 @@ fn copy_packed_plane(
         // SAFETY: the caller verified the FFMS2 pointers and strides, and
         // both regions hold this row.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                src.add(index * stride),
-                dst.as_mut_ptr().add(index * row),
-                row,
-            );
+            std::ptr::copy_nonoverlapping(src.add(index * stride), dst.as_mut_ptr().add(index * row), row);
         }
     }
     Ok(())
@@ -628,6 +541,10 @@ fn copy_packed_plane(
 // These are used to interpret FFMS_Frame::ConvertedPixelFormat values
 // Using `FFMS_GetPixFmt` ensures we have the correct value regardless
 // of the ffmpeg version we are linked against
+//
+// These are stored in `LazyLock`s because they can be frequently called,
+// which should be a fast operation, but because it is an FFI,
+// would always invoke an expensive `call` operation`.
 static AV_PIX_FMT_YUV420P: LazyLock<i32> = LazyLock::new(|| {
     // SAFETY: FFI call with a const C string
     unsafe { FFMS_GetPixFmt(c"yuv420p".as_ptr().cast()) }
@@ -721,30 +638,30 @@ fn pixel_format_to_video_info(pix_fmt: i32) -> Result<(usize, ChromaSubsampling)
         // 10-bit formats
         x if x == *AV_PIX_FMT_YUV420P10LE || x == *AV_PIX_FMT_YUV420P10BE => {
             Ok((10, ChromaSubsampling::Yuv420))
-        },
+        }
         x if x == *AV_PIX_FMT_YUV422P10LE || x == *AV_PIX_FMT_YUV422P10BE => {
             Ok((10, ChromaSubsampling::Yuv422))
-        },
+        }
         x if x == *AV_PIX_FMT_YUV444P10LE || x == *AV_PIX_FMT_YUV444P10BE => {
             Ok((10, ChromaSubsampling::Yuv444))
-        },
+        }
         x if x == *AV_PIX_FMT_GRAY10LE || x == *AV_PIX_FMT_GRAY10BE => {
             Ok((10, ChromaSubsampling::Monochrome))
-        },
+        }
 
         // 12-bit formats
         x if x == *AV_PIX_FMT_YUV420P12LE || x == *AV_PIX_FMT_YUV420P12BE => {
             Ok((12, ChromaSubsampling::Yuv420))
-        },
+        }
         x if x == *AV_PIX_FMT_YUV422P12LE || x == *AV_PIX_FMT_YUV422P12BE => {
             Ok((12, ChromaSubsampling::Yuv422))
-        },
+        }
         x if x == *AV_PIX_FMT_YUV444P12LE || x == *AV_PIX_FMT_YUV444P12BE => {
             Ok((12, ChromaSubsampling::Yuv444))
-        },
+        }
         x if x == *AV_PIX_FMT_GRAY12LE || x == *AV_PIX_FMT_GRAY12BE => {
             Ok((12, ChromaSubsampling::Monochrome))
-        },
+        }
 
         _ => Err(DecoderError::UnsupportedFormat {
             fmt: format!("Unsupported pixel format: {}", pix_fmt),
@@ -779,58 +696,50 @@ fn video_info_to_pixel_format(
             return Err(DecoderError::UnsupportedFormat {
                 fmt: "Unsupported bit depth and subsampling combination".to_string(),
             });
-        },
+        }
     })
 }
 
 const ERR_BUFFER_SIZE: usize = 1024;
 
-/// Creates a new `FFMS_ErrorInfo` struct with allocated buffer
-///
-/// # Returns
-/// A new `FFMS_ErrorInfo` struct with a 1024-byte buffer allocated
-///
-/// # Safety
-/// The caller is responsible for freeing the allocated buffer when done
-unsafe fn empty_error_info() -> FFMS_ErrorInfo {
-    // SAFETY: we fill the required buffer before returning
-    let mut err: FFMS_ErrorInfo = unsafe { std::mem::zeroed() };
-    // Allocate 1024 bytes for the error buffer
-    let buffer = vec![0u8; ERR_BUFFER_SIZE];
-    let buffer_ptr = buffer.as_ptr() as *mut c_char;
-    #[expect(
-        clippy::mem_forget,
-        reason = "intentionally avoid drop here, must be freed by caller"
-    )]
-    std::mem::forget(buffer);
-    err.Buffer = buffer_ptr;
-    err.BufferSize = ERR_BUFFER_SIZE as i32;
-    err
+/// Builds an `FFMS_ErrorInfo` that writes into the caller-owned stack buffer.
+fn empty_error_info(buffer: &mut [c_char; ERR_BUFFER_SIZE]) -> FFMS_ErrorInfo {
+    FFMS_ErrorInfo {
+        ErrorType: 0,
+        SubType: 0,
+        BufferSize: ERR_BUFFER_SIZE as i32,
+        Buffer: buffer.as_mut_ptr(),
+    }
 }
 
-/// Extracts error message from `FFMS_ErrorInfo` struct
+/// Extracts the error message from an `FFMS_ErrorInfo` struct.
 ///
 /// # Safety
-/// The `FFMS_ErrorInfo` struct must be properly initialized by an FFMS2 function call
+/// `err` must have been populated by an FFMS2 function call while its buffer is still alive.
 fn get_error_message(err: FFMS_ErrorInfo) -> String {
     if err.Buffer.is_null() {
         return "Unknown error".to_string();
     }
 
-    // SAFETY: we validated that buffer is not null
+    // SAFETY: FFMS2 writes a nul-terminated C string into the live error buffer.
     unsafe { std::ffi::CStr::from_ptr(err.Buffer) }
         .to_string_lossy()
         .into_owned()
 }
 
-/// Frees the buffer allocated by `empty_error_info`
-///
-/// # Safety
-/// The buffer must be a valid pointer returned by `empty_error_info`
-fn free_error_info(err: &mut FFMS_ErrorInfo) {
-    if !err.Buffer.is_null() {
-        // SAFETY: we validated that buffer is not null
-        let _ = unsafe { Box::from_raw(err.Buffer as *mut [u8; ERR_BUFFER_SIZE]) };
-        err.Buffer = std::ptr::null_mut();
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_error_info_points_to_caller_owned_buffer() {
+        let mut buffer: [c_char; ERR_BUFFER_SIZE] = [0; ERR_BUFFER_SIZE];
+
+        let err = empty_error_info(&mut buffer);
+
+        assert_eq!(err.ErrorType, 0);
+        assert_eq!(err.SubType, 0);
+        assert_eq!(err.BufferSize, ERR_BUFFER_SIZE as i32);
+        assert_eq!(err.Buffer, buffer.as_mut_ptr());
     }
 }

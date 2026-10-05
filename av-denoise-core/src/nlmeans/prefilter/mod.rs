@@ -1,8 +1,8 @@
+use crate::runtime::{ComputeClient, Runtime};
 mod bilateral;
 
 pub use bilateral::bilateral_radius;
 pub(crate) use bilateral::inv_two_sigma_sq;
-use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 /// How the reference image for each frame is produced.
@@ -103,7 +103,7 @@ pub fn parse_prefilter(s: &str) -> Result<PrefilterMode, anyhow::Error> {
     }
 
     anyhow::bail!(
-        "unknown prefilter '{s}', expected `none`, `nlm[:<strength_scale>]`, or `bilateral:<sigma_s>,<sigma_r>`"
+        "unknown prefilter '{s}', expected `none`, `nlm[:<strength_scale]>`, or `bilateral:<sigma_s>,<sigma_r>`"
     )
 }
 
@@ -139,6 +139,6 @@ pub(crate) fn run_prefilter<R: Runtime>(
         PrefilterMode::NlmSpatial { .. } => Ok(()),
         PrefilterMode::Bilateral { sigma_s, sigma_r } => {
             bilateral::run_bilateral::<R>(client, ctx, sigma_s, sigma_r)
-        },
+        }
     }
 }

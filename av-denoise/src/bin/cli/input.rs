@@ -18,14 +18,14 @@ pub enum InputSource {
 impl InputSource {
     /// Opens the stream this source names.
     ///
-    /// Only the piped variants are readable here. A path goes through
-    /// the file pipeline, which opens it with ffms2 instead.
+    /// Only the piped variants are readable here. A path is opened
+    /// with ffms2 instead.
     pub fn open_reader(&self) -> Result<Box<dyn Read>, anyhow::Error> {
         match self {
             InputSource::Stdin => Ok(Box::new(std::io::stdin().lock())),
             InputSource::Fd(fd) => open_fd(*fd),
             InputSource::File(path) => anyhow::bail!(
-                "`{}` is a file path and is read through the file pipeline, not as a stream",
+                "`{}` is a file path and is opened with ffms2, not read as a stream",
                 path.display(),
             ),
         }

@@ -7,14 +7,14 @@ use av_decoders::Decoder;
 use av_denoise_core::{FrameLayout, PlaneOptions};
 
 use crate::budget::{FramePermits, temporal_radius};
-use crate::pool::SharedPools;
-use crate::threads::release_affinity;
-use crate::{CreationGuard, SceneLayout};
 use crate::dispatch::{Staging, dispatch_frames};
+use crate::pool::SharedPools;
 use crate::source::{OpenedSource, SourceIndex};
+use crate::threads::release_affinity;
 use crate::warm::{create_denoiser, warm_resident};
 use crate::window::{Window, WindowJob};
 use crate::worker::{Resident, WorkerConfig, spawn_workers};
+use crate::{CreationGuard, SceneLayout};
 
 /// The decode, denoise and budget settings every window of one source
 /// runs with.
@@ -44,7 +44,13 @@ impl Pipeline {
         }
 
         let frame_bytes = layout.luma_bytes() + 2 * layout.chroma_bytes();
-        let permits = FramePermits::checked(frame_budget, frame_bytes, workers, temporal_radius(planes.mode), streams)?;
+        let permits = FramePermits::checked(
+            frame_budget,
+            frame_bytes,
+            workers,
+            temporal_radius(planes.mode),
+            streams,
+        )?;
 
         tracing::info!(
             permits = permits.count(),
@@ -93,7 +99,11 @@ impl Pipeline {
         Ok(decoder.as_mut().expect("the decoder was opened above"))
     }
 
-    pub(crate) fn warmed_resident(&self, layout: FrameLayout, cancel: &AtomicBool) -> Result<Resident, anyhow::Error> {
+    pub(crate) fn warmed_resident(
+        &self,
+        layout: FrameLayout,
+        cancel: &AtomicBool,
+    ) -> Result<Resident, anyhow::Error> {
         let mut resident = self.guard.run(|| create_denoiser(&self.planes, layout))?;
         warm_resident(&mut resident, layout, cancel)?;
         Ok(resident)
@@ -161,6 +171,7 @@ impl Pipeline {
             abort: &job.abort,
             guard: &self.guard,
             pools: &job.pools,
+            grain: &job.grain,
         };
         let (job_tx, worker_handles) = spawn_workers(&config, std::mem::take(residents));
 
@@ -191,11 +202,14 @@ impl Pipeline {
                 Ok(Err(error)) => {
                     failure.get_or_insert(error);
                     None
-                },
+                }
                 Err(panic) => {
-                    failure.get_or_insert(anyhow::anyhow!("worker panicked: {}", panic_message(panic.as_ref())));
+                    failure.get_or_insert(anyhow::anyhow!(
+                        "worker panicked: {}",
+                        panic_message(panic.as_ref())
+                    ));
                     None
-                },
+                }
             };
             residents.push(resident);
         }
@@ -225,7 +239,15 @@ pub fn denoise_scenes(
     cancel: Arc<AtomicBool>,
 ) -> Result<Window, anyhow::Error> {
     let index = SourceIndex::open(&source)?;
-    let pipeline = Pipeline::new(planes, index, workers, scenes.layout, frame_budget, 1, CreationGuard::default())?;
+    let pipeline = Pipeline::new(
+        planes,
+        index,
+        workers,
+        scenes.layout,
+        frame_budget,
+        1,
+        CreationGuard::default(),
+    )?;
     let (window, job, done) = Window::open(
         pipeline.output_layout(scenes.layout),
         Arc::new(scenes),

@@ -1,11 +1,7 @@
+use std::path::PathBuf;
+
 use av_denoise::{
-    Algorithm,
-    ChannelIntent,
-    DenoisingMode,
-    Depth,
-    Nl4dOptions,
-    PlaneOptions,
-    nl4d_spatial_radius_for,
+    Algorithm, ChannelIntent, DenoisingMode, Depth, Nl4dOptions, PlaneOptions, nl4d_spatial_radius_for,
     nl4d_temporal_radius_for,
 };
 
@@ -98,46 +94,6 @@ pub struct Nl4dArgs {
     #[arg(long)]
     pub lambda_ht_scale: Option<f32>,
 
-    /// How much a poorly matched neighbour patch is distrusted.
-    ///
-    /// A patch matched in a neighbour frame is treated as a noisier view
-    /// of the same content, as noisy as its own match residual says, and
-    /// this scales how much noisier. `1.0` (the library default) is the
-    /// shipped calibration. `0` matches `--no-confidence-variance`.
-    ///
-    /// The variance grows with the square of this, so `2` distrusts a
-    /// bad match four times as much. The effect saturates. It saturates
-    /// sooner the worse the patch matched, because the variance the
-    /// mechanism derives is capped at 64 times the channel's own
-    /// variance, and values above `16` are rejected because nothing up
-    /// there can change a pixel.
-    ///
-    /// Setting this applies one value to both planes, unless
-    /// `--luma-mismatch-scale` or `--chroma-mismatch-scale` overrides
-    /// it.
-    #[arg(long)]
-    pub mismatch_scale: Option<f32>,
-
-    /// `--mismatch-scale` override for the brightness plane only.
-    ///
-    /// Falls back to `--mismatch-scale`, or to the library default, when
-    /// not set.
-    ///
-    /// Ignored when luma is not being denoised, or when `--channel-mode
-    /// yuv` is used.
-    #[arg(long)]
-    pub luma_mismatch_scale: Option<f32>,
-
-    /// `--mismatch-scale` override for the colour planes only.
-    ///
-    /// Falls back to `--mismatch-scale`, or to the library default, when
-    /// not set.
-    ///
-    /// Ignored when chroma is not being denoised, or when
-    /// `--channel-mode yuv` is used.
-    #[arg(long)]
-    pub chroma_mismatch_scale: Option<f32>,
-
     /// How noisy the source is. Leave it unset for almost all uses.
     ///
     /// The noise level is measured automatically per scene when this
@@ -174,8 +130,9 @@ pub struct Nl4dArgs {
     /// skipped rather than scored.
     ///
     /// Between `0` and `1`, not including `1`. Library default is
-    /// 0.05. Only affects how much compute a submit spends, never
-    /// which candidates are admitted once they are scored.
+    /// 0.05. A block below the floor is never scored, and a volume
+    /// left short of frames by the skip makes its group filter from
+    /// the centre frame alone.
     #[arg(long)]
     pub c_min: Option<f32>,
 
@@ -199,14 +156,47 @@ pub struct Nl4dArgs {
     #[arg(long)]
     pub field_lambda: Option<f32>,
 
-    /// Stops a poorly matched patch from being trusted less than a well
-    /// matched one.
-    ///
-    /// On by default, the shrinkage treats a patch matched with a large
-    /// match distance as a noisier observation. This flag gives every
-    /// patch the same noise estimate instead.
+    /// Turns off the luma noise map, which scales the threshold by how noisy each brightness
+    /// level is.
     #[arg(long)]
-    pub no_confidence_variance: bool,
+    pub no_noise_map: bool,
+
+    /// Turns off the pooled threshold, which judges each frequency together with its neighbours
+    /// so faint texture survives.
+    ///
+    /// With this flag and `--flat-boost 1.5`, the output matches earlier releases.
+    #[arg(long)]
+    pub no_pooled_threshold: bool,
+
+    /// Filters flat, grainy areas harder, as a multiplier on the luma threshold.
+    ///
+    /// Between `1` and `3`. Library default is 1.75. `1` turns it off. Has no effect with
+    /// `--no-noise-map`.
+    #[arg(long)]
+    pub flat_boost: Option<f32>,
+
+    /// Filters flat, grainy areas of the colour planes harder, as a multiplier on the chroma
+    /// threshold.
+    ///
+    /// Between `1` and `3`. Library default is 1.5. `1` turns it off. Has no effect with
+    /// `--no-noise-map`.
+    #[arg(long)]
+    pub chroma_flat_boost: Option<f32>,
+
+    /// Filters textured dark areas more gently, as a multiplier on the luma threshold.
+    ///
+    /// Between `0.1` and `1`. Library default is 0.65. It applies in full at or below luma 128 of
+    /// 255 and fades out by 160. `1` turns it off. Has no effect with `--no-noise-map`.
+    #[arg(long)]
+    pub shadow_soften: Option<f32>,
+
+    /// Stops flat areas whose surroundings line up like faint lines or edges from counting as flat.
+    ///
+    /// Between `0` and `1`. Library default is 0.21. Lower keeps more faint texture, higher
+    /// filters more areas as flat. `1` turns it off. Luma only. Has no effect with
+    /// `--no-noise-map`.
+    #[arg(long)]
+    pub flat_texture_cut: Option<f32>,
 
     /// Estimates noise from a local window instead of a temporal EMA
     /// over stream history.
@@ -217,6 +207,16 @@ pub struct Nl4dArgs {
     /// assumes.
     #[arg(long, hide = true)]
     pub windowed_noise_estimation: bool,
+
+    /// Writes an AV1 film grain table for the grain this run removes. Unstable.
+    ///
+    /// The flag and its output may change between releases. The table describes the source's
+    /// luma grain, minus what the output still keeps. Add it to an AV1 encode with
+    /// `grav1synth apply`. SVT-AV1's `--fgs-table` applies only the table's first entry, so it
+    /// suits a single-scene table only. Its timestamps follow this run's output frames from 0,
+    /// so it suits constant frame rate sources and encodes of this output.
+    #[arg(long, value_name = "PATH")]
+    pub unstable_export_av1_fgs: Option<PathBuf>,
 
     #[command(flatten)]
     pub motion: MotionArgs,
@@ -250,6 +250,18 @@ impl Nl4dArgs {
     pub fn build_options(&self, globals: &Args) -> Result<RunOptions, anyhow::Error> {
         let defaults = Nl4dOptions::default();
         let intent = resolve_channel_intent(&globals.channel_mode)?;
+
+        let exports_grain = self.unstable_export_av1_fgs.is_some();
+        if exports_grain && intent == ChannelIntent::Chroma {
+            anyhow::bail!("--unstable-export-av1-fgs measures luma grain, so it needs luma to be denoised");
+        }
+
+        if exports_grain {
+            tracing::warn!(
+                "--unstable-export-av1-fgs is unstable, its output and the flag itself may change \
+                 between releases"
+            );
+        }
 
         // Check the raw 8-bit value here so an out-of-range `--sigma`
         // reports the number the user typed. The library re-validates
@@ -299,8 +311,6 @@ impl Nl4dArgs {
                     lambda_ht: self.lambda_ht,
                     lambda_ht_scale: self.lambda_ht_scale.unwrap_or(defaults.lambda_ht_scale),
                     c_min: self.c_min.unwrap_or(defaults.c_min),
-                    mismatch_scale: self.mismatch_scale.unwrap_or(defaults.mismatch_scale),
-                    confidence_variance: !self.no_confidence_variance,
                     kaiser_beta: self.kaiser_beta.unwrap_or(defaults.kaiser_beta),
                     field_lambda: self.field_lambda.unwrap_or(defaults.field_lambda),
                     // The CLI keeps the temporal EMA every calibrated
@@ -309,16 +319,22 @@ impl Nl4dArgs {
                     // determinism. `--windowed-noise-estimation` exists
                     // to measure the difference on real footage.
                     windowed_noise_estimation: self.windowed_noise_estimation,
+                    noise_map: defaults.noise_map && !self.no_noise_map,
+                    flat_boost: self.flat_boost.unwrap_or(defaults.flat_boost),
+                    chroma_flat_boost: self.chroma_flat_boost.unwrap_or(defaults.chroma_flat_boost),
+                    shadow_soften: self.shadow_soften.unwrap_or(defaults.shadow_soften),
+                    flat_texture_cut: self.flat_texture_cut.unwrap_or(defaults.flat_texture_cut),
+                    pooled_threshold: defaults.pooled_threshold && !self.no_pooled_threshold,
+                    grain_export: exports_grain,
                 }),
                 // nl4d has no NLM weighting pass for a strength to apply to.
                 luma_strength: None,
                 chroma_strength: None,
                 luma_lambda_ht: self.luma_lambda_ht,
                 chroma_lambda_ht: self.chroma_lambda_ht,
-                luma_mismatch_scale: self.luma_mismatch_scale,
-                chroma_mismatch_scale: self.chroma_mismatch_scale,
             },
             progress: globals.progress,
+            grain_table: self.unstable_export_av1_fgs.clone(),
         })
     }
 
@@ -335,24 +351,6 @@ impl Nl4dArgs {
             ChannelIntent::YuvFused if self.luma_lambda_ht.is_some() || self.chroma_lambda_ht.is_some() => {
                 tracing::warn!(
                     "--luma-lambda-ht and --chroma-lambda-ht are ignored when --channel-mode yuv is used"
-                );
-            },
-            _ => {},
-        }
-
-        match intent {
-            ChannelIntent::Luma if self.chroma_mismatch_scale.is_some() => {
-                tracing::warn!("--chroma-mismatch-scale is ignored when chroma is not being denoised");
-            },
-            ChannelIntent::Chroma if self.luma_mismatch_scale.is_some() => {
-                tracing::warn!("--luma-mismatch-scale is ignored when luma is not being denoised");
-            },
-            ChannelIntent::YuvFused
-                if self.luma_mismatch_scale.is_some() || self.chroma_mismatch_scale.is_some() =>
-            {
-                tracing::warn!(
-                    "--luma-mismatch-scale and --chroma-mismatch-scale are ignored when \
-                     --channel-mode yuv is used"
                 );
             },
             _ => {},

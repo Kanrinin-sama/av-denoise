@@ -1,3 +1,4 @@
+use crate::runtime::{ComputeClient, Runtime};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 

@@ -59,7 +59,7 @@ pub(crate) fn safe_reciprocal(denom: f32, floor: f32) -> f32 {
 /// with more threads than that call this once per thread anyway. The
 /// caller must call `sync_cube()` before reading `basis`.
 #[cube]
-pub(crate) fn fill_dct8_basis(basis: &mut SharedMemory<f32>, thread_id: u32) {
+pub(crate) fn fill_dct8_basis(basis: &mut Shared<[f32]>, thread_id: u32) {
     if thread_id < PATCH_AREA {
         let i = thread_id % PATCH_SIZE;
         let j = thread_id / PATCH_SIZE;
@@ -85,7 +85,7 @@ pub(crate) fn fill_dct8_basis(basis: &mut SharedMemory<f32>, thread_id: u32) {
 /// A lane owns every value it touches, so no barrier is needed here or
 /// around the call.
 #[cube]
-pub(crate) fn dct8_reg_fwd(basis: &SharedMemory<f32>, line: &mut Array<f32>) {
+pub(crate) fn dct8_reg_fwd(basis: &Shared<[f32]>, line: &mut Array<f32>) {
     let mut src = Array::<f32>::new(8usize);
     #[unroll]
     for i in 0..PATCH_SIZE {
@@ -109,7 +109,7 @@ pub(crate) fn dct8_reg_fwd(basis: &SharedMemory<f32>, line: &mut Array<f32>) {
 /// position `j`, and sums over `j` instead of `i`, matching
 /// [`dct8_reg_fwd`]'s calling convention otherwise.
 #[cube]
-pub(crate) fn dct8_reg_inv(basis: &SharedMemory<f32>, line: &mut Array<f32>) {
+pub(crate) fn dct8_reg_inv(basis: &Shared<[f32]>, line: &mut Array<f32>) {
     let mut src = Array::<f32>::new(8usize);
     #[unroll]
     for j in 0..PATCH_SIZE {

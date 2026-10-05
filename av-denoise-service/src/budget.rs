@@ -133,7 +133,10 @@ impl WindowPermits<'_> {
         let own = self.own.acquire(closed, cancel)?;
         let shared = self.shared.acquire(closed, cancel)?;
 
-        Ok(Permit { _own: own, _shared: shared })
+        Ok(Permit {
+            _own: own,
+            _shared: shared,
+        })
     }
 }
 

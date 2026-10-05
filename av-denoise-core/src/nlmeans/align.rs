@@ -1,4 +1,4 @@
-use cubecl::prelude::*;
+use crate::runtime::{ComputeClient, Runtime};
 
 /// Byte alignment every buffer binding must start on, taken from the
 /// runtime the denoiser is running against.

@@ -1,3 +1,4 @@
+use crate::runtime::{ComputeClient, Runtime};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
@@ -40,14 +41,14 @@ pub(crate) fn run_compensate<R: Runtime>(
         .offset_start(mv_field_byte_offset(mc, neighbour_idx));
 
     unsafe {
-        nlm_mc_warp::launch_unchecked::<R>(
+        nlm_mc_warp::launch_unchecked(
             client,
             grid,
             dim,
             stored_ch as usize,
-            ArrayArg::from_raw_parts(src.clone(), total_pixels),
-            ArrayArg::from_raw_parts(dst.clone(), total_pixels),
-            ArrayArg::from_raw_parts(mv_slice, mv_slice_len),
+            BufferArg::from_raw_parts(src.clone(), total_pixels),
+            BufferArg::from_raw_parts(dst.clone(), total_pixels),
+            BufferArg::from_raw_parts(mv_slice, mv_slice_len),
             neighbour_slot,
             neighbour_slot,
             mc.step,

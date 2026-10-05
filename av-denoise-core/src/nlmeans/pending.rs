@@ -1,10 +1,10 @@
+use crate::runtime::{ComputeClient, Runtime};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
 use cubecl::bytes::Bytes;
-use cubecl::client::ComputeClient;
 use cubecl::prelude::*;
 use cubecl::server::{Handle, ServerError};
 
@@ -145,7 +145,7 @@ impl<R: Runtime> Pending<R> {
                     &mut out,
                 );
                 Ok(TryWait::Ready(out))
-            },
+            }
             Poll::Ready(Err(e)) => Err(e.into()),
             Poll::Pending => Ok(TryWait::NotReady(self)),
         }
@@ -182,7 +182,7 @@ pub(super) fn empty_output(pixels: usize, channels: u32, format: OutputFormat) -
         OutputFormat::F32 => FrameOutput::F32(Vec::with_capacity(samples)),
         OutputFormat::Wire { depth, .. } => {
             FrameOutput::Wire(Vec::with_capacity(samples * depth.bytes_per_sample()))
-        },
+        }
     }
 }
 
@@ -204,20 +204,20 @@ fn unpack_into(
     match (format, dst) {
         (OutputFormat::F32, FrameOutput::F32(out)) => {
             unpack_bytes_into(bytes, pixels, channels, stored_ch, out);
-        },
+        }
         (OutputFormat::Wire { depth, .. }, FrameOutput::Wire(out)) => {
             unpack_wire_into(bytes, samples * depth.bytes_per_sample(), out);
-        },
+        }
         (OutputFormat::F32, dst) => {
             let mut out = Vec::new();
             unpack_bytes_into(bytes, pixels, channels, stored_ch, &mut out);
             *dst = FrameOutput::F32(out);
-        },
+        }
         (OutputFormat::Wire { depth, .. }, dst) => {
             let mut out = Vec::new();
             unpack_wire_into(bytes, samples * depth.bytes_per_sample(), &mut out);
             *dst = FrameOutput::Wire(out);
-        },
+        }
     }
 }
 
@@ -259,10 +259,10 @@ pub(crate) fn start_readback<R: Runtime>(
         (OutputFormat::Wire { depth, source_depth }, Some(dst)) => {
             pack_wire(client, &handle, dst, &shape, depth, source_depth, fruit_dither);
             dst.clone()
-        },
+        }
         (OutputFormat::Wire { .. }, None) => {
             unreachable!("a wire-mode denoiser allocates its wire buffers at construction")
-        },
+        }
     };
 
     // The future is wrapped in an `async move` that owns a cloned
@@ -302,13 +302,13 @@ fn pack_wire<R: Runtime>(
 
     unsafe {
         let dither = fruit_dither.unwrap_or(src);
-        gpu_pack_wire::launch_unchecked::<R>(
+        gpu_pack_wire::launch_unchecked(
             client,
             CubeCount::new_1d(grid),
             CubeDim::new_1d(BLOCK_1D),
-            ArrayArg::from_raw_parts(src.clone(), shape.pixels * shape.stored_ch as usize),
-            ArrayArg::from_raw_parts(dst.clone(), words as usize),
-            ArrayArg::from_raw_parts(
+            BufferArg::from_raw_parts(src.clone(), shape.pixels * shape.stored_ch as usize),
+            BufferArg::from_raw_parts(dst.clone(), words as usize),
+            BufferArg::from_raw_parts(
                 dither.clone(),
                 if fruit_dither.is_some() {
                     4096

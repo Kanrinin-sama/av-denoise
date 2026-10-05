@@ -1,25 +1,15 @@
+use crate::runtime::{ComputeClient, Runtime};
 use std::collections::VecDeque;
 
-use cubecl::Runtime;
-use cubecl::prelude::ComputeClient;
-use cubecl::stream_id::StreamId;
+use crate::runtime::StreamId;
 
 use crate::accelerate::Accelerator;
 use crate::device::Device;
+use crate::nl4d::grain::GrainChunk;
 use crate::nl4d::{Nl4dDenoiser, Nl4dParams};
 use crate::nlmeans::{
-    ChannelMode,
-    Depth,
-    HqParams,
-    MotionCompensationMode,
-    MotionSearch,
-    NlmDenoiser,
-    NlmParams,
-    Pending,
-    PrefilterMode,
-    TryWait,
-    hq_default_strength,
-    validate_dimensions,
+    ChannelMode, Depth, HqParams, MotionCompensationMode, MotionSearch, NlmDenoiser, NlmParams, Pending,
+    PrefilterMode, TryWait, hq_default_strength, validate_dimensions,
 };
 use crate::sniff::sniff_best_accelerator;
 
@@ -228,21 +218,11 @@ pub struct Nl4dOptions {
     /// be finite and in `[0.1, 10.0]`.
     pub lambda_ht_scale: f32,
     /// The confidence floor below which a whole neighbour block is
-    /// skipped rather than scored, in `[0, 1)`. Defaults to 0.05. Only
-    /// affects how much compute a submit spends, never which candidates
-    /// are admitted once they are scored.
+    /// skipped rather than scored, in `[0, 1)`. Defaults to 0.05. A
+    /// block below the floor is never scored, and a volume left short
+    /// of frames by the skip makes its group filter from the centre
+    /// frame alone.
     pub c_min: f32,
-    /// A multiplier on the mismatch variance a poorly matched temporal
-    /// member carries into the hard threshold. Defaults to 1.0.
-    ///
-    /// The variance grows with the square of this. The mechanism
-    /// saturates well before the top of its accepted range, see
-    /// [`crate::nl4d::Nl4dParams::mismatch_scale`].
-    pub mismatch_scale: f32,
-    /// Whether a temporal member's mismatch variance reaches the
-    /// hard-threshold shrinkage at all. Defaults to `true`. See
-    /// [`crate::nl4d::Nl4dParams::confidence_variance`].
-    pub confidence_variance: bool,
     /// The `beta` of the Kaiser window each filtered patch is tapered
     /// with as it is aggregated. Defaults to 2.0. `0.0` is uniform
     /// aggregation. See [`crate::nl4d::Nl4dParams::kaiser_beta`].
@@ -259,6 +239,22 @@ pub struct Nl4dOptions {
     pub windowed_noise_estimation: bool,
     /// See [`crate::nl4d::Nl4dParams::field_lambda`].
     pub field_lambda: f32,
+    /// See [crate::nl4d::Nl4dParams::noise_map].
+    pub noise_map: bool,
+    /// See [crate::nl4d::Nl4dParams::flat_boost].
+    pub flat_boost: f32,
+    /// See [crate::nl4d::Nl4dParams::chroma_flat_boost].
+    pub chroma_flat_boost: f32,
+    /// See [crate::nl4d::Nl4dParams::shadow_soften].
+    pub shadow_soften: f32,
+    /// See [crate::nl4d::Nl4dParams::flat_texture_cut].
+    pub flat_texture_cut: f32,
+    /// See [crate::nl4d::Nl4dParams::pooled_threshold].
+    pub pooled_threshold: bool,
+    /// See [crate::nl4d::Nl4dParams::grain_export].
+    ///
+    /// Measured chunks stay on the GPU until drained, so callers drain after each flush.
+    pub grain_export: bool,
 }
 
 impl Default for Nl4dOptions {
@@ -278,11 +274,16 @@ impl Default for Nl4dOptions {
             lambda_ht: None,
             lambda_ht_scale: 1.0,
             c_min: defaults.c_min,
-            mismatch_scale: defaults.mismatch_scale,
-            confidence_variance: defaults.confidence_variance,
             kaiser_beta: defaults.kaiser_beta,
             windowed_noise_estimation: false,
             field_lambda: defaults.field_lambda,
+            noise_map: defaults.noise_map,
+            flat_boost: defaults.flat_boost,
+            chroma_flat_boost: defaults.chroma_flat_boost,
+            shadow_soften: defaults.shadow_soften,
+            flat_texture_cut: defaults.flat_texture_cut,
+            pooled_threshold: defaults.pooled_threshold,
+            grain_export: defaults.grain_export,
         }
     }
 }
@@ -315,8 +316,7 @@ impl Nl4dOptions {
 ///
 /// Luma and chroma values are picked by eye from a ladder of renders against real
 /// film grain, accepting more lost detail in exchange for less remaining
-/// noise on heavy grain. Separately confirmed not to over-filter near-clean
-/// animation. The reason why we're going a bit heavier on high noise is because
+/// noise on heavy grain. The reason why we're going a bit heavier on high noise is because
 /// the encoders end up reducing that detail _more_ than the denoiser does if
 /// that extra entropy remains in and overall produces a worse final image.
 ///
@@ -324,12 +324,23 @@ impl Nl4dOptions {
 /// dominated by luma" assumption [`hq_default_strength`]
 /// makes for its own Yuv case.
 ///
-/// Luma and the fused Yuv mode use 5.2, and chroma uses 3.4.
+/// Luma and the fused Yuv mode use 4.158, and chroma uses 3.234.
 pub fn nl4d_default_lambda_ht(channels: ChannelMode) -> f32 {
     match channels {
-        ChannelMode::Luma | ChannelMode::Yuv => 5.2,
-        ChannelMode::Chroma => 3.4,
+        ChannelMode::Luma | ChannelMode::Yuv => 4.158,
+        ChannelMode::Chroma => 3.234,
     }
+}
+
+/// The pooled threshold at each plane's default lambda, calibrated on real grain.
+const NL4D_POOLED_THRESHOLD: f32 = 2.42;
+
+/// The ratio of nl4d's pooled threshold to its lambda for one plane.
+///
+/// At the default lambda this gives the calibrated pooled threshold, and it scales with any
+/// other lambda.
+pub fn nl4d_pool_ratio(channels: ChannelMode) -> f32 {
+    NL4D_POOLED_THRESHOLD / nl4d_default_lambda_ht(channels)
 }
 
 /// Resolves `Nl4dOptions.lambda_ht` for one plane, falling back to
@@ -451,7 +462,7 @@ pub fn nl4d_spatial_radius_for(preset: Preset) -> u32 {
         Preset::Veryfast => 6,
         Preset::Fast | Preset::Base | Preset::Slow | Preset::Veryslow => {
             Nl4dOptions::default().spatial_radius
-        },
+        }
     }
 }
 
@@ -594,6 +605,12 @@ impl<R: Runtime> Engine<R> {
         matches!(self, Self::Nl4d(_))
     }
 
+    fn mark_continuation(&mut self) {
+        if let Self::Nl4d(d) = self {
+            d.mark_continuation();
+        }
+    }
+
     fn push_frame(&mut self, frame: &[f32]) {
         match self {
             Self::Nlm(d) => d.push_frame(frame),
@@ -630,6 +647,13 @@ impl<R: Runtime> Engine<R> {
         match self {
             Self::Nlm(d) => d.reset_stream_state(),
             Self::Nl4d(d) => d.reset_stream(),
+        }
+    }
+
+    fn drain_grain_chunks(&mut self) -> Result<Vec<GrainChunk>, DenoiserError> {
+        match self {
+            Self::Nlm(_) => Ok(Vec::new()),
+            Self::Nl4d(d) => d.drain_grain_chunks(),
         }
     }
 }
@@ -671,16 +695,21 @@ fn build_engine<R: Runtime>(
                 spatial_radius: opts.spatial_radius,
                 lambda_ht,
                 c_min: opts.c_min,
-                mismatch_scale: opts.mismatch_scale,
-                confidence_variance: opts.confidence_variance,
                 kaiser_beta: opts.kaiser_beta,
                 field_lambda: opts.field_lambda,
+                noise_map: opts.noise_map,
+                flat_boost: opts.flat_boost,
+                chroma_flat_boost: opts.chroma_flat_boost,
+                shadow_soften: opts.shadow_soften,
+                flat_texture_cut: opts.flat_texture_cut,
+                pooled_threshold: opts.pooled_threshold,
+                grain_export: opts.grain_export,
             };
             let denoiser =
                 Nl4dDenoiser::with_output_format(client, nl4d_params, width, height, output_format)
                     .map_err(|e| DenoiserError::Other(anyhow::anyhow!(e)))?;
             Ok(Engine::Nl4d(Box::new(denoiser)))
-        },
+        }
         Algorithm::Nlmeans(_) | Algorithm::NlmeansHq(_) => Ok(Engine::Nlm(Box::new(
             NlmDenoiser::with_output_format(client, params, width, height, output_format),
         ))),
@@ -705,6 +734,17 @@ impl Backend {
             Self::Rocm(e) => e.is_nl4d(),
             #[cfg(any(feature = "vulkan", feature = "metal"))]
             Self::Wgpu(e) => e.is_nl4d(),
+        }
+    }
+
+    fn mark_continuation(&mut self) {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(e) => e.mark_continuation(),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(e) => e.mark_continuation(),
+            #[cfg(any(feature = "vulkan", feature = "metal"))]
+            Self::Wgpu(e) => e.mark_continuation(),
         }
     }
 }
@@ -788,6 +828,17 @@ pub struct WindowSpan {
     pub behind: usize,
     /// How many frames newer than the target the window must include.
     pub ahead: usize,
+    /// How the window is filled where it runs past a clip's ends.
+    pub edges: EdgePadding,
+}
+
+/// How a windowed algorithm fills a window that runs past a clip's ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgePadding {
+    /// Repeat the boundary frame, so every window has the same length.
+    Repeat,
+    /// Stop at the clip's ends and let the denoiser run off-centre passes there.
+    Shifted,
 }
 
 impl WindowSpan {
@@ -975,16 +1026,23 @@ impl Denoiser {
     /// `radius` more frames behind it again. So nl4d needs the target's
     /// own `radius`-wide neighbourhood doubled on both sides:
     /// `WindowSpan { behind: 2 * radius, ahead: 2 * radius }`.
+    ///
+    /// nl4d's windows stop at a clip's ends, while the NLM algorithms
+    /// repeat the boundary frame.
     pub fn window_span(&self) -> WindowSpan {
         let radius = self.temporal_radius as usize;
-        let span = if self.backend.is_nl4d() {
-            2 * radius
+        let is_nl4d = self.backend.is_nl4d();
+        let span = if is_nl4d { 2 * radius } else { radius };
+        let edges = if is_nl4d {
+            EdgePadding::Shifted
         } else {
-            radius
+            EdgePadding::Repeat
         };
+
         WindowSpan {
             behind: span,
             ahead: span,
+            edges,
         }
     }
 
@@ -1033,21 +1091,21 @@ impl Denoiser {
                 if let Some(p) = d.denoise_submit()? {
                     self.pending.push_back(BackendPending::Cuda(p));
                 }
-            },
+            }
             #[cfg(feature = "rocm")]
             Backend::Rocm(d) => {
                 d.push_frame(frame);
                 if let Some(p) = d.denoise_submit()? {
                     self.pending.push_back(BackendPending::Rocm(p));
                 }
-            },
+            }
             #[cfg(any(feature = "vulkan", feature = "metal"))]
             Backend::Wgpu(d) => {
                 d.push_frame(frame);
                 if let Some(p) = d.denoise_submit()? {
                     self.pending.push_back(BackendPending::Wgpu(p));
                 }
-            },
+            }
         }
 
         self.frames_pushed = self.frames_pushed.saturating_add(1);
@@ -1087,21 +1145,21 @@ impl Denoiser {
                 if let Some(p) = d.denoise_submit()? {
                     self.pending.push_back(BackendPending::Cuda(p));
                 }
-            },
+            }
             #[cfg(feature = "rocm")]
             Backend::Rocm(d) => {
                 d.push_frame_wire(planes, depth);
                 if let Some(p) = d.denoise_submit()? {
                     self.pending.push_back(BackendPending::Rocm(p));
                 }
-            },
+            }
             #[cfg(any(feature = "vulkan", feature = "metal"))]
             Backend::Wgpu(d) => {
                 d.push_frame_wire(planes, depth);
                 if let Some(p) = d.denoise_submit()? {
                     self.pending.push_back(BackendPending::Wgpu(p));
                 }
-            },
+            }
         }
 
         self.frames_pushed = self.frames_pushed.saturating_add(1);
@@ -1112,10 +1170,17 @@ impl Denoiser {
     /// without starting a denoise.
     ///
     /// The wire counterpart of [`Self::push_frame_priming`].
+    ///
+    /// A stream that starts with a priming push picks up mid-clip, so nl4d runs no head passes for it.
     pub fn push_frame_wire_priming(&mut self, planes: &[&[u8]], depth: Depth) -> Result<(), DenoiserError> {
         if self.poisoned {
             return Err(DenoiserError::Poisoned);
         }
+
+        if self.frames_pushed == 0 {
+            self.backend.mark_continuation();
+        }
+
         match &mut self.backend {
             #[cfg(feature = "cuda")]
             Backend::Cuda(d) => d.push_frame_wire(planes, depth),
@@ -1138,12 +1203,19 @@ impl Denoiser {
     /// window at once, rather than a strictly ordered stream, fills the
     /// window in one go and lets only the last push in it submit.
     ///
+    /// A stream that starts with a priming push picks up mid-clip, so nl4d runs no head passes for it.
+    ///
     /// A failure elsewhere poisons the denoiser, so this refuses to run
     /// until [`Self::reset_stream`] clears it.
     pub fn push_frame_priming(&mut self, frame: &[f32]) -> Result<(), DenoiserError> {
         if self.poisoned {
             return Err(DenoiserError::Poisoned);
         }
+
+        if self.frames_pushed == 0 {
+            self.backend.mark_continuation();
+        }
+
         match &mut self.backend {
             #[cfg(feature = "cuda")]
             Backend::Cuda(d) => d.push_frame(frame),
@@ -1217,7 +1289,8 @@ impl Denoiser {
         if self.poisoned {
             return Err(DenoiserError::Poisoned);
         }
-        self.recv_frame_into_inner(dst).inspect_err(|_| self.poisoned = true)
+        self.recv_frame_into_inner(dst)
+            .inspect_err(|_| self.poisoned = true)
     }
 
     fn recv_frame_into_inner(&mut self, dst: &mut FrameOutput) -> Result<bool, DenoiserError> {
@@ -1266,7 +1339,7 @@ impl Denoiser {
             Err(pending) => {
                 self.pending.push_front(pending);
                 Ok(None)
-            },
+            }
         }
     }
 
@@ -1318,6 +1391,21 @@ impl Denoiser {
 
         Ok(())
     }
+
+    /// Reads back the grain chunks measured since the last call, in frame order.
+    ///
+    /// Call it after [Self::flush]. Measured chunks stay on the GPU until drained, so callers
+    /// drain after each flush. Empty unless grain export is on.
+    pub fn drain_grain_chunks(&mut self) -> Result<Vec<GrainChunk>, DenoiserError> {
+        match &mut self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda(d) => d.drain_grain_chunks(),
+            #[cfg(feature = "rocm")]
+            Backend::Rocm(d) => d.drain_grain_chunks(),
+            #[cfg(any(feature = "vulkan", feature = "metal"))]
+            Backend::Wgpu(d) => d.drain_grain_chunks(),
+        }
+    }
 }
 
 fn build_backend(
@@ -1342,7 +1430,7 @@ fn build_backend(
                 height,
                 options.output_format,
             )?))
-        },
+        }
         #[cfg(feature = "rocm")]
         Accelerator::Rocm => {
             let dev = device.to_amd()?;
@@ -1355,7 +1443,7 @@ fn build_backend(
                 height,
                 options.output_format,
             )?))
-        },
+        }
         #[cfg(feature = "vulkan")]
         Accelerator::Vulkan => {
             let dev = device.to_wgpu()?;
@@ -1368,7 +1456,7 @@ fn build_backend(
                 height,
                 options.output_format,
             )?))
-        },
+        }
         #[cfg(feature = "metal")]
         Accelerator::Metal => {
             let dev = device.to_wgpu()?;
@@ -1381,7 +1469,7 @@ fn build_backend(
                 height,
                 options.output_format,
             )?))
-        },
+        }
         // Keeps the match exhaustive on docs.rs, where `cfg(docsrs)`
         // widens the `Accelerator` enum to include variants whose
         // backend feature is not enabled. Never reached at runtime.

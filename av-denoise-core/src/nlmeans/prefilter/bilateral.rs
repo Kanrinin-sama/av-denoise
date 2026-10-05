@@ -1,3 +1,4 @@
+use crate::runtime::{ComputeClient, Runtime};
 use cubecl::prelude::*;
 
 use super::PrefilterCtx;
@@ -44,13 +45,13 @@ pub(super) fn run_bilateral<R: Runtime>(
     let inv_two_sigma_r_sq = inv_two_sigma_sq(sigma_r);
 
     unsafe {
-        nlm_bilateral::launch_unchecked::<R>(
+        nlm_bilateral::launch_unchecked(
             client,
             CubeCount::new_2d(ctx.width.div_ceil(BLOCK_X), ctx.height.div_ceil(BLOCK_Y)),
             CubeDim::new_2d(BLOCK_X, BLOCK_Y),
             stored_ch,
-            ArrayArg::from_raw_parts(ctx.input_buf.clone(), total),
-            ArrayArg::from_raw_parts(ctx.reference_buf.clone(), total),
+            BufferArg::from_raw_parts(ctx.input_buf.clone(), total),
+            BufferArg::from_raw_parts(ctx.reference_buf.clone(), total),
             ctx.frame,
             inv_two_sigma_s_sq,
             inv_two_sigma_r_sq,

@@ -1,3 +1,4 @@
+use crate::runtime::{ComputeClient, Runtime};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
@@ -117,13 +118,13 @@ pub(crate) fn run_analyse<R: Runtime>(
         let dim = CubeDim::new_2d(8, 8);
 
         unsafe {
-            nlm_mc_block_match_coarse::launch_unchecked::<R>(
+            nlm_mc_block_match_coarse::launch_unchecked(
                 client,
                 grid,
                 dim,
-                ArrayArg::from_raw_parts(coarse_centre, level_len),
-                ArrayArg::from_raw_parts(coarse_neighbour, level_len),
-                ArrayArg::from_raw_parts(mv_slot.clone(), mv_slot_len),
+                BufferArg::from_raw_parts(coarse_centre, level_len),
+                BufferArg::from_raw_parts(coarse_neighbour, level_len),
+                BufferArg::from_raw_parts(mv_slot.clone(), mv_slot_len),
                 cw,
                 ch,
                 coarse_blksize,
@@ -166,14 +167,14 @@ pub(crate) fn run_analyse<R: Runtime>(
     let seeded = if mc.pyramid_levels > 1 { 1u32 } else { 0u32 };
 
     unsafe {
-        nlm_mc_block_match_fine::launch_unchecked::<R>(
+        nlm_mc_block_match_fine::launch_unchecked(
             client,
             grid,
             dim,
-            ArrayArg::from_raw_parts(fine_centre, level_len),
-            ArrayArg::from_raw_parts(fine_neighbour, level_len),
-            ArrayArg::from_raw_parts(mv_slot, mv_slot_len),
-            ArrayArg::from_raw_parts(conf_slot, conf_slot_len),
+            BufferArg::from_raw_parts(fine_centre, level_len),
+            BufferArg::from_raw_parts(fine_neighbour, level_len),
+            BufferArg::from_raw_parts(mv_slot, mv_slot_len),
+            BufferArg::from_raw_parts(conf_slot, conf_slot_len),
             write_confidence,
             sad_noise_floor,
             thsad,
@@ -260,14 +261,14 @@ pub(crate) fn run_seeded_refine<R: Runtime>(
     let dim = CubeDim::new_2d(8, 8);
 
     unsafe {
-        nlm_mc_block_match_fine::launch_unchecked::<R>(
+        nlm_mc_block_match_fine::launch_unchecked(
             client,
             grid,
             dim,
-            ArrayArg::from_raw_parts(fine_centre, level_len),
-            ArrayArg::from_raw_parts(fine_neighbour, level_len),
-            ArrayArg::from_raw_parts(mv_slot, mv_slot_len),
-            ArrayArg::from_raw_parts(conf_slot, conf_slot_len),
+            BufferArg::from_raw_parts(fine_centre, level_len),
+            BufferArg::from_raw_parts(fine_neighbour, level_len),
+            BufferArg::from_raw_parts(mv_slot, mv_slot_len),
+            BufferArg::from_raw_parts(conf_slot, conf_slot_len),
             write_confidence,
             sad_noise_floor,
             thsad,

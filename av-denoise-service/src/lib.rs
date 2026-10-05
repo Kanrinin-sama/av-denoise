@@ -20,10 +20,7 @@ pub use av_decoders::Rational32;
 pub use self::config::ServiceConfig;
 pub use self::frame_range::FrameRange;
 pub use self::layout::{
-    SceneLayout,
-    emitted_boundary_to_raw,
-    subsampling_from_av_decoders,
-    validate_keep_frames,
+    SceneLayout, emitted_boundary_to_raw, subsampling_from_av_decoders, validate_keep_frames,
 };
 pub use self::pipeline::denoise_scenes;
 pub use self::service::WindowService;

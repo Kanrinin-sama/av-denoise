@@ -1,3 +1,4 @@
+use crate::runtime::{ComputeClient, Runtime};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
@@ -102,14 +103,14 @@ pub(crate) fn run_confidence_for_neighbour<R: Runtime>(
     let dim = CubeDim::new_2d(8, 8);
 
     unsafe {
-        nlm_mc_block_match_fine::launch_unchecked::<R>(
+        nlm_mc_block_match_fine::launch_unchecked(
             client,
             grid,
             dim,
-            ArrayArg::from_raw_parts(centre, level_len),
-            ArrayArg::from_raw_parts(neighbour, level_len),
-            ArrayArg::from_raw_parts(mv_scratch.clone(), mv_slot_len),
-            ArrayArg::from_raw_parts(conf_slot, conf_slot_len),
+            BufferArg::from_raw_parts(centre, level_len),
+            BufferArg::from_raw_parts(neighbour, level_len),
+            BufferArg::from_raw_parts(mv_scratch.clone(), mv_slot_len),
+            BufferArg::from_raw_parts(conf_slot, conf_slot_len),
             true, // the no-MC confidence pass always wants its output
             sad_noise_floor,
             thsad,

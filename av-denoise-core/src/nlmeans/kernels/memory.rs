@@ -13,8 +13,8 @@ use cubecl::prelude::*;
 /// `width * height * stored_ch` frame stride rarely lands on one.
 #[cube(launch_unchecked)]
 pub fn gpu_copy(
-    src: &Array<f32>,
-    dst: &mut Array<f32>,
+    src: &[f32],
+    dst: &mut [f32],
     src_offset: u32,
     dst_offset: u32,
     #[comptime] length: u32,
@@ -34,9 +34,9 @@ pub fn gpu_copy(
 /// least as long as the other two.
 #[cube(launch_unchecked)]
 pub fn gpu_zero_buffers(
-    accum: &mut Array<f32>,
-    weight_sum: &mut Array<f32>,
-    max_weight: &mut Array<f32>,
+    accum: &mut [f32],
+    weight_sum: &mut [f32],
+    max_weight: &mut [f32],
     #[comptime] accum_len: u32,
     #[comptime] weight_len: u32,
     #[comptime] total_threads: u32,
@@ -89,9 +89,9 @@ pub fn gpu_zero_buffers(
     reason = "every argument is a comptime shape the kernel specialises on"
 )]
 pub fn gpu_pack_wire(
-    src: &Array<f32>,
-    dst: &mut Array<u32>,
-    dither: &Array<u32>,
+    src: &[f32],
+    dst: &mut [u32],
+    dither: &[u32],
     max: f32,
     #[comptime] width: u32,
     #[comptime] pixels: u32,
@@ -178,8 +178,8 @@ pub fn gpu_pack_wire(
     reason = "every argument is a comptime shape the kernel specialises on"
 )]
 pub fn gpu_unpack_wire(
-    src: &Array<u32>,
-    dst: &mut Array<f32>,
+    src: &[u32],
+    dst: &mut [f32],
     max: f32,
     dst_offset: u32,
     #[comptime] pixels: u32,

@@ -26,3 +26,13 @@ pub fn ref_pos(i: u32, dim: u32) -> u32 {
 pub fn ref_count(width: u32, height: u32) -> usize {
     refs_along(width) as usize * refs_along(height) as usize
 }
+
+/// Columns and rows of a strength map.
+///
+/// The map holds one entry per 8x8 quarter of the noise estimator's 16x16 blocks, so a ragged
+/// frame edge rounds up to a whole block.
+pub fn strength_map_dims(width: u32, height: u32) -> (u32, u32) {
+    let cols = 2 * width.div_ceil(16);
+    let rows = 2 * height.div_ceil(16);
+    (cols, rows)
+}

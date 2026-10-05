@@ -133,7 +133,7 @@ fn emitted_frames<'a>(
                     pools.staged.recycle(planes);
                     return None;
                 };
-                if let Err(error) = decoder.seek_video_frame(start) {
+                if let Err(error) = decoder.seek_to_frame(start) {
                     pools.staged.recycle(planes);
                     return Some(Err(error.into()));
                 }
@@ -158,7 +158,7 @@ fn emitted_frames<'a>(
             Err(error) => {
                 pools.staged.recycle(planes);
                 Some(Err(error))
-            },
+            }
         }
     })
 }

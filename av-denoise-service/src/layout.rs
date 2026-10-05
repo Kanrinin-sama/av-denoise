@@ -126,6 +126,6 @@ pub fn subsampling_from_av_decoders(
         ChromaSubsampling::Yuv444 => Ok(Subsampling::Yuv444),
         other => {
             anyhow::bail!("unsupported chroma subsampling {other:?}, need 4:2:0, 4:2:2, or 4:4:4")
-        },
+        }
     }
 }

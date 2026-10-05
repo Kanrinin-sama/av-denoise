@@ -42,9 +42,9 @@ use cubecl::terminate;
 /// [`MAX_BLKSIZE`]: crate::nlmeans::motion::MAX_BLKSIZE
 #[cube(launch_unchecked)]
 pub fn nlm_mc_block_match_coarse(
-    centre: &Array<f32>,
-    neighbour: &Array<f32>,
-    mv_field: &mut Array<i32>,
+    centre: &[f32],
+    neighbour: &[f32],
+    mv_field: &mut [i32],
     #[comptime] level_width: u32,
     #[comptime] level_height: u32,
     #[comptime] blksize: u32,
@@ -69,8 +69,8 @@ pub fn nlm_mc_block_match_coarse(
     let window_side = comptime!(2 * search_radius + 1);
     let candidates = comptime!(window_side * window_side);
     let block_pixels = comptime!(blksize * blksize);
-    let mut sad_scratch = SharedMemory::<f32>::new(candidates as usize);
-    let mut centre_smem = SharedMemory::<f32>::new(block_pixels as usize);
+    let mut sad_scratch = Shared::<[f32]>::new_slice(candidates as usize);
+    let mut centre_smem = Shared::<[f32]>::new_slice(block_pixels as usize);
 
     // A cooperative load. Each thread claims a row-strided share of the
     // block's pixels and caches the clamped centre value once, so every
@@ -195,7 +195,7 @@ pub fn nlm_mc_block_match_coarse(
                   conversion supplies"
     )]
     let fbx_end = if bx == CUBE_COUNT_X - 1 {
-        fine_blocks_x.into()
+        fine_blocks_x
     } else {
         ((bx + 1) * step * level_scale / fine_step).min(fine_blocks_x)
     };
@@ -206,7 +206,7 @@ pub fn nlm_mc_block_match_coarse(
                   conversion supplies"
     )]
     let fby_end = if by == CUBE_COUNT_Y - 1 {
-        fine_blocks_y.into()
+        fine_blocks_y
     } else {
         ((by + 1) * step * level_scale / fine_step).min(fine_blocks_y)
     };
@@ -258,10 +258,10 @@ pub fn nlm_mc_block_match_coarse(
 /// the kernel never reads it.
 #[cube(launch_unchecked)]
 pub fn nlm_mc_block_match_fine(
-    centre: &Array<f32>,
-    neighbour: &Array<f32>,
-    mv_field: &mut Array<i32>,
-    confidence: &mut Array<f32>,
+    centre: &[f32],
+    neighbour: &[f32],
+    mv_field: &mut [i32],
+    confidence: &mut [f32],
     #[comptime] write_confidence: bool,
     sad_noise_floor: f32,
     thsad: f32,
@@ -278,7 +278,7 @@ pub fn nlm_mc_block_match_fine(
 
     let mv_slot = ((by * blocks_x + bx) * 2) as usize;
 
-    // Clippy flags these `.into()` calls as useless, but they are
+    // Clippy flags these `` calls as useless, but they are
     // required. Both `if` branches have to produce the same cubecl
     // `NativeExpand<i32>` type, and a bare `0i32` literal does not
     // coerce inside the cube macro.
@@ -287,11 +287,7 @@ pub fn nlm_mc_block_match_fine(
         reason = "both branches have to expand to the same cubecl native type, which the \
                   conversion supplies"
     )]
-    let seed_dx = if use_seed == 1u32 {
-        mv_field[mv_slot]
-    } else {
-        0i32.into()
-    };
+    let seed_dx = if use_seed == 1u32 { mv_field[mv_slot] } else { 0i32 };
     #[expect(
         clippy::useless_conversion,
         reason = "both branches have to expand to the same cubecl native type, which the \
@@ -300,7 +296,7 @@ pub fn nlm_mc_block_match_fine(
     let seed_dy = if use_seed == 1u32 {
         mv_field[mv_slot + 1]
     } else {
-        0i32.into()
+        0i32
     };
 
     let block_origin_x = bx as i32 * step as i32;
@@ -314,8 +310,8 @@ pub fn nlm_mc_block_match_fine(
     let window_side = comptime!(2 * search_radius + 1);
     let candidates = comptime!(window_side * window_side);
     let block_pixels = comptime!(blksize * blksize);
-    let mut sad_scratch = SharedMemory::<f32>::new(candidates as usize);
-    let mut centre_smem = SharedMemory::<f32>::new(block_pixels as usize);
+    let mut sad_scratch = Shared::<[f32]>::new_slice(candidates as usize);
+    let mut centre_smem = Shared::<[f32]>::new_slice(block_pixels as usize);
 
     // A cooperative load. Each thread claims a row-strided share of the
     // block's pixels and caches the clamped centre value once, so every

@@ -21,6 +21,7 @@ use kernels::fused_window::{
     FusedSingleWindowBench,
     FusedSingleWindowRefBench,
 };
+use kernels::grain::{GRAIN_SIZES, GrainMeasureBench, GrainReducePartialsBench, GrainSaveVectorsBench};
 use kernels::horizontal_sum::HSumBench;
 use kernels::horizontal_sum_pair::HSumPairBench;
 use kernels::mc_block_match_coarse::BlockMatchCoarseBench;
@@ -198,9 +199,16 @@ fn run_all<R: Runtime>(backend: &str, device: &R::Device) {
         client: client.clone(),
     });
 
-    // Temporal-residual noise-stats kernel.
+    // Temporal-residual noise-stats kernel, the default `luma_fields`
+    // off variant every caller but nl4d's luma pass uses, and the on
+    // variant that pass will enable.
     run(TemporalNoiseStatsBench {
         client: client.clone(),
+        luma_fields: false,
+    });
+    run(TemporalNoiseStatsBench {
+        client: client.clone(),
+        luma_fields: true,
     });
 
     // Motion-compensation kernels. Pyramid build and analyse are
@@ -224,12 +232,18 @@ fn run_all<R: Runtime>(backend: &str, device: &R::Device) {
     run(MvRegulariseBench {
         client: client.clone(),
     });
-    for &(ch, ch_name) in CHANNELS {
-        run(CollabFusedBench {
+    for &size in GRAIN_SIZES {
+        run(GrainSaveVectorsBench {
             client: client.clone(),
-            ch,
-            ch_name,
-            split_mv: false,
+            size,
+        });
+        run(GrainMeasureBench {
+            client: client.clone(),
+            size,
+        });
+        run(GrainReducePartialsBench {
+            client: client.clone(),
+            size,
         });
     }
     for &(ch, ch_name) in CHANNELS {
@@ -237,7 +251,48 @@ fn run_all<R: Runtime>(backend: &str, device: &R::Device) {
             client: client.clone(),
             ch,
             ch_name,
+            split_mv: false,
+            noise_curve: false,
+            strength_map: false,
+            pooled: false,
+        });
+    }
+    run(CollabFusedBench {
+        client: client.clone(),
+        ch: 1,
+        ch_name: "luma",
+        split_mv: false,
+        noise_curve: true,
+        strength_map: false,
+        pooled: false,
+    });
+    run(CollabFusedBench {
+        client: client.clone(),
+        ch: 1,
+        ch_name: "luma",
+        split_mv: false,
+        noise_curve: true,
+        strength_map: true,
+        pooled: false,
+    });
+    run(CollabFusedBench {
+        client: client.clone(),
+        ch: 1,
+        ch_name: "luma",
+        split_mv: false,
+        noise_curve: true,
+        strength_map: true,
+        pooled: true,
+    });
+    for &(ch, ch_name) in CHANNELS {
+        run(CollabFusedBench {
+            client: client.clone(),
+            ch,
+            ch_name,
             split_mv: true,
+            noise_curve: false,
+            strength_map: false,
+            pooled: false,
         });
     }
     for &(ch, ch_name) in CHANNELS {

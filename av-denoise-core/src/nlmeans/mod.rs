@@ -29,6 +29,7 @@ pub mod prefilter;
 mod align;
 mod denoiser;
 mod dispatch;
+mod edges;
 mod noise;
 mod params;
 mod pending;
@@ -37,19 +38,17 @@ pub(crate) use denoiser::RingView;
 pub use denoiser::{GpuOutput, NlmDenoiser};
 pub use motion::{MotionCompensationMode, MotionEstimation, MotionSearch};
 pub use params::{
-    ChannelMode,
-    HqParams,
-    MAX_PATCH_RADIUS,
-    MAX_SEARCH_RADIUS,
-    MAX_TEMPORAL_RADIUS,
-    MIN_FRAME_DIM,
-    NlmParams,
-    hq_default_strength,
-    validate_dimensions,
+    ChannelMode, HqParams, MAX_PATCH_RADIUS, MAX_SEARCH_RADIUS, MAX_TEMPORAL_RADIUS, MIN_FRAME_DIM,
+    NlmParams, hq_default_strength, validate_dimensions,
 };
 pub use pending::{Pending, TryWait};
 pub(crate) use pending::{ReadbackShape, start_readback};
 pub use prefilter::{DEFAULT_PILOT_STRENGTH_SCALE, PrefilterMode, parse_prefilter};
+
+pub use self::noise::NOISE_CURVE_BINS;
+#[cfg(test)]
+pub(crate) use self::noise::QuarterClass;
+pub(crate) use self::noise::{QuarterClasses, StrengthMapParams};
 
 /// Cube X dimension for tile-heavy fused/separable kernels.
 pub const BLOCK_X: u32 = 32;

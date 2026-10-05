@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 name = "av-decoders"
-version = "0.9.1"
+version = "0.11.1"
 build = false
 include = [
     "Cargo.toml",
@@ -54,7 +54,7 @@ name = "av_decoders"
 path = "src/lib.rs"
 
 [dependencies.ffmpeg-the-third]
-version = "4.0.1"
+version = "6.0.0"
 features = [
     "codec",
     "format",
@@ -68,12 +68,13 @@ optional = true
 
 [dependencies.num-rational]
 version = "0.4.2"
+default-features = false
 
 [dependencies.thiserror]
-version = "2.0.17"
+version = "2.0.21"
 
 [dependencies.v_frame]
-version = "0.5"
+version = "0.7"
 
 [dependencies.vapoursynth]
 version = "0.5"
@@ -83,7 +84,7 @@ optional = true
 version = "0.8"
 
 [dev-dependencies.criterion]
-version = "0.8.0"
+version = "0.8.2"
 
 [lints.clippy]
 case_sensitive_file_extension_comparisons = "warn"

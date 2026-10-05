@@ -31,7 +31,7 @@ fn abs_i32(value: i32) -> i32 {
 /// median.
 #[cube]
 fn median_of(vals: &mut Array<i32>, n: u32) -> i32 {
-    let mut i: u32 = 1;
+    let mut i = 1u32;
     while i < n {
         let key = vals[i as usize];
         let mut j = i;
@@ -70,11 +70,11 @@ fn median_of(vals: &mut Array<i32>, n: u32) -> i32 {
     reason = "every argument is a buffer or comptime shape the kernel binds"
 )]
 pub fn nl4d_mv_regularise(
-    centre: &Array<f32>,
-    neighbour: &Array<f32>,
-    mv_in: &Array<i32>,
-    mv_out: &mut Array<i32>,
-    confidence_out: &mut Array<f32>,
+    centre: &[f32],
+    neighbour: &[f32],
+    mv_in: &[i32],
+    mv_out: &mut [i32],
+    confidence_out: &mut [f32],
     lambda_pixel: f32,
     sad_noise_floor: f32,
     thsad: f32,
@@ -93,11 +93,11 @@ pub fn nl4d_mv_regularise(
     let thread_id = local_y * CUBE_DIM_X + local_x;
 
     let block_pixels = comptime!(blksize * blksize);
-    let mut centre_smem = SharedMemory::<f32>::new(block_pixels as usize);
-    let mut cand = SharedMemory::<i32>::new(comptime!(2 * REGULARISE_CANDIDATES) as usize);
-    let mut median = SharedMemory::<i32>::new(2usize);
-    let mut sad_scratch = SharedMemory::<f32>::new(REGULARISE_CANDIDATES as usize);
-    let mut cost = SharedMemory::<f32>::new(REGULARISE_CANDIDATES as usize);
+    let mut centre_smem = Shared::<[f32]>::new_slice(block_pixels as usize);
+    let mut cand = Shared::<[i32]>::new_slice(comptime!(2 * REGULARISE_CANDIDATES) as usize);
+    let mut median = Shared::<[i32]>::new_slice(2usize);
+    let mut sad_scratch = Shared::<[f32]>::new_slice(REGULARISE_CANDIDATES as usize);
+    let mut cost = Shared::<[f32]>::new_slice(REGULARISE_CANDIDATES as usize);
 
     let block_origin_x = bx as i32 * step as i32;
     let block_origin_y = by as i32 * step as i32;
@@ -118,10 +118,10 @@ pub fn nl4d_mv_regularise(
     if thread_id == 0u32 {
         let mut xs = Array::<i32>::new(NEIGHBOURHOOD as usize);
         let mut ys = Array::<i32>::new(NEIGHBOURHOOD as usize);
-        let mut n: u32 = 0;
-        let mut dy: u32 = 0;
+        let mut n = 0u32;
+        let mut dy = 0u32;
         while dy < 3u32 {
-            let mut dx: u32 = 0;
+            let mut dx = 0u32;
             while dx < 3u32 {
                 if dx != 1u32 || dy != 1u32 {
                     let nx = bx as i32 + dx as i32 - 1i32;
@@ -155,8 +155,8 @@ pub fn nl4d_mv_regularise(
         cand[3] = my;
         // Left, right, up, down. Off-grid neighbours repeat the block's
         // own vector, which the tie rule then discards.
-        let mut c: u32 = 2;
-        let mut side: u32 = 0;
+        let mut c = 2u32;
+        let mut side = 0u32;
         while side < 4u32 {
             let mut nx = bx as i32;
             let mut ny = by as i32;
@@ -189,7 +189,7 @@ pub fn nl4d_mv_regularise(
     if thread_id < REGULARISE_CANDIDATES {
         let mvx = cand[(thread_id * 2u32) as usize];
         let mvy = cand[(thread_id * 2u32 + 1u32) as usize];
-        let mut sad: f32 = 0.0;
+        let mut sad = 0.0f32;
         for iy in 0..blksize {
             for ix in 0..blksize {
                 let cx = block_origin_x + ix as i32;
@@ -209,9 +209,9 @@ pub fn nl4d_mv_regularise(
     sync_cube();
 
     if thread_id == 0u32 {
-        let mut best: u32 = 0;
+        let mut best = 0u32;
         let mut best_cost = cost[0];
-        let mut c: u32 = 1;
+        let mut c = 1u32;
         while c < REGULARISE_CANDIDATES {
             if cost[c as usize] < best_cost {
                 best_cost = cost[c as usize];

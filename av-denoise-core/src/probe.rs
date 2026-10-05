@@ -11,11 +11,9 @@
 //! a crash. That is what makes a single binary with `cuda`, `rocm`, and
 //! `vulkan` all enabled usable on a machine that has only one of them.
 
+use crate::runtime::{ComputeClient, Runtime};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Mutex;
-
-use cubecl::client::ComputeClient;
-use cubecl::prelude::*;
 
 use crate::accelerate::Accelerator;
 
@@ -50,7 +48,7 @@ pub(crate) fn open_client<R: Runtime>(
         Ok(Err(err)) => {
             tracing::debug!(err = ?err, "could not use the {accelerator} runtime");
             None
-        },
+        }
         Err(_) => {
             // Only the first probe of a backend says anything. A denoise
             // run probes once per denoiser it builds, and a missing
@@ -62,7 +60,7 @@ pub(crate) fn open_client<R: Runtime>(
                 );
             }
             None
-        },
+        }
     }
 }
 
@@ -73,11 +71,13 @@ pub(crate) fn open_client<R: Runtime>(
 /// queue the server runs on.
 pub(crate) fn load_client<R: Runtime>(device: &R::Device) -> ComputeClient<R> {
     #[cfg(any(feature = "vulkan", feature = "metal"))]
-    if let Some(device) = (device as &dyn std::any::Any).downcast_ref::<cubecl::wgpu::WgpuDevice>() {
-        crate::gpu_share::register(device);
-    }
-
-    R::client(device)
+    let native = match (device as &dyn std::any::Any).downcast_ref::<cubecl::wgpu::WgpuDevice>() {
+        Some(device) => crate::gpu_share::register(device),
+        None => R::client(device),
+    };
+    #[cfg(not(any(feature = "vulkan", feature = "metal")))]
+    let native = R::client(device);
+    ComputeClient::new(native)
 }
 
 /// Runs `f`, turning a panic into an `Err` and routing the panic message

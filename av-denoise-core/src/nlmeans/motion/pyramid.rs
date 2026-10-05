@@ -1,3 +1,4 @@
+use crate::runtime::{ComputeClient, Runtime};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
@@ -137,13 +138,13 @@ fn extract_luma<R: Runtime>(
     let level0_len = (frame_count * height * width) as usize;
 
     unsafe {
-        nlm_mc_extract_luma::launch_unchecked::<R>(
+        nlm_mc_extract_luma::launch_unchecked(
             client,
             grid,
             dim,
             stored_ch as usize,
-            ArrayArg::from_raw_parts(full_res.clone(), full_len),
-            ArrayArg::from_raw_parts(level0_dst, level0_len),
+            BufferArg::from_raw_parts(full_res.clone(), full_len),
+            BufferArg::from_raw_parts(level0_dst, level0_len),
             slot,
             0u32,
             width,
@@ -193,12 +194,12 @@ fn downscale_level<R: Runtime>(
     let dst_len = (dst_w * dst_h) as usize;
 
     unsafe {
-        nlm_mc_downscale::launch_unchecked::<R>(
+        nlm_mc_downscale::launch_unchecked(
             client,
             grid,
             dim,
-            ArrayArg::from_raw_parts(src, src_len),
-            ArrayArg::from_raw_parts(dst, dst_len),
+            BufferArg::from_raw_parts(src, src_len),
+            BufferArg::from_raw_parts(dst, dst_len),
             0u32,
             0u32,
             src_w,

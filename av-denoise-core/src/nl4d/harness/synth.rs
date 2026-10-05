@@ -186,13 +186,13 @@ fn background_displacement(class: MotionClass, k: i32, x: u32, y: u32, width: u3
         MotionClass::IntegerPan | MotionClass::HalfPelPan => {
             let v = class.velocity();
             [v[0] * k as f32, v[1] * k as f32]
-        },
+        }
         MotionClass::Zoom => {
             let s = ZOOM_PER_FRAME.powi(k);
             let cx = width as f32 / 2.0;
             let cy = height as f32 / 2.0;
             [(x as f32 - cx) * (s - 1.0), (y as f32 - cy) * (s - 1.0)]
-        },
+        }
         MotionClass::CutOut => [0.0, 0.0],
     }
 }
@@ -249,7 +249,7 @@ pub fn synthesise(still: &Still, class: MotionClass, radius: u32, sigma: f32, se
                             let fx = w as f32 / 2.0 + (x as f32 - w as f32 / 2.0) / s;
                             let fy = h as f32 / 2.0 + (y as f32 - h as f32 / 2.0) / s;
                             still.sample(fx, fy)
-                        },
+                        }
                         _ => still.sample(x as f32 - d[0], y as f32 - d[1]),
                     }
                 };

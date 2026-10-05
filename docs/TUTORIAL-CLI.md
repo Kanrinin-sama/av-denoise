@@ -22,6 +22,14 @@ The following (non-accelerator) features are available:
     * This pulls in `ffms2` as hard dependencies. This means you must install `ffms2` before you can compile and link
       the binary.
 
+### Release binaries
+
+Each [GitHub release](https://github.com/ChillFish8/av-denoise/releases) carries a prebuilt CLI for
+Linux x86, Windows x86 and macOS on Apple Silicon. FFMS2 and FFmpeg are linked statically, so
+it is not required to have FFmpeg and FFMS2 installed on your host system, however, the JIT will still 
+attempt to dynamically load the CUDA headers and compiler system from your system if you attempt to use
+CUDA.
+
 ### Cargo install
 
 This builds the binary with the default accelerators enabled (`vulkan`)
@@ -62,7 +70,7 @@ docker run --rm \
     --device /dev/kfd --device /dev/dri \
     --group-add video --group-add render \
     -v "$PWD:/in:ro" \
-    ghcr.io/chillfish8/av-denoise:vulkan-0.4.0 \
+    ghcr.io/chillfish8/av-denoise:vulkan-0.5.0-alpha3 \
     nl4d --input /in/noisy.mkv \
   | ffmpeg -f yuv4mpegpipe -i - -c:v ffv1 clean.mkv
 ```
@@ -95,14 +103,14 @@ These are global, so they work on either side of the subcommand.
 | `--channel-mode <luma,chroma,yuv>` | Which planes to clean. `yuv` is one fused pass and needs a YUV444 source.                                        | `luma,chroma` |
 | `-A, --accelerators <list>`        | Backends to try, in order. Comma-separated, for example `cuda,vulkan`.                                           | `vulkan`      |
 | `-d, --device <spec>`              | `default`, `discrete[:N]`, `integrated[:N]`, `virtual[:N]`, or `cpu`.                                            | `default`     |
-| `--progress`                       | Draws a progress bar for file input. Off by default, because anything else writing to the terminal scrambles it. | off           |
+| `--progress`                       | Draws a progress bar. Off by default, because anything else writing to the terminal scrambles it.                | off           |
 
 Both subcommands also take:
 
 | Flag                    | What it does                                                                                     | Default  |
 |-------------------------|--------------------------------------------------------------------------------------------------|----------|
-| `-i, --input <path\|->` | A path is opened with ffms2 and split by scene. `-` or `pipe:0` reads y4m from stdin.            | required |
-| `-W, --workers <N>`     | How many scenes to clean in parallel. Trades GPU memory for throughput. Ignored for piped input. | `2`      |
+| `-i, --input <path\|->` | A path is opened with ffms2. `-` or `pipe:0` reads y4m from stdin. Both are split by scene.      | required |
+| `-W, --workers <N>`     | How many scenes to clean in parallel. Trades GPU memory for throughput.                          | `2`      |
 
 ### Listing devices
 
@@ -153,13 +161,14 @@ What `--preset` fills in:
 | `slow`     | 4               | 9              |
 | `veryslow` | 8               | 9              |
 
-| Flag                    | What it does                                                                                                                                                                                                         | Default              |
-|-------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------|
-| `--temporal-radius <N>` | How many neighbouring frames to search on each side, between 1 and 8. More frames means more patches to group.                                                                                                       | from `--preset`      |
-| `--lambda-ht <f>`       | How aggressively small transform coefficients are zeroed out. Higher removes more noise and more fine detail with it. `--luma-lambda-ht` and `--chroma-lambda-ht` override one plane.                                | 5.2 luma, 3.4 chroma |
-| `--lambda-ht-scale <f>` | Multiplies the `--lambda-ht` in effect for each plane. The main quality dial, since luma and chroma start from different defaults and this moves both together.                                                      | `1.0`                |
-| `--spatial-radius <N>`  | Half-width of the candidate search inside the centre frame, between 1 and 16. Most of the search work goes here, since the window covers `(2N+1)^2` positions.                                                       | from `--preset`      |
-| `--sigma-scale <f>`     | Nudges the measured noise level, the same dial NLMeans spells `--hq-sigma-scale`.                                                                                                                                    | `1.0`                |
+| Flag                               | What it does                                                                                                                                                                                                                    | Default                  |
+|------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------|
+| `--temporal-radius <N>`            | How many neighbouring frames to search on each side, between 1 and 8. More frames means more patches to group.                                                                                                                  | from `--preset`          |
+| `--lambda-ht <f>`                  | How aggressively small transform coefficients are zeroed out. Higher removes more noise and more fine detail with it. `--luma-lambda-ht` and `--chroma-lambda-ht` override one plane.                                           | 4.158 luma, 3.234 chroma |
+| `--lambda-ht-scale <f>`            | Multiplies the `--lambda-ht` in effect for each plane. The main quality dial, since luma and chroma start from different defaults and this moves both together.                                                                 | `1.0`                    |
+| `--spatial-radius <N>`             | Half-width of the candidate search inside the centre frame, between 1 and 16. Most of the search work goes here, since the window covers `(2N+1)^2` positions.                                                                  | from `--preset`          |
+| `--sigma-scale <f>`                | Nudges the measured noise level, the same dial NLMeans spells `--hq-sigma-scale`.                                                                                                                                               | `1.0`                    |
+| `--unstable-export-av1-fgs <PATH>` | Unstable, and may change between releases. Writes an AV1 film grain table to add with `grav1synth apply`. SVT-AV1 `--fgs-table` applies only its first entry, so it suits a single-scene table only. Needs luma to be denoised. | off                      |
 
 <details>
 <summary><b>Expert flags</b> — calibration and debugging, not everyday tuning</summary>
@@ -169,9 +178,13 @@ What `--preset` fills in:
 | `--refine <N>`                                                       | Half-width of the window searched around each neighbour frame's motion-predicted position, between 1 and 4. Raise it when motion tracking lands close but not exact.                                                                                              | `2`                 |
 | `--sigma <f>`                                                        | Pins the noise level in 8-bit units, turning the per-scene measurement off entirely.                                                                                                                                                                              | measured            |
 | `--thsad-scale <f>`                                                  | How badly a neighbour frame may match before its patches stop being trusted.                                                                                                                                                                                      | `1.0`               |
-| `--c-min <f>`                                                        | Confidence floor below which a whole neighbour block is skipped rather than scored. Only changes how much compute a frame costs, never which patches are admitted once scored.                                                                                    | `0.05`              |
-| `--no-confidence-variance`                                           | Gives every patch the same noise estimate, instead of trusting a poorly matched one less.                                                                                                                                                                         | off                 |
-| `--mismatch-scale <f>`                                               | How much less a poorly matched patch is trusted. The variance grows with the square of it, and the effect saturates between roughly 3 and 13 depending on source noise. `0` matches `--no-confidence-variance`. Per-plane as `--luma-`/`--chroma-mismatch-scale`. | `1.0`               |
+| `--c-min <f>`                                                        | Confidence floor below which a whole neighbour block is skipped rather than scored. A volume left short of frames by the skip makes its group filter from the centre frame alone.                                                                                    | `0.05`              |
+| `--no-noise-map`                                                     | Turns off the luma noise map, which scales the luma threshold by how noisy each brightness level is.                                                                                                                                                              | map on              |
+| `--no-pooled-threshold`                                              | Turns off the pooled threshold, which judges each frequency together with its neighbours so faint texture survives.                                                                                                                                               | pooling on          |
+| `--flat-boost <f>`                                                   | How much harder flat, grainy areas are filtered on luma, between 1 and 3. `1` turns it off.                                                                                                                                                                        | `1.75`              |
+| `--chroma-flat-boost <f>`                                            | The same for the colour planes.                                                                                                                                                                                                                                    | `1.5`               |
+| `--shadow-soften <f>`                                                | How much more gently textured dark areas are filtered, between 0.1 and 1. `1` turns it off.                                                                                                                                                                        | `0.65`              |
+| `--flat-texture-cut <f>`                                             | Keeps areas whose surroundings line up like faint lines or edges out of the flat boost, between 0 and 1. Lower keeps more texture. `1` turns it off.                                                                                                               | `0.21`              |
 | `--mc-blksize`, `--mc-overlap`, `--mc-search`, `--mc-pyramid-levels` | Motion-search geometry. NL4D always tracks motion, so these are always live.                                                                                                                                                                                      | `16`, `8`, `4`, `2` |
 
 </details>
@@ -229,8 +242,7 @@ ffmpeg -i noisy.mkv -pix_fmt yuv420p -f yuv4mpegpipe - \
   | ffmpeg -f yuv4mpegpipe -i - -c:v ffv1 clean.mkv
 ```
 
-Piped input has no scene detection, so the temporal window slides across the whole stream and
-`--workers` does not apply.
+Piped input is split by scene just like a file, and `--workers` applies to both.
 
 ffmpeg will not write 10 or 12-bit y4m without `-strict -1`, so high-depth pipelines need it on
 the *producing* side:

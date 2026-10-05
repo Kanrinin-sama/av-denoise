@@ -24,6 +24,7 @@
 //!
 //! `compensate` applies the finished motion field to a frame.
 
+use crate::runtime::{ComputeClient, Runtime};
 mod analyse;
 mod chain;
 mod compensate;
@@ -34,7 +35,6 @@ pub(crate) use analyse::{confidence_byte_offset, mv_field_byte_offset, run_analy
 pub(crate) use chain::{neighbour_idx_for_k, run_pair_analyse, zero_pair_slot};
 pub(crate) use compensate::run_compensate;
 pub(crate) use confidence::{THSAD_PIXEL, run_confidence_for_neighbour, sad_noise_floor, thsad};
-use cubecl::prelude::*;
 use cubecl::server::Handle;
 pub(crate) use pyramid::{level_dims, pyramid_pixels_per_frame, pyramid_slot_byte_offset, run_pyramid_build};
 

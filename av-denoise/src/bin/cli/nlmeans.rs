@@ -1,17 +1,7 @@
 use av_denoise::{
-    DenoisingMode,
-    Depth,
-    MotionCompensationMode,
-    NlmTuning,
-    NlmeansHqOptions,
-    NlmeansOptions,
-    NlmeansVariant as Variant,
-    PlaneOptions,
-    PrefilterMode,
-    nlmeans_search_radius_for,
-    nlmeans_temporal_radius_for,
-    nlmeans_variant_for,
-    parse_prefilter,
+    DenoisingMode, Depth, MotionCompensationMode, NlmTuning, NlmeansHqOptions, NlmeansOptions,
+    NlmeansVariant as Variant, PlaneOptions, PrefilterMode, nlmeans_search_radius_for,
+    nlmeans_temporal_radius_for, nlmeans_variant_for, parse_prefilter,
 };
 
 use super::{Args, CommonArgs, MotionArgs, Preset, RunOptions, resolve_channel_intent};
@@ -399,10 +389,9 @@ impl NlmeansArgs {
                 // here. `Nl4dArgs::build_options` fills them in afterwards.
                 luma_lambda_ht: None,
                 chroma_lambda_ht: None,
-                luma_mismatch_scale: None,
-                chroma_mismatch_scale: None,
             },
             progress: globals.progress,
+            grain_table: None,
         })
     }
 }

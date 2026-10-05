@@ -10,10 +10,9 @@
 //! with, and sizes the buffers driven by that grid. [`kernels`] holds the
 //! GPU code that does the grouping, filtering, and blending.
 
+use crate::runtime::{ComputeClient, Runtime};
 pub mod geometry;
 pub mod kernels;
-
-use cubecl::prelude::*;
 
 /// Whether `R` needs [`kernels::fused::collab_fused`]'s warp-uniform
 /// search.
@@ -31,7 +30,7 @@ use cubecl::prelude::*;
 /// rectangles. See the `warp_uniform` argument for what the other path
 /// changes.
 pub fn needs_warp_uniform_search<R: Runtime>(client: &ComputeClient<R>) -> bool {
-    R::name(client) == "cuda"
+    client.name() == "cuda"
 }
 
 /// Side length of a collaborative patch in pixels.
@@ -52,3 +51,15 @@ pub const MAX_K: u32 = 8;
 /// `2 * MAX_TEMPORAL_RADIUS + 1` frames, which bounds how many passes can
 /// write into one pixel before it is read back.
 pub const MAX_TEMPORAL_RADIUS: u32 = 8;
+
+/// Frames per volume in a cross-frame group at `temporal_radius`.
+///
+/// A group holds `MAX_K` patches as `MAX_K / grid_frames` volumes. Radius 0 has no neighbour to
+/// follow, so it gives 1, which leaves every group a single-frame one.
+pub fn grid_frames(temporal_radius: u32) -> u32 {
+    match temporal_radius {
+        0 => 1,
+        1 => 2,
+        _ => 4,
+    }
+}
