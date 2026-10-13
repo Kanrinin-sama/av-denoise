@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use av_denoise_core::DenoisingMode;
+use av_denoise::DenoisingMode;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::cancel::Cancel;
@@ -21,7 +21,7 @@ fn window_floor(workers: usize, radius: u32) -> usize {
     // takes `radius + MAX_PENDING + 1` pushes. Fewer permits than that
     // and its scene can never return one, so the dispatcher waits on a
     // permit the worker cannot release.
-    workers * (radius as usize + av_denoise_core::MAX_PENDING + 2)
+    workers * (radius as usize + av_denoise::MAX_PENDING + 2)
 }
 
 /// Frames the budget pays for at this frame size.

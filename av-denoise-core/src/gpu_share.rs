@@ -30,7 +30,7 @@ static SHARED: Mutex<Vec<Shared>> = Mutex::new(Vec::new());
 /// It has to run before the first `WgpuRuntime::client` for `device`,
 /// which is why [`crate::probe::load_client`] is the only way this crate
 /// opens a client.
-pub(crate) fn register(device: &WgpuDevice) -> Client {
+pub fn register(device: &WgpuDevice) -> Client {
     let mut shared = SHARED.lock().unwrap_or_else(|err| err.into_inner());
     if let Some(entry) = shared.iter().find(|entry| &entry.device == device) {
         return entry.client.clone();
@@ -51,7 +51,7 @@ pub(crate) fn register(device: &WgpuDevice) -> Client {
 ///
 /// Every client of one server shares that server's properties, so their
 /// address identifies the server.
-pub(crate) fn device_and_queue(client: &Client) -> Option<(wgpu::Device, wgpu::Queue)> {
+pub fn device_and_queue(client: &Client) -> Option<(wgpu::Device, wgpu::Queue)> {
     let shared = SHARED.lock().unwrap_or_else(|err| err.into_inner());
     shared
         .iter()

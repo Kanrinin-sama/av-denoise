@@ -11,7 +11,7 @@ pub struct ComputeClient<R: Runtime> {
 }
 
 impl<R: Runtime> ComputeClient<R> {
-    pub(crate) fn new(client: Client) -> Self {
+    pub fn new(client: Client) -> Self {
         Self {
             client,
             runtime: PhantomData,

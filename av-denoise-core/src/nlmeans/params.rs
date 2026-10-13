@@ -1,87 +1,45 @@
 use super::{MotionCompensationMode, PrefilterMode, prefilter};
 
-/// The reference value patch distances are normalised against, matching
-/// FFmpeg's nlmeans at 255 squared.
+/// The value patch distances are normalised against, 255 squared as in FFmpeg's nlmeans.
 ///
-/// Distances here are measured in `[0, 1]` units, so this constant folds
-/// in the scale-up back to 8-bit terms.
+/// Distances are measured between 0 and 1, so this folds the scale back up to 8-bit terms.
 pub(super) const NLM_NORM: f32 = 255.0 * 255.0;
 
-/// A scaling factor inherited from FFmpeg's nlmeans, kept so our
-/// `strength` parameter means the same thing theirs does.
+/// A scale factor from FFmpeg's nlmeans, kept so `strength` means the same as theirs.
 pub(super) const NLM_LEGACY: f32 = 3.0;
 
-/// The measured HQ default `strength` for luma at each temporal radius,
-/// indexed by `temporal_radius.min(8)`.
-///
-/// `hq_default_strength` reads this for `ChannelMode::Luma` and
-/// `ChannelMode::Yuv`.
+/// The measured HQ default luma `strength`, indexed by `temporal_radius.min(8)`.
 const HQ_DEFAULT_STRENGTH_LUMA: [f32; 9] = [0.45, 0.45, 0.42, 0.42, 0.35, 0.35, 0.35, 0.30, 0.30];
 
-/// The measured HQ default `strength` for chroma at each temporal
-/// radius, indexed by `temporal_radius.min(8)`.
-///
-/// `hq_default_strength` reads this for `ChannelMode::Chroma`.
+/// The measured HQ default chroma `strength`, indexed by `temporal_radius.min(8)`.
 const HQ_DEFAULT_STRENGTH_CHROMA: [f32; 9] = [1.00, 0.85, 0.70, 0.70, 0.70, 0.70, 0.70, 0.70, 0.70];
 
-/// The calibrated default `strength` multiplier for `nlmeans-hq`'s
-/// auto-strength mode.
+/// The calibrated default `strength` multiplier for HQ auto-strength.
 ///
-/// The answer depends on which plane is being denoised and how far the
-/// temporal window reaches.
+/// Every entry is measured, from quality sweeps over three noise levels per radius that keep the
+/// strength whose worst XPSNR gain is highest. Luma is swept at every radius from 0 to 8 and never
+/// rises with radius, because a wider window already gathers more samples. Chroma is swept at
+/// radii 0, 1, 2, 4 and 8 with luma pinned, and holds flat at 0.70 from radius 2, so radii 3, 5, 6
+/// and 7 sit on that plateau.
 ///
-/// # Where the numbers come from
-///
-/// Every entry is a measured value rather than a fitted curve. Both
-/// tables come from quality-harness sweeps that score a grid of
-/// strengths at three noise levels per radius.
-///
-/// The luma sweep covers each radius from 0 to 8 directly.
-///
-/// The chroma sweep pins luma at the value already chosen for that
-/// radius, so the chroma numbers stay clean, and covers radii 0, 1, 2,
-/// 4, and 8 with a bracketed peak at each.
-///
-/// At each measured radius the chosen value is the one whose worst XPSNR
-/// gain across the tested noise levels is highest, so it holds up at
-/// whichever noise level is hardest to serve.
-///
-/// # Shape of the tables
-///
-/// Luma never rises with radius, because a wider temporal window already
-/// gathers more samples to average over.
-///
-/// Chroma falls the same way out to radius 2 and then holds flat at
-/// 0.70. Radii 3, 5, 6, and 7 sit on that measured plateau rather than
-/// being swept directly.
-///
-/// `ChannelMode::Yuv` reads the luma table, on the assumption that a
-/// fused pass is dominated by luma. That mode was not part of the sweep,
-/// so this is an assumption rather than a measurement.
-///
-/// # Clamping
-///
-/// `temporal_radius` is clamped to the last table index, which matches
-/// [`MAX_TEMPORAL_RADIUS`]. That is only a safety net, because
-/// [`NlmParams::validate`] already rejects anything larger.
+/// `ChannelMode::Yuv` reads the luma table, which is an assumption because the sweeps do not
+/// cover that mode. Clamping the radius to [MAX_TEMPORAL_RADIUS] is a safety net, since
+/// [NlmParams::validate] already rejects anything larger.
 pub fn hq_default_strength(channels: ChannelMode, temporal_radius: u32) -> f32 {
-    let idx = temporal_radius.min(MAX_TEMPORAL_RADIUS) as usize;
+    let index = temporal_radius.min(MAX_TEMPORAL_RADIUS) as usize;
     match channels {
-        ChannelMode::Luma | ChannelMode::Yuv => HQ_DEFAULT_STRENGTH_LUMA[idx],
-        ChannelMode::Chroma => HQ_DEFAULT_STRENGTH_CHROMA[idx],
+        ChannelMode::Luma | ChannelMode::Yuv => HQ_DEFAULT_STRENGTH_LUMA[index],
+        ChannelMode::Chroma => HQ_DEFAULT_STRENGTH_CHROMA[index],
     }
 }
 
-/// The smallest frame side length the denoiser supports.
+/// The smallest supported frame side.
 ///
-/// The Immerkær noise estimate only reads interior pixels, because its
-/// 3x3 mask cannot reach the one-pixel border. A frame under 3 pixels
-/// across has no interior at all, which leaves the estimate undefined.
+/// The ImmerkÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦r estimate's 3x3 mask only reads interior pixels, and a frame under 3 pixels across
+/// has none.
 pub const MIN_FRAME_DIM: u32 = 3;
 
 /// Rejects frame dimensions the kernels cannot handle.
-///
-/// Both denoiser constructors call this before allocating any buffer.
 pub fn validate_dimensions(width: u32, height: u32) -> Result<(), anyhow::Error> {
     if width < MIN_FRAME_DIM || height < MIN_FRAME_DIM {
         anyhow::bail!(
@@ -90,62 +48,44 @@ pub fn validate_dimensions(width: u32, height: u32) -> Result<(), anyhow::Error>
              least one interior pixel"
         );
     }
+
     Ok(())
 }
 
-/// The patch radius above which the dispatcher switches to the separable
-/// path, so per-pixel cost stays linear in `patch_radius`.
+/// The patch radius above which the separable path runs, keeping per-pixel cost linear in
+/// `patch_radius`.
 pub(super) const SEPARABLE_THRESHOLD: u32 = 8;
 
 /// The hard ceiling on `patch_radius`.
 ///
-/// The fused kernels load a `(block + 2 * patch_radius)^2` tile into
-/// shared memory, and anything larger runs out of it on RDNA-class GPUs.
+/// The fused kernels load a `(block + 2 * patch_radius)^2` tile into shared memory, and anything
+/// larger runs out of it on RDNA-class GPUs.
 pub const MAX_PATCH_RADIUS: u32 = 16;
 
 /// The hard ceiling on `search_radius`.
 ///
-/// Shared memory is not the limit here. The windowed kernel's tile is
-/// `(block + 2 * patch_radius + 2 * search_radius)^2 * stored_ch * 4`
-/// bytes, which stays comfortably inside hardware limits at every
-/// supported size.
-///
-/// The real cost is the kernel's fully unrolled
-/// `(2 * search_radius + 1)^2` window loop. Both its compiled size and
-/// how long it takes to generate grow with the radius. See the
-/// stack-size note in `.cargo/config.toml`.
-///
-/// The per-offset dispatch path, used when `patch_radius` forces the
-/// separable fallback, is limited by the same constant, which keeps its
-/// `(2 * search_radius + 1)^2` launches per temporal offset reasonable.
+/// The windowed kernel's tile fits in shared memory at every supported size. The limit is its fully
+/// unrolled `(2 * search_radius + 1)^2` window loop, whose compiled size and build time grow with
+/// the radius. It also bounds the separable path's `(2 * search_radius + 1)^2` launches per
+/// temporal offset.
 pub const MAX_SEARCH_RADIUS: u32 = 8;
 
 /// The hard ceiling on `temporal_radius`.
 ///
-/// The ring buffer holds `2 * radius + 1` frames, so device memory grows
-/// with it. At radius 16, 1080p YUV would need roughly 540 MB for the
-/// input alone.
+/// The ring holds `2 * radius + 1` frames, so device memory grows with it. At radius 16, 1080p YUV
+/// would need roughly 540 MB for the input alone.
 pub const MAX_TEMPORAL_RADIUS: u32 = 8;
 
-/// The hard ceiling on the radius the bilateral prefilter derives from
-/// `sigma_s`, where `radius = ceil(2 * sigma_s).max(1)`. See
-/// `prefilter::bilateral_radius`.
+/// The hard ceiling on the bilateral prefilter's radius, `ceil(2 * sigma_s).max(1)`.
 ///
-/// `nlm_bilateral` loads a `(32 + 2r) x (8 + 2r)` tile of
-/// `Vector<f32, N>` into shared memory. `N` reaches 4 for YUV storage at
-/// 4 bytes per `f32`, so the tile costs `16 * (32 + 2r) * (8 + 2r)`
-/// bytes.
-///
-/// RDNA-class hardware gives 64 KiB of shared memory to work with. At
-/// `r = 22` the tile is 63,232 bytes, or 61.75 KiB, which fits. At
-/// `r = 23` it is 67,392 bytes, or 65.8 KiB, which does not.
-///
-/// So 22 is the largest radius that fits, and `bilateral_radius` reaches
-/// it at `sigma_s = 11.0`.
+/// `nlm_bilateral` loads a `(32 + 2r) x (8 + 2r)` tile of up to four `f32` lanes into shared
+/// memory, which costs `16 * (32 + 2r) * (8 + 2r)` bytes. Against the 64 KiB RDNA-class hardware
+/// offers, `r = 22` fits at 63,232 bytes and `r = 23` does not at 67,392. `bilateral_radius`
+/// reaches 22 at `sigma_s = 11.0`.
 pub const MAX_BILATERAL_RADIUS: u32 = 22;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Which channels of a frame the denoiser works on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelMode {
     /// The single brightness channel, with distances scaled by 3.0.
     Luma,
@@ -167,9 +107,8 @@ impl ChannelMode {
 
     /// How many channels each pixel occupies in GPU storage.
     ///
-    /// This is padded up to the next supported vector width so kernels
-    /// can read whole `Line<f32>` values at once. Backends only support
-    /// power-of-two widths, so YUV pads from 3 up to 4.
+    /// Kernels read whole `Line<f32>` values and backends only support power-of-two widths, so YUV
+    /// pads from 3 to 4.
     pub fn storage_count(self) -> u32 {
         match self {
             ChannelMode::Luma => 1,
@@ -181,66 +120,36 @@ impl ChannelMode {
 
 /// Parameters for the quality-focused `nlmeans-hq` variant.
 ///
-/// The measured noise level drives both the effective strength and the
-/// distance floor, so the weighting adapts to how noisy the source
-/// really is.
+/// The measured noise level drives both the effective strength and the distance floor.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HqParams {
-    /// Reads `strength` as a multiplier on the noise level, making the
-    /// effective FFmpeg-style strength `strength * sigma_eff * 255`.
+    /// Reads `strength` as a multiplier on the noise level. Defaults to true.
     ///
-    /// Defaults to true.
+    /// The FFmpeg-style strength becomes `strength * sigma_eff * 255`.
     pub auto_strength: bool,
-    /// Subtracts the expected noise floor from patch distances before
-    /// weighting, so a match is not penalised for the noise it carries.
+    /// Subtracts the expected noise floor from patch distances before weighting. Defaults to true.
     ///
-    /// Defaults to true.
+    /// A match is then not penalised for the noise it carries.
     pub noise_floor: bool,
-    /// A fixed noise standard deviation in `[0, 1]` units, replacing the
-    /// automatic per-frame estimate.
+    /// A fixed noise sigma between 0 and 1 in place of the automatic estimate.
     ///
-    /// `None`, the default, measures the noise in each pushed frame and
-    /// smooths it over time. `Some` applies one fixed value to every
-    /// frame instead.
-    ///
-    /// The CLI takes this in 8-bit units through `--hq-sigma` and
-    /// divides by 255.
+    /// `None`, the default, measures each pushed frame and smooths the result over time.
     pub sigma_override: Option<f32>,
-    /// Weights each temporal neighbour by how well it block-matches the
-    /// centre frame, so occlusion or a change of content collapses its
-    /// contribution rather than blurring it in.
-    ///
-    /// Only has an effect when `temporal_radius` is above 0. Defaults to
+    /// Weights each temporal neighbour by how well it block-matches the centre frame. Defaults to
     /// true.
+    ///
+    /// Occlusion or a change of content then collapses a neighbour's contribution rather than
+    /// blurring it in. It only has an effect when `temporal_radius` is above 0.
     pub temporal_confidence: bool,
-    /// A multiplier on the per-pixel mismatch threshold, which sets how
-    /// much extra SAD a block tolerates before its confidence starts to
-    /// fall.
+    /// A multiplier on the per-pixel mismatch threshold. Defaults to 1.0.
     ///
-    /// Higher values tolerate larger mismatches. Defaults to 1.0.
+    /// Higher values let a block carry more extra SAD before its confidence starts to fall.
     pub thsad_scale: f32,
-    /// A multiplier applied to each channel's measured sigma before it
-    /// folds into the running estimate.
+    /// A multiplier on each channel's measured sigma before it joins the running estimate. Defaults
+    /// to 1.0.
     ///
-    /// `1.0`, the default, keeps the measurement as it is. This does
-    /// nothing when `sigma_override` is set, because the estimator never
-    /// runs in that case.
-    ///
-    /// The CLI takes this as `--hq-sigma-scale`.
+    /// It has no effect with `sigma_override` set, because the estimator never runs.
     pub sigma_scale: f32,
-    /// Estimates noise fresh from each submit's own window, instead of
-    /// smoothing it with an exponential average carried forward from
-    /// every earlier frame the stream has folded.
-    ///
-    /// `false`, the default, keeps the temporal EMA every calibrated
-    /// preset assumes. `true` makes the automatic estimate depend only
-    /// on the frames currently in the window, so a
-    /// [`crate::frame::PlanarDenoiser::reseed`] targeting frame `n` and
-    /// a continuous stream that reaches frame `n` compute the same
-    /// sigma, regardless of how each got there. This does nothing when
-    /// `sigma_override` pins a fixed value, because the estimator never
-    /// runs in that case.
-    pub windowed_noise_estimation: bool,
 }
 
 impl Default for HqParams {
@@ -252,14 +161,12 @@ impl Default for HqParams {
             temporal_confidence: true,
             thsad_scale: 1.0,
             sigma_scale: 1.0,
-            windowed_noise_estimation: false,
         }
     }
 }
 
 impl HqParams {
-    /// The HQ defaults with a fixed noise level in `[0, 1]` units, which
-    /// skips automatic estimation.
+    /// The HQ defaults with a fixed noise sigma between 0 and 1, which skips automatic estimation.
     pub fn with_sigma(sigma: f32) -> Self {
         Self {
             sigma_override: Some(sigma),
@@ -273,39 +180,28 @@ impl HqParams {
 pub struct NlmParams {
     /// How many frames on each side of the current one to look at.
     ///
-    /// 0 means each frame is cleaned on its own. Anything higher uses a
-    /// window of `2 * radius + 1` frames.
+    /// 0 cleans each frame on its own.
     pub temporal_radius: u32,
-    /// Half the width of the search window, which covers
-    /// `(2 * radius + 1)^2` pixels. Defaults to 2.
+    /// Half the width of the search window. Defaults to 2.
     pub search_radius: u32,
-    /// Half the width of a compared patch, which covers
-    /// `(2 * radius + 1)^2` pixels. Defaults to 4.
+    /// Half the width of a compared patch. Defaults to 4.
     pub patch_radius: u32,
     /// How hard to filter. Higher values smooth more. Defaults to 1.2.
     pub strength: f32,
-    /// How much weight the centre pixel gets in the average.
+    /// How much weight the centre pixel gets in the average. Defaults to 1.0.
     ///
-    /// Defaults to 1.0. Set it to 0 for pure NLM, where the centre pixel
-    /// only counts through the patches that match it.
+    /// 0 gives pure NLM, where the centre pixel only counts through the patches that match it.
     pub self_weight: f32,
-    /// Which channels to process.
     pub channels: ChannelMode,
-    /// Which image the patch distances are measured against.
+    /// The image patch distances are measured on. Defaults to `None`.
     ///
-    /// Defaults to `None`. When set, the weights come from a prefiltered
-    /// or externally supplied image while the pixels being averaged
-    /// still come from the original input.
+    /// The averaged pixels always come from the original input.
     pub prefilter: PrefilterMode,
-    /// Whether temporal denoising follows motion between frames.
+    /// Whether temporal denoising follows motion between frames. Defaults to `None`.
     ///
-    /// Defaults to `None`. Set to `Mvtools`, each submit warps the
-    /// temporal neighbours into line with the centre frame before the
-    /// NLM weighting runs.
-    ///
-    /// Only has an effect when `temporal_radius` is above 0.
+    /// It only has an effect when `temporal_radius` is above 0.
     pub motion_compensation: MotionCompensationMode,
-    /// The quality-mode parameters. `None` runs the fast path unchanged.
+    /// The quality-mode parameters, or `None` for the fast path.
     pub hq: Option<HqParams>,
 }
 
@@ -326,13 +222,10 @@ impl Default for NlmParams {
 }
 
 impl NlmParams {
-    /// The FFmpeg-style strength the weighting actually uses.
+    /// The FFmpeg-style strength the weighting uses.
     ///
-    /// With HQ auto-strength the user's value multiplies the noise
-    /// level, so one setting follows sources of different noisiness.
-    ///
-    /// `sigma_eff` is the scale-weighted RMS of the per-channel noise
-    /// estimates.
+    /// With HQ auto-strength, `strength` multiplies `sigma_eff`, so one setting follows sources of
+    /// different noisiness.
     pub(super) fn effective_strength_with(&self, sigma_eff: Option<f32>) -> f32 {
         match (self.hq, sigma_eff) {
             (Some(hq), Some(sigma)) if hq.auto_strength => self.strength * sigma * 255.0,
@@ -340,58 +233,44 @@ impl NlmParams {
         }
     }
 
-    /// `h2_inv_norm` for a noise estimate given here, ignoring whatever
-    /// `self.hq.sigma_override` holds.
-    ///
-    /// The denoiser calls this each submit to refresh the value from a
-    /// freshly measured sigma.
+    /// `h2_inv_norm` for the given noise estimate, ignoring `sigma_override`.
     pub fn h2_inv_norm_with(&self, sigma_eff: Option<f32>) -> f32 {
-        let s_size = (2 * self.patch_radius + 1) * (2 * self.patch_radius + 1);
-        let s = self.effective_strength_with(sigma_eff);
-        NLM_NORM / (NLM_LEGACY * s * s * s_size as f32)
+        let patch_area = (2 * self.patch_radius + 1) * (2 * self.patch_radius + 1);
+        let strength = self.effective_strength_with(sigma_eff);
+        NLM_NORM / (NLM_LEGACY * strength * strength * patch_area as f32)
     }
 
-    /// `h2_inv_norm` using `self.hq.sigma_override` as the noise
-    /// estimate, or no estimate at all on the fast path.
-    ///
-    /// HQ denoisers that estimate noise automatically call
-    /// [`Self::h2_inv_norm_with`] each submit instead.
+    /// `h2_inv_norm` from `sigma_override`, or with no estimate on the fast path.
     pub fn h2_inv_norm(&self) -> f32 {
-        self.h2_inv_norm_with(self.hq.and_then(|hq| hq.sigma_override))
+        let sigma_override = self.hq.and_then(|hq| hq.sigma_override);
+        self.h2_inv_norm_with(sigma_override)
     }
 
-    /// The patch distance two noisy copies of the same content are
-    /// expected to show, for a given set of per-channel sigmas.
+    /// The patch distance two noisy copies of the same content are expected to show.
     ///
-    /// Each active channel contributes `2 * channel_scale * sigma^2`,
-    /// summed over all `(2 * patch_radius + 1)^2` taps.
-    ///
-    /// Returns 0 when the HQ noise floor is off, or when there is no
-    /// estimate to apply.
+    /// Each active channel adds `2 * channel_scale * sigma^2` per tap over all
+    /// `(2 * patch_radius + 1)^2` taps. It is 0 with the HQ noise floor off or no estimate.
     pub(super) fn noise_offset_with(&self, sigmas: Option<&[f32]>) -> f32 {
         match (self.hq, sigmas) {
             (Some(hq), Some(sigmas)) if hq.noise_floor => {
-                let s_size = (2 * self.patch_radius + 1) * (2 * self.patch_radius + 1);
+                let patch_area = (2 * self.patch_radius + 1) * (2 * self.patch_radius + 1);
                 let scale = channel_scale(self.channels);
                 let count = self.channels.count() as usize;
-                let sum_sq: f32 = sigmas.iter().take(count).map(|&s| s * s).sum();
-                2.0 * scale * sum_sq * s_size as f32
-            }
+                let sum_sq: f32 = sigmas.iter().take(count).map(|&sigma| sigma * sigma).sum();
+                2.0 * scale * sum_sq * patch_area as f32
+            },
             _ => 0.0,
         }
     }
 
-    /// `noise_offset` with `self.hq.sigma_override` applied to every
-    /// active channel, or no estimate at all on the fast path.
-    ///
-    /// HQ denoisers that estimate noise automatically call
-    /// [`Self::noise_offset_with`] each submit instead.
+    /// `noise_offset` with `sigma_override` on every active channel, or 0 without one.
     pub(super) fn noise_offset(&self) -> f32 {
         match self.hq.and_then(|hq| hq.sigma_override) {
             Some(sigma) => {
                 let sigmas = [sigma; 3];
-                self.noise_offset_with(Some(&sigmas[..self.channels.count() as usize]))
-            }
+                let active = &sigmas[..self.channels.count() as usize];
+                self.noise_offset_with(Some(active))
+            },
             None => 0.0,
         }
     }
@@ -400,12 +279,8 @@ impl NlmParams {
         1 + 2 * self.temporal_radius
     }
 
-    /// Rejects parameter combinations that would fail to launch, by
-    /// running the kernels past their shared-memory or register limits,
-    /// or that would produce meaningless output.
-    ///
-    /// `NlmDenoiser::new` calls this for you. Callers building params by
-    /// hand can call it directly to see errors before construction.
+    /// Rejects parameters that would push a kernel past its shared-memory or register limits, or
+    /// produce meaningless output.
     pub fn validate(&self) -> Result<(), anyhow::Error> {
         if self.patch_radius > MAX_PATCH_RADIUS {
             anyhow::bail!(
@@ -489,6 +364,7 @@ impl NlmParams {
                     sigma_s,
                 );
             }
+
             if !sigma_r.is_finite() || sigma_r <= 0.0 {
                 anyhow::bail!(
                     "bilateral prefilter sigma_r must be finite and greater than 0, got \
@@ -497,16 +373,9 @@ impl NlmParams {
                     sigma_r,
                 );
             }
-            // sigma_s decides the shared-memory tile radius through
-            // `prefilter::bilateral_radius`. Checking that derived
-            // radius, rather than working out an equivalent sigma_s
-            // threshold here, keeps this in step if the formula ever
-            // changes.
-            //
-            // A very large sigma_s can also overflow the radius inside
-            // the tile-size expression. This check catches that too,
-            // because an overflowed radius always lands far past the
-            // maximum.
+
+            // Checking the derived radius keeps this in step with its formula, and also catches a
+            // sigma_s large enough to overflow the tile-size expression.
             let bilateral_radius = prefilter::bilateral_radius(sigma_s);
             if bilateral_radius > MAX_BILATERAL_RADIUS {
                 anyhow::bail!(
@@ -519,16 +388,11 @@ impl NlmParams {
                     MAX_BILATERAL_RADIUS,
                 );
             }
-            // A sigma can be finite and positive yet small enough that
-            // `sigma * sigma` underflows to 0.0 in f32, which happens
-            // below roughly 3.8e-20. That makes the reciprocal
-            // normalisation factor the kernel uses infinite.
-            //
-            // Checking the same derived factor `run_bilateral` computes
-            // for the launch catches this wherever the underflow
-            // threshold actually falls, without picking a sigma cutoff
-            // by hand or repeating the expression here.
-            if !prefilter::inv_two_sigma_sq(sigma_s).is_finite() {
+
+            // A positive sigma below roughly 3.8e-20 squares to 0.0 in f32, so the launch's own
+            // factor is checked rather than a hand-picked sigma cutoff.
+            let inv_two_sigma_s_sq = prefilter::inv_two_sigma_sq(sigma_s);
+            if !inv_two_sigma_s_sq.is_finite() {
                 anyhow::bail!(
                     "bilateral prefilter sigma_s is too small, got {}. Squaring it \
                      underflows to 0 in f32, which makes the spatial-weight \
@@ -536,7 +400,9 @@ impl NlmParams {
                     sigma_s,
                 );
             }
-            if !prefilter::inv_two_sigma_sq(sigma_r).is_finite() {
+
+            let inv_two_sigma_r_sq = prefilter::inv_two_sigma_sq(sigma_r);
+            if !inv_two_sigma_r_sq.is_finite() {
                 anyhow::bail!(
                     "bilateral prefilter sigma_r is too small, got {}. Squaring it \
                      underflows to 0 in f32, which makes the range-weight normalisation \
@@ -553,6 +419,7 @@ impl NlmParams {
                     strength_scale,
                 );
             }
+
             if self.patch_radius > SEPARABLE_THRESHOLD {
                 anyhow::bail!(
                     "the nlm pilot uses the windowed spatial kernel, which supports \
@@ -569,11 +436,7 @@ impl NlmParams {
     }
 }
 
-/// The per-channel distance scale for a channel mode, which is 3 for
-/// luma, 1.5 for chroma, and 1 for full YUV.
-///
-/// This matches the `channel_scale` the weighting kernels use on the
-/// GPU, and it is the same for every channel within a given mode.
+/// The per-channel distance scale, matching the `channel_scale` the weighting kernels use.
 pub(super) fn channel_scale(channels: ChannelMode) -> f32 {
     match channels {
         ChannelMode::Luma => 3.0,
@@ -582,15 +445,12 @@ pub(super) fn channel_scale(channels: ChannelMode) -> f32 {
     }
 }
 
-/// The scale-weighted RMS of the per-channel noise estimates, over the
-/// channels a mode actually uses.
+/// The scale-weighted RMS of the active channels' noise estimates.
 ///
-/// Because `channel_scale` is the same for every channel in a mode, the
-/// weighting cancels out and this is really just a plain RMS.
-///
-/// Anything in `sigmas` past the mode's channel count is ignored.
+/// The scale is the same for every channel in a mode, so this is a plain RMS. Entries past the
+/// mode's channel count are ignored.
 pub(super) fn sigma_eff(sigmas: &[f32], channels: ChannelMode) -> f32 {
     let count = channels.count() as usize;
-    let sum_sq: f32 = sigmas.iter().take(count).map(|&s| s * s).sum();
+    let sum_sq: f32 = sigmas.iter().take(count).map(|&sigma| sigma * sigma).sum();
     (sum_sq / count as f32).sqrt()
 }

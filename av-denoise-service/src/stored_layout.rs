@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 
 use av_decoders::{Decoder, Rational32};
-use av_denoise_core::{Depth, FrameLayout, Subsampling};
+use av_denoise::{Depth, FrameLayout, Subsampling};
 
 use crate::layout::{merge_adjacent_ranges, subsampling_from_av_decoders};
 use crate::source::SourceIndex;

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use av_decoders::Decoder;
-use av_denoise_core::Planes;
+use av_denoise::Planes;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::SceneLayout;
@@ -158,7 +158,7 @@ fn emitted_frames<'a>(
             Err(error) => {
                 pools.staged.recycle(planes);
                 Some(Err(error))
-            }
+            },
         }
     })
 }

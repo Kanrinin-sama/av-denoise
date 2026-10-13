@@ -1,9 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use av_denoise_core::{
-    FrameLayout, PlanarDenoiser, PlaneOptions, Planes, WarmUp, kernel_key, push_needs_retry,
-};
+use av_denoise::{FrameLayout, PlanarDenoiser, PlaneOptions, Planes, WarmUp, kernel_key, push_needs_retry};
 
 use crate::worker::Resident;
 
@@ -16,18 +14,18 @@ const WARM_FRAMES: usize = 8;
 /// This has to run before the first denoiser is built, because the
 /// first CubeCL client locks the global config the moment it is built.
 pub fn install_kernel_cache() -> Result<Option<PathBuf>, anyhow::Error> {
-    match av_denoise_core::install_compilation_cache() {
+    match av_denoise::install_compilation_cache() {
         Ok(Some(path)) => {
             tracing::info!(?path, "caching compiled kernels");
             Ok(Some(path))
-        }
+        },
         Ok(None) => {
             tracing::info!(
                 "kernel caching is off, every run recompiles. Unset {} to turn it back on.",
-                av_denoise_core::COMPILATION_CACHE_ENV,
+                av_denoise::COMPILATION_CACHE_ENV,
             );
             Ok(None)
-        }
+        },
         Err(err) => Err(anyhow::Error::new(err).context("unable to install the kernel cache")),
     }
 }
@@ -37,7 +35,7 @@ pub fn install_kernel_cache() -> Result<Option<PathBuf>, anyhow::Error> {
 /// Takes a place in the cross-process warm-up queue first, so concurrent
 /// `av-denoise` processes do not each compile into a cold cache. The
 /// returned place, if any, is the caller's to finish once this
-/// denoiser has produced its first output frame — see [`WarmUp`] for
+/// denoiser has produced its first output frame â€” see [`WarmUp`] for
 /// why it cannot be finished any earlier than that.
 pub fn create_denoiser(
     opts: &PlaneOptions,

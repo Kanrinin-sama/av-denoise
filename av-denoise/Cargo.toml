@@ -24,70 +24,35 @@ autobins = false
 rustdoc-args = ["--cfg", "docsrs"]
 targets = ["x86_64-unknown-linux-gnu"]
 
-[[bin]]
-name = "av-denoise"
-path = "src/bin/main.rs"
-required-features = ["binary"]
-
 [dependencies]
 av-denoise-core.workspace = true
-av-denoise-service = { workspace = true, optional = true }
 anyhow.workspace = true
+bon.workspace = true
+cubecl.workspace = true
+cubecl-runtime.workspace = true
+cubecl-environment.workspace = true
+etcetera = "0.11"
+thiserror.workspace = true
 tracing.workspace = true
 strum.workspace = true
 strum_macros.workspace = true
 
-# Frame ingestion via ffms2
-av-scenechange = { version = "0.24", optional = true, features = ["ffms2"] }
-av-decoders = { version = "0.11", optional = true, features = ["ffms2"] }
-# Reads the frame index av-decoders does not surface. Must track the
-# ffms2-sys that av-decoders links, so both share one set of handles.
-ffms2-sys = { version = "0.3", optional = true }
-v_frame = { version = "0.7", optional = true }
-rayon = { version = "1", optional = true }
-
-# Frame ingestion via y4m stdin
-y4m = { version = "0.8", optional = true }
-
-# Binary dependencies
-bytesize = { workspace = true, optional = true }
-clap = { version = "4", optional = true, features = ["derive", "env"] }
-crossbeam-channel = { workspace = true, optional = true }
-mimalloc = { version = "0.1", optional = true, default-features = false }
-indicatif = { version = "0.18", optional = true, default-features = false }
-tracing-indicatif = { version = "0.3", optional = true }
-tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter"] }
-serde = { version = "1", optional = true, features = ["derive"] }
-serde_json = { version = "1", optional = true }
-tempfile = { version = "3", optional = true }
-
-[build-dependencies]
-pkg-config = { version = "0.3.34", optional = true }
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+wgpu = "30"
 
 [features]
-vulkan = ["av-denoise-core/vulkan", "av-denoise-service?/vulkan"]
-metal = ["av-denoise-core/metal", "av-denoise-service?/metal"]
-cuda = ["av-denoise-core/cuda", "av-denoise-service?/cuda"]
-rocm = ["av-denoise-core/rocm", "av-denoise-service?/rocm"]
-binary = [
-    "av-denoise-service",
-    "bytesize",
-    "clap",
-    "crossbeam-channel",
-    "mimalloc",
-    "av-scenechange",
-    "av-decoders",
-    "ffms2-sys",
-    "v_frame",
-    "rayon",
-    "y4m",
-    "indicatif",
-    "tracing-indicatif",
-    "tracing-subscriber",
-    "serde",
-    "serde_json",
-    "tempfile",
-]
-# Links ffms2 and FFmpeg statically from the vcpkg tree. See `just build-static`.
-static-ffms2 = ["binary", "av-decoders/ffms2_static", "dep:pkg-config"]
+vulkan = ["av-denoise-core/vulkan", "cubecl/vulkan"]
+metal = ["av-denoise-core/metal", "cubecl/metal"]
+cuda = ["av-denoise-core/cuda", "cubecl/cuda"]
+rocm = ["av-denoise-core/rocm", "cubecl/hip"]
 default = ["vulkan"]
+
+[[bench]]
+name = "denoise"
+harness = false
+
+[[bench]]
+name = "reseed"
+harness = false

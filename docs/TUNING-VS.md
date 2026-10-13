@@ -28,11 +28,13 @@ variant and everything above it selects NLMeans-HQ. In Python you pick the algor
 `NlmHQ(clip, preset="veryfast")` is a spatial-only NLMeans-HQ run, and `Nlm(clip, preset="slow")` is
 the fast variant with a 9-frame window, neither of which the CLI can express through `--preset`.
 
-**There is no scene detection.** The plugin estimates the noise level fresh for each frame from that
-frame's own temporal window rather than smoothing it over a scene, so a frame denoises to the same
-pixels no matter what order VapourSynth asks for frames in. Tuning still works the same way, but if
-you have wildly different-looking scenes in one clip, trimming and denoising them separately gives
-each one its own dials.
+**There is no scene detection.** Like the CLI, the plugin smooths the noise estimate over the
+stream's history. Unlike the CLI, it does not reset the estimate at a
+scene cut. A render from the start is consistent. Frames after a seek, or after a burst of requests
+wider than twice VapourSynth's thread count, can differ slightly for a while. In tests the drift
+lasted 20 or more frames after a seek. Tuning still works the same way, but if you have wildly
+different-looking scenes in one clip, trimming and denoising them separately gives each one its own
+dials.
 
 Every numeric parameter is optional. An unset one falls back to what `preset` resolves for it, and
 anything you set explicitly wins over the preset.
@@ -55,14 +57,6 @@ instead, since NL4D has nothing to group without neighbours.
 
 ### The NL4D dials
 
-| Symptom                               | First thing to try              | Second            |
-|---------------------------------------|---------------------------------|-------------------|
-| Grain or noise still visible          | `lambda_ht_scale` up a little   | one preset higher |
-| Fine texture getting scrubbed         | `lambda_ht_scale` down a little | `sigma_scale=0.9` |
-| Result looks under-cleaned everywhere | `sigma_scale=1.1`               | one preset higher |
-| Smearing or ghosting on motion        | one preset lower                | `refine` up       |
-| Too slow                              | `spatial_radius` down           | one preset lower  |
-
 **`lambda_ht_scale` is the main dial.** The threshold it scales is how many standard deviations
 of estimated noise a transform coefficient has to clear to survive, so raising the scale removes
 more noise and takes more fine detail with it. Move in steps of **0.05 to 0.1** and judge by eye,
@@ -82,13 +76,6 @@ plane without touching the other, and `lambda_ht_scale` still applies on top of 
 clean = avd.Nl4d(clip, luma_lambda_ht=5.0, lambda_ht_scale=1.05)
 ```
 
-**`sigma_scale` is the other one**, and it does something different. The lambda dials decide how
-aggressive to be at a given noise level. `sigma_scale` corrects the noise level itself. That
-estimate also feeds the motion confidence scoring, so when the whole result reads uniformly
-under- or over-cleaned, correcting the level fixes the cause rather than the symptom. When you
-are happy with the level and just want to adjust how much noise is removed vs detail, use
-`lambda_ht_scale`.
-
 **`spatial_radius` is the speed dial.** The centre-frame search covers `(2 * radius + 1)^2`
 positions, so it dominates the work. Dropping it from 9 to 6 roughly halves the candidates, which
 is exactly what `preset="veryfast"` does.
@@ -104,24 +91,31 @@ clean = avd.Nl4d(clip, noise_map=False)
 **`pooled_threshold=False` turns off the pooled threshold.** It is on by default. Each frequency
 is judged together with its neighbours rather than alone, so faint lines and fine texture
 survive where each frequency on its own would fall under the threshold. Turn it off, and set
-`flat_boost=1.5`, to get the output of earlier releases.
+`pooled_threshold=False, enable_psy=True, psy_flat_boost=1.5, psy_flat_texture_cut=1, psy_line_ring=0`,
+to get the output of earlier releases.
 
-**`flat_boost`, `chroma_flat_boost`, `shadow_soften` and `flat_texture_cut` adjust the noise map
-by area.** Flat, grainy areas such as skies are filtered harder, 1.75 times by default on luma and
-1.5 times on chroma. The chroma boost applies when chroma is denoised in its own pass, not under
-`channel_mode="yuv"`. Textured dark areas are filtered more gently, at 0.65 times by default,
-fading out between luma 128 and 160. `1` turns each one off, and `noise_map=False` turns all
-four off.
+**`enable_psy=True` turns on the psy options.** They are off by default. Flat, grainy areas such
+as skies are filtered harder, 1.75 times by default on luma and 1.5 times on chroma. The chroma
+boost applies when chroma is denoised in its own pass, not under `channel_mode="yuv"`. Textured
+dark areas are filtered more gently, at 0.65 times by default, fading out between luma 128 and 160.
+The areas within 16 pixels of a strong line skip shadow soften and the flat texture cut, so the
+grain beside dark ink lines is filtered like the rest of the frame. `noise_map=False` turns all of it off.
 
 ```python
-clean = avd.Nl4d(clip, shadow_soften=0.8)
+clean = avd.Nl4d(clip, enable_psy=True)
 ```
 
-**`flat_texture_cut` keeps faint texture out of the flat areas.** Grain points every which way,
-while faint lines and edges share one direction. An area whose surroundings line up at or above
-the cut, 0.21 by default, is filtered as texture rather than boosted as flat. Lower it to keep
-more faint texture in dark scenes, raise it to filter more areas as flat. It applies to luma
-only, and `1` turns it off.
+**`psy_flat_boost`, `psy_chroma_flat_boost`, `psy_shadow_soften`, `psy_flat_texture_cut` and
+`psy_line_ring` tune the psy options.** Each needs `enable_psy=True`, and `1` (or `0` for the line
+ring) turns that one off. `psy_flat_texture_cut` keeps faint texture out of the flat areas. Grain
+points every which way, while faint lines and edges share one direction, so an area whose
+surroundings line up at or above the cut, 0.21 by default, is filtered as texture rather than
+boosted as flat. Lower it to keep more faint texture in dark scenes. `psy_line_ring` sets how many
+pixels around a strong line skip shadow soften and the flat texture cut, between 0 and 64.
+
+```python
+clean = avd.Nl4d(clip, enable_psy=True, psy_shadow_soften=0.8)
+```
 
 ### What not to touch in NL4D
 
@@ -130,6 +124,12 @@ only, and `1` turns it off.
   actually want.
 - **`temporal_radius`** is what `preset` mostly exists to resolve. Setting it by hand is fine, but
   it is the same lever the preset ladder pulls, so reach for the ladder first.
+- **`sigma_scale`**, and it does something different. The lambda dials decide how
+  aggressive to be at a given noise level. `sigma_scale` corrects the noise level itself. That
+  estimate also feeds the motion confidence scoring, so when the whole result reads uniformly
+  under- or over-cleaned, correcting the level fixes the cause rather than the symptom. When you
+  are happy with the level and just want to adjust how much noise is removed vs detail, use
+  `lambda_ht_scale`.
 
 `strength`, `luma_strength`, `chroma_strength`, `search_radius`, `patch_radius`, `prefilter` and
 `motion_compensation` all belong to the NLMeans weighting pass, which NL4D does not have. Passing
@@ -209,9 +209,9 @@ fixes the cause rather than the symptom.
   take `chroma_strength` above the default without touching luma.
 - **Fast motion looks smeary.** Set `motion_compensation=True` first. If a scene still trails,
   drop one preset (a shallower window has less material to mis-blend).
-- **Mixed content in one clip.** With no scene detection the estimate is per frame, so a clip that
-  swings between very clean and very grainy material is better served by trimming it and giving
-  each part its own call.
+- **Mixed content in one clip.** With no scene detection the estimate carries across cuts and
+  adapts slowly, so a clip that swings between very clean and very grainy material is better
+  served by trimming it and giving each part its own call.
 
 ### What not to touch in NLMeans-HQ
 

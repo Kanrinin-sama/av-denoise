@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use av_denoise_core::FrameLayout;
+use av_denoise::FrameLayout;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::pipeline::{Pipeline, panic_message};

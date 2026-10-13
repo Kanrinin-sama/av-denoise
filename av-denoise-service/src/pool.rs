@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use av_denoise_core::{FrameLayout, Planes};
+use av_denoise::{FrameLayout, Planes};
 
 pub(crate) struct PlanesPool {
     layout: FrameLayout,

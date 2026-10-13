@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use av_decoders::Rational32;
-use av_denoise_core::{FrameLayout, Planes, SceneGrain};
+use av_denoise::{FrameLayout, Planes, SceneGrain};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::budget::CANCEL_POLL;

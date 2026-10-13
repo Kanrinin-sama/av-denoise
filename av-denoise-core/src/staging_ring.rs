@@ -50,7 +50,8 @@ impl StagingRing {
         regions: &[Region],
         depth: usize,
     ) -> Option<Self> {
-        let client = (client as &dyn Any).downcast_ref::<ComputeClient<WgpuRuntime>>()?;
+        let client =
+            (client as &dyn Any).downcast_ref::<ComputeClient<WgpuRuntime<cubecl::wgpu::AutoCompiler>>>()?;
         let (device, queue) = gpu_share::device_and_queue(client)?;
 
         let mut staging_len = 0;

@@ -1,5 +1,5 @@
 use av_decoders::Decoder;
-use av_denoise_core::{Depth, FrameLayout, Planes};
+use av_denoise::{Depth, FrameLayout, Planes};
 
 /// Checks each plane's byte length against the layout, failing with an error naming which plane
 /// is wrong, the length found and the length expected.

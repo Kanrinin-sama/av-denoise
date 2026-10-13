@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use av_decoders::Decoder;
-use av_denoise_core::{FrameLayout, PlaneOptions};
+use av_denoise::{FrameLayout, PlaneOptions};
 
 use crate::budget::{FramePermits, temporal_radius};
 use crate::dispatch::{Staging, dispatch_frames};
@@ -202,14 +202,14 @@ impl Pipeline {
                 Ok(Err(error)) => {
                     failure.get_or_insert(error);
                     None
-                }
+                },
                 Err(panic) => {
                     failure.get_or_insert(anyhow::anyhow!(
                         "worker panicked: {}",
                         panic_message(panic.as_ref())
                     ));
                     None
-                }
+                },
             };
             residents.push(resident);
         }

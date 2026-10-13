@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use av_denoise_core::PlaneOptions;
+use av_denoise::PlaneOptions;
 
 use crate::{CreationGuard, FrameRange};
 

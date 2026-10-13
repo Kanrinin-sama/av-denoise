@@ -16,7 +16,7 @@ format:
 # Lints all three crates. Pass `-- -D warnings` to fail on any lint.
 clippy *ARGS:
     cargo clippy -p av-denoise-core --features vulkan --all-targets {{ARGS}}
-    cargo clippy -p av-denoise --features vulkan,binary --all-targets {{ARGS}}
+    cargo clippy -p av-denoise-cli --features vulkan,binary --all-targets {{ARGS}}
     cargo clippy -p av-denoise-vs --features vulkan --all-targets {{ARGS}}
 
 # Formats the shipped Python, matching the `python` job in the PR checks workflow. scripts/ is excluded.
@@ -33,10 +33,10 @@ typecheck-py:
         mypy --config-file packages/vs-avd/pyproject.toml packages/vs-avd/src/vsavd
 
 build *ARGS:
-    cargo build -p av-denoise {{ARGS}}
+    cargo build -p av-denoise-cli {{ARGS}}
 
 run *ARGS:
-    cargo run -p av-denoise {{ARGS}}
+    cargo run -p av-denoise-cli {{ARGS}}
 
 # Builds the static ffms2 and FFmpeg tree from vcpkg.json into vcpkg_installed/.
 static-deps:
@@ -61,7 +61,7 @@ build-static features=static_features:
     export FFMS_INCLUDE_DIR="$prefix/include"
     export FFMS_LIB_DIR="$prefix/lib"
     export PKG_CONFIG_PATH="$prefix/lib/pkgconfig"
-    cargo build --release -p av-denoise --features {{features}},static-ffms2
+    cargo build --release -p av-denoise-cli --features {{features}},static-ffms2
 
 bench *ARGS:
     cargo bench -p av-denoise-core {{ARGS}}
@@ -98,7 +98,7 @@ make-10bit-sample:
 denoise-file input output workers="2" *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo run --release --bin av-denoise --features binary -- nlmeans {{ARGS}} --workers {{workers}} --input "{{input}}" \
+    cargo run --release -p av-denoise-cli --bin av-denoise --features binary -- nlmeans {{ARGS}} --workers {{workers}} --input "{{input}}" \
         | ffmpeg -hide_banner -stats -stats_period 0.5 -loglevel info \
             -y -f yuv4mpegpipe -i - -c:v ffv1 "{{output}}"
 
@@ -136,7 +136,7 @@ benchmark-e2e *ARGS: _build-benchmark-bin _rebuild-benchmark-vs-plugin
     uv run --directory scripts src/benchmark_e2e.py {{ARGS}}
 
 _build-benchmark-bin:
-    cargo build --release --bin av-denoise --features {{bench_features}}
+    cargo build --release -p av-denoise-cli --bin av-denoise --features {{bench_features}}
 
 # The benchmark's plugin arms take vsavd from `packages/vs-avd` as an editable
 # install, and `uv run` does not rebuild the cdylib after a Rust change, so they

@@ -1,19 +1,15 @@
 use super::noise_curve::stepped_curve;
-use super::{Setup, cross_frame_setup, run_fused_walk, unique_frame};
+use super::{Setup, chroma_cross_frame_setup, cross_frame_setup, run_fused_walk, unique_frame};
 
-/// Asserts the two search walks aggregated the same thing, byte for
-/// byte.
+/// Asserts the two search walks aggregated the same thing, byte for byte.
 ///
-/// Exact equality is the right bar rather than a tolerance. The
-/// warp-uniform walk offers the same candidates, in the same order, and
-/// scores them with the same arithmetic. Its extra turns carry the
-/// `3.0e38` an unfilled slot already holds, which cannot displace a
-/// slot, so they change nothing about the group that is retired. A
-/// difference here means the masking let a dead position into a group
-/// or dropped a live one, not that floating point drifted.
-fn assert_walks_agree(label: &str, s: &Setup) {
-    let clipped = run_fused_walk(s, Some(false));
-    let uniform = run_fused_walk(s, Some(true));
+/// The warp-uniform walk offers the same candidates in the same order with the same arithmetic. Its
+/// extra turns carry the `3.0e38` an unfilled slot already holds, which cannot displace a slot. A
+/// difference therefore means the masking let a dead position in or dropped a live one, not that
+/// floating point drifted.
+fn assert_walks_agree(label: &str, setup: &Setup) {
+    let clipped = run_fused_walk(setup, Some(false));
+    let uniform = run_fused_walk(setup, Some(true));
 
     assert_eq!(
         clipped.group_weight, uniform.group_weight,
@@ -28,70 +24,132 @@ fn assert_walks_agree(label: &str, s: &Setup) {
         "{label}: the two search walks scattered different weights",
     );
     assert!(
-        uniform.group_weight.iter().any(|w| *w > 0.0),
+        uniform.group_weight.iter().any(|weight| *weight > 0.0),
         "{label}: neither walk aggregated anything, so agreeing proves nothing",
     );
 }
 
-/// The warp-uniform walk is only correct if it is a pure change of
-/// schedule, so this pins it against the walk it replaces on the spatial
-/// search alone.
-///
-/// The references along the left and top edges are the ones whose
-/// clipped rectangle is narrower than the unclipped span, which is
-/// exactly where the uniform walk takes turns the other one does not.
-/// Those turns have to score nothing.
+/// References along the left and top edges have a clipped rectangle narrower than the unclipped
+/// span, which is where the uniform walk takes extra turns. Those turns must score nothing.
 #[test]
 fn warp_uniform_search_matches_the_clipped_search_on_the_spatial_pass() {
-    let (w, h) = (48u32, 48u32);
-    let s = Setup::spatial_only(unique_frame(w, h), w, h);
+    let (width, height) = (48u32, 48u32);
+    let frame = unique_frame(width, height);
+    let setup = Setup::spatial_only(frame, width, height);
 
-    assert_walks_agree("spatial", &s);
+    assert_walks_agree("spatial", &setup);
 }
 
-/// The same equivalence across the temporal search, which is where the
-/// two walks diverge most.
-///
-/// [cross_frame_setup] is built for this: its motion vectors push some
-/// refine windows off the frame so the clip matters, and its confidence
-/// field straddles `c_min`, so blocks that one group scores its
-/// neighbour skips. Under the clipped walk those are the two things that
-/// give groups sharing a warp different trip counts, and under the
-/// uniform walk they have to fold into the mask instead without moving
-/// a single member.
+/// [cross_frame_setup] pushes some refine windows off the frame and its confidences straddle `c_min`,
+/// the two things that give groups sharing a warp different trip counts under the clipped walk.
 #[test]
 fn warp_uniform_search_matches_the_clipped_search_across_frames() {
-    let s = cross_frame_setup(64, 64, 2);
+    let setup = cross_frame_setup(64, 64, 2);
 
-    assert_walks_agree("cross frame", &s);
+    assert_walks_agree("cross frame", &setup);
 }
 
-/// A gated neighbour is the one case where the uniform walk reads a
-/// motion block the clipped walk never touches, so the `seen_*` slot it
-/// leaves behind has to stay empty or it would hide positions a later
-/// covering block still owes the search.
+/// The uniform walk reads a gated motion block the clipped walk never touches, so the `seen_*` slot
+/// it leaves must stay empty or it would hide positions a later covering block still owes the search.
 #[test]
 fn warp_uniform_search_matches_the_clipped_search_when_every_neighbour_is_gated() {
-    let mut s = cross_frame_setup(64, 64, 2);
-    // Above every confidence the setup plants, so no temporal block ever
-    // scores and every `seen_*` slot is one the uniform walk wrote.
-    s.c_min = 2.0;
+    let mut setup = cross_frame_setup(64, 64, 2);
+    // Above every planted confidence, so every `seen_*` slot is one the uniform walk wrote.
+    setup.c_min = 2.0;
 
-    assert_walks_agree("all gated", &s);
+    assert_walks_agree("all gated", &setup);
 }
 
-/// The same equivalence at radius 1, where the grid is four volumes of two frames.
+/// At radius 1 the grid is four volumes of two frames.
 #[test]
 fn warp_uniform_search_matches_the_clipped_search_at_radius_one() {
-    let s = cross_frame_setup(64, 64, 1);
+    let setup = cross_frame_setup(64, 64, 1);
 
-    assert_walks_agree("radius one", &s);
+    assert_walks_agree("radius one", &setup);
 }
 
 #[test]
 fn warp_uniform_search_matches_the_clipped_search_with_a_noise_curve() {
-    let mut s = cross_frame_setup(64, 64, 2);
-    s.noise_curve = Some(stepped_curve());
+    let mut setup = cross_frame_setup(64, 64, 2);
+    let curve = stepped_curve();
+    setup.noise_curve = Some(curve);
 
-    assert_walks_agree("noise curve", &s);
+    assert_walks_agree("noise curve", &setup);
+}
+
+/// [cross_frame_setup] with every motion block of a neighbour carrying one vector, so the refine
+/// rectangles covering an anchor coincide.
+fn shared_vector_setup(radius: u32) -> Setup {
+    let mut setup = cross_frame_setup(64, 64, radius);
+
+    for t in 0..(2 * radius) {
+        for block in 0..setup.conf_stride {
+            let mv_index = (t * setup.mv_stride + block * 2) as usize;
+            setup.mv_field[mv_index] = t as i32 - 1;
+            setup.mv_field[mv_index + 1] = 1 - t as i32;
+        }
+    }
+
+    setup
+}
+
+/// [cross_frame_setup] with vectors that push most refine windows past the right and bottom edges by
+/// slightly different amounts, so clamping makes rectangles equal or nested.
+fn edge_clamped_setup(radius: u32) -> Setup {
+    let mut setup = cross_frame_setup(64, 64, radius);
+
+    for t in 0..(2 * radius) {
+        for block in 0..setup.conf_stride {
+            let mv_index = (t * setup.mv_stride + block * 2) as usize;
+            let overshoot_x = (block % 3) as i32;
+            let overshoot_y = (block % 2) as i32;
+            setup.mv_field[mv_index] = 40 + overshoot_x;
+            setup.mv_field[mv_index + 1] = 40 + overshoot_y;
+        }
+    }
+
+    setup
+}
+
+#[test]
+fn warp_uniform_search_matches_the_clipped_search_when_covering_blocks_share_a_vector() {
+    let setup = shared_vector_setup(2);
+
+    assert_walks_agree("shared vector", &setup);
+}
+
+#[test]
+fn warp_uniform_search_matches_the_clipped_search_when_every_shared_block_is_confident() {
+    let mut setup = shared_vector_setup(2);
+    setup.confidence.fill(1.0);
+
+    assert_walks_agree("shared vector, all confident", &setup);
+}
+
+#[test]
+fn warp_uniform_search_matches_the_clipped_search_when_the_edge_clamps_rectangles_together() {
+    let mut setup = edge_clamped_setup(2);
+    setup.confidence.fill(1.0);
+
+    assert_walks_agree("edge clamped", &setup);
+}
+
+#[test]
+fn warp_uniform_search_matches_the_clipped_search_with_the_f16_search() {
+    let mut cross_frame = cross_frame_setup(64, 64, 2);
+    cross_frame.f16_search = true;
+    assert_walks_agree("f16 cross frame", &cross_frame);
+
+    let mut shared = shared_vector_setup(2);
+    shared.f16_search = true;
+    shared.confidence.fill(1.0);
+    assert_walks_agree("f16 shared vector", &shared);
+}
+
+#[test]
+fn warp_uniform_search_matches_the_clipped_search_with_the_f16_search_on_wide_storage() {
+    let mut setup = chroma_cross_frame_setup(64, 64, 2);
+    setup.f16_search = true;
+
+    assert_walks_agree("f16 chroma cross frame", &setup);
 }

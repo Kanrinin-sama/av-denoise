@@ -3,9 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use av_denoise_core::{
-    FrameLayout, PlanarDenoiser, PlaneOptions, Planes, SceneGrain, WarmUp, push_needs_retry,
-};
+use av_denoise::{FrameLayout, PlanarDenoiser, PlaneOptions, Planes, SceneGrain, WarmUp, push_needs_retry};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::CreationGuard;
@@ -199,7 +197,7 @@ fn flush_worker(
     wd: &mut PlanarDenoiser,
     warm_up: &mut Option<WarmUp>,
     pending: &mut Pending,
-    pools: &SharedPools,
+    _pools: &SharedPools,
     tx: &Sender<OutputMsg>,
 ) -> Result<(), anyhow::Error> {
     let mut disconnected = false;
@@ -212,7 +210,7 @@ fn flush_worker(
         if let Some((global_idx, permit)) = pending.pop_front() {
             let msg = OutputMsg {
                 global_idx,
-                planes: std::mem::replace(out, pools.emitted.take()),
+                planes: out,
                 _permit: permit,
             };
             let did_send = tx.send(msg).is_ok();

@@ -14,7 +14,7 @@ use crate::staging_ring::StagingRing;
 
 /// How many uploads can be in flight before the next one waits on the
 /// oldest: one per pending frame, plus the one being written.
-pub(crate) const UPLOAD_RING_DEPTH: usize = crate::denoiser::MAX_PENDING + 1;
+pub(crate) const UPLOAD_RING_DEPTH: usize = 2 + 1;
 
 pub(crate) struct Region {
     pub(crate) handle: Handle,
@@ -22,7 +22,7 @@ pub(crate) struct Region {
     pub(crate) capacity: usize,
 }
 
-pub(crate) struct Uploader<R: Runtime> {
+pub struct Uploader<R: Runtime> {
     client: ComputeClient<R>,
     regions: Vec<Region>,
     #[cfg(any(feature = "vulkan", feature = "metal"))]
@@ -31,7 +31,7 @@ pub(crate) struct Uploader<R: Runtime> {
 
 impl<R: Runtime> Uploader<R> {
     /// One GPU buffer per entry of `capacities`, in bytes.
-    pub(crate) fn new(client: &ComputeClient<R>, capacities: &[usize]) -> Self {
+    pub fn new(client: &ComputeClient<R>, capacities: &[usize]) -> Self {
         let regions: Vec<Region> = capacities
             .iter()
             .map(|&capacity| {
@@ -52,13 +52,8 @@ impl<R: Runtime> Uploader<R> {
     }
 
     /// The buffer holding `region`'s latest upload.
-    pub(crate) fn handle(&self, region: usize) -> &Handle {
+    pub fn handle(&self, region: usize) -> &Handle {
         &self.regions[region].handle
-    }
-
-    /// The most bytes one upload can write into `region`.
-    pub(crate) fn capacity(&self, region: usize) -> usize {
-        self.regions[region].capacity
     }
 
     /// Uploads `contents[i]`'s parts back to back into region `i`, with
@@ -66,7 +61,7 @@ impl<R: Runtime> Uploader<R> {
     ///
     /// Launches queued before this call still see the previous contents,
     /// and launches queued after it see the new ones.
-    pub(crate) fn upload(&mut self, contents: &[&[&[u8]]]) {
+    pub fn upload(&mut self, contents: &[&[&[u8]]]) {
         #[cfg(any(feature = "vulkan", feature = "metal"))]
         if let Some(ring) = self.ring.as_mut() {
             ring.upload(&self.client, contents);
