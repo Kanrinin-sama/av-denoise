@@ -171,12 +171,6 @@ fn run_slot(
     requests: &Receiver<SlotRequest>,
     mut residents: Vec<Option<Resident>>,
 ) {
-    if let Err(error) = pipeline.build_residents(&mut residents, layout) {
-        tracing::warn!(
-            error = format!("{error:#}"),
-            "window slot denoisers failed to build"
-        );
-    }
     let mut decoder = None;
     while let Ok(request) = requests.recv() {
         let result = pipeline
