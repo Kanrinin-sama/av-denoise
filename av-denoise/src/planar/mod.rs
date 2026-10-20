@@ -106,6 +106,7 @@ pub struct Planes {
     pub y: Vec<u8>,
     pub u: Vec<u8>,
     pub v: Vec<u8>,
+    pub device: Option<crate::device_output::DeviceFrame>,
 }
 
 /// Which planes a caller wants cleaned.
@@ -146,6 +147,7 @@ impl ChannelIntent {
 #[derive(Debug, Clone)]
 pub struct PlaneOptions {
     pub accelerators: Vec<Accelerator>,
+    pub device_sink: Option<std::sync::Arc<dyn crate::device_output::DeviceSink>>,
     pub device: Device,
     pub intent: ChannelIntent,
     /// Whether to clean each frame on its own or across a temporal window.
@@ -230,6 +232,7 @@ impl PlaneOptions {
             .algorithm(algorithm)
             .depth(depth)
             .maybe_output_depth(self.output_depth)
+            .device_output(self.device_sink.is_some())
             .build()
     }
 }
@@ -300,7 +303,12 @@ fn into_array<const N: usize>(planes: Vec<Vec<u8>>) -> [Vec<u8>; N] {
 
 fn into_yuv(planes: Vec<Vec<u8>>) -> Planes {
     let [y, u, v] = into_array(planes);
-    Planes { y, u, v }
+    Planes {
+        y,
+        u,
+        v,
+        device: None,
+    }
 }
 
 fn into_uv(planes: Vec<Vec<u8>>) -> (Vec<u8>, Vec<u8>) {
@@ -333,10 +341,15 @@ pub struct PlanarDenoiser {
     luma_passthrough: VecDeque<Vec<u8>>,
     chroma_passthrough: VecDeque<(Vec<u8>, Vec<u8>)>,
     temporal_radius: u32,
+    device_sink: Option<std::sync::Arc<dyn crate::device_output::DeviceSink>>,
 }
 
 impl PlanarDenoiser {
     pub fn create(options: &PlaneOptions, layout: FrameLayout) -> Result<Self, anyhow::Error> {
+        let _queue = options
+            .device_sink
+            .as_ref()
+            .map(|_| crate::gpu_share::queue_lock());
         let (chroma_width, chroma_height) = layout.chroma_dims();
 
         if chroma_width == 0 || chroma_height == 0 {
@@ -405,7 +418,8 @@ impl PlanarDenoiser {
             depth: options.output_depth.unwrap_or(layout.depth),
             ..layout
         };
-        Ok(Self {
+        let result = Self {
+            device_sink: options.device_sink.clone(),
             layout,
             output_layout,
             luma,
@@ -414,7 +428,13 @@ impl PlanarDenoiser {
             luma_passthrough: VecDeque::new(),
             chroma_passthrough: VecDeque::new(),
             temporal_radius,
-        })
+        };
+        if result.device_sink.is_some() {
+            for denoiser in [&result.luma, &result.chroma, &result.yuv].into_iter().flatten() {
+                denoiser.flush_gpu()?;
+            }
+        }
+        Ok(result)
     }
 
     /// The temporal radius the underlying denoisers run at.
@@ -452,6 +472,7 @@ impl PlanarDenoiser {
     /// The planes go over as wire bytes, so the normalisation and the channel interleave both happen
     /// on the GPU.
     fn push_with(&mut self, planes: &Planes, push_frame: WirePush) -> Result<(), DenoiserError> {
+        let _queue = self.device_sink.as_ref().map(|_| crate::gpu_share::queue_lock());
         self.check_planes(planes)?;
 
         if let Some(denoiser) = self.yuv.as_mut() {
@@ -483,6 +504,11 @@ impl PlanarDenoiser {
             self.chroma_passthrough.push_back(chroma_pair);
         }
 
+        if self.device_sink.is_some() {
+            for denoiser in [&self.luma, &self.chroma, &self.yuv].into_iter().flatten() {
+                denoiser.flush_gpu().map_err(DenoiserError::Other)?;
+            }
+        }
         Ok(())
     }
 
@@ -514,6 +540,27 @@ impl PlanarDenoiser {
     ///
     /// Returns `Ok(None)` if neither half had pending output.
     pub fn recv_into(&mut self, output: &mut Planes) -> Result<bool, anyhow::Error> {
+        if let Some(sink) = &self.device_sink {
+            let _queue = crate::gpu_share::queue_lock();
+            let mut planes = match self
+                .luma
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("device output requires luma and chroma"))?
+                .recv_device()?
+            {
+                Some(planes) => planes,
+                None => return Ok(false),
+            };
+            let chroma = self
+                .chroma
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("device output requires chroma"))?
+                .recv_device()?
+                .ok_or_else(|| anyhow::anyhow!("device planes lost alignment"))?;
+            planes.extend(chroma);
+            *output = crate::device_output::emit(sink.as_ref(), self.output_layout, planes)?;
+            return Ok(true);
+        }
         if let Some(denoiser) = self.yuv.as_mut() {
             return Ok(denoiser.recv_into(&mut [&mut output.y, &mut output.u, &mut output.v])?);
         }
@@ -568,6 +615,34 @@ impl PlanarDenoiser {
     ///
     /// `sink` is called once per emitted planar frame.
     pub fn flush(&mut self, mut sink: impl FnMut(Planes)) -> Result<(), anyhow::Error> {
+        if self.device_sink.is_some() {
+            while let Some(frame) = self.recv()? {
+                sink(frame);
+            }
+            let _queue = crate::gpu_share::queue_lock();
+            let luma = self
+                .luma
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("missing device luma"))?;
+            let chroma = self
+                .chroma
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("missing device chroma"))?;
+            let tail = luma.begin_device_tail()?;
+            if chroma.begin_device_tail()? != tail {
+                anyhow::bail!("device tails lost alignment");
+            }
+            for _ in 0..tail {
+                let mut planes = luma.device_tail()?;
+                planes.extend(chroma.device_tail()?);
+                sink(crate::device_output::emit(
+                    self.device_sink.as_ref().unwrap().as_ref(),
+                    self.output_layout,
+                    planes,
+                )?);
+            }
+            return Ok(());
+        }
         if let Some(denoiser) = self.yuv.as_mut() {
             denoiser.flush(|planes| {
                 let frame = into_yuv(planes);
@@ -621,6 +696,7 @@ impl PlanarDenoiser {
                 y: y_plane,
                 u: u_plane,
                 v: v_plane,
+                device: None,
             });
         }
 

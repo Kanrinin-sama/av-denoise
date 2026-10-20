@@ -4,19 +4,8 @@ use cubecl::benchmark::Benchmark;
 use cubecl::prelude::*;
 
 use super::{
-    BILATERAL_SIGMA_R,
-    BILATERAL_SIGMA_S,
-    BLOCK_X,
-    BLOCK_Y,
-    HEIGHT,
-    InputOutput,
-    WIDTH,
-    block_sync,
-    cube_count_2d,
-    cube_dim_2d,
-    make_padded_frame,
-    shapes_with_channels,
-    stored_channels,
+    BILATERAL_SIGMA_R, BILATERAL_SIGMA_S, BLOCK_X, BLOCK_Y, HEIGHT, InputOutput, WIDTH, block_sync,
+    cube_count_2d, cube_dim_2d, make_padded_frame, shapes_with_channels, stored_channels,
 };
 
 pub struct BilateralBench<R: Runtime> {

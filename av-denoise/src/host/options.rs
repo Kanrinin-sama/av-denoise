@@ -26,6 +26,8 @@ pub struct DenoiserOptions {
     #[builder(default = Depth::Eight)]
     pub depth: Depth,
     pub output_depth: Option<Depth>,
+    #[builder(default)]
+    pub device_output: bool,
 }
 
 impl DenoiserOptions {

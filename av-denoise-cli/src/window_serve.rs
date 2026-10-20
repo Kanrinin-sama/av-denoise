@@ -45,6 +45,7 @@ pub fn run_window_service(
 ) -> Result<(), anyhow::Error> {
     let service = WindowService::start(
         ServiceConfig {
+            resident: None,
             source: input.to_path_buf(),
             planes: opts.planes.clone(),
             scene_layout: stored_layout.to_path_buf(),

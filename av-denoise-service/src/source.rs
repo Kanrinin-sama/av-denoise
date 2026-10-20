@@ -21,7 +21,7 @@ impl SourceIndex {
                     let _ = std::fs::remove_file(created);
                 }
                 return Err(error.into());
-            }
+            },
         };
         Ok(Self {
             index: Arc::new(index),

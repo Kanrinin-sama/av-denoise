@@ -27,7 +27,7 @@ type Pending = VecDeque<(u64, Permit)>;
 
 /// A built denoiser with the cold-cache queue place it holds until its
 /// first output frame proves the kernels are compiled and cached.
-pub(crate) type Resident = (PlanarDenoiser, Option<WarmUp>);
+pub type Resident = (PlanarDenoiser, Option<WarmUp>);
 
 pub(crate) type WorkerJoin = thread::JoinHandle<Result<Option<Resident>, anyhow::Error>>;
 

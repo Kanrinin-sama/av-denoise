@@ -118,6 +118,7 @@ pub struct HostDenoiser {
     /// Output plane sets, allocated on first use.
     outputs: Vec<Vec<Handle>>,
     next_output: usize,
+    device_output: bool,
     pending: VecDeque<Pending>,
     /// Set once a call fails with an error that [DenoiserError::poisons_stream].
     poisoned: bool,
@@ -174,9 +175,25 @@ impl HostDenoiser {
             device_plane_bytes,
             outputs: Vec::with_capacity(OUTPUT_SETS),
             next_output: 0,
+            device_output: options.device_output,
             pending: VecDeque::with_capacity(MAX_PENDING),
             poisoned: false,
         })
+    }
+
+    pub(crate) fn flush_gpu(&self) -> Result<(), anyhow::Error> {
+        self.io.flush()
+    }
+    pub(crate) fn recv_device(&mut self) -> Result<Option<Vec<crate::gpu_share::GpuPlane>>, anyhow::Error> {
+        self.pending.pop_front().map(Pending::device).transpose()
+    }
+    pub(crate) fn begin_device_tail(&mut self) -> Result<usize, anyhow::Error> {
+        Ok(self.engine.finish()? as usize)
+    }
+    pub(crate) fn device_tail(&mut self) -> Result<Vec<crate::gpu_share::GpuPlane>, anyhow::Error> {
+        let result = self.emit_into_slot(0)?.device()?;
+        self.next_output = 0;
+        Ok(result)
     }
 
     pub fn selected_accelerator(&self) -> Accelerator {
@@ -442,9 +459,18 @@ impl HostDenoiser {
         let device_planes = device_planes(&handles, self.width, self.height);
         self.engine.emit_into(&device_planes)?;
 
-        let future = self.io.read(handles);
+        let device = if self.device_output {
+            Some(self.io.export(&handles).map_err(DenoiserError::Other)?)
+        } else {
+            None
+        };
+        let future = if device.is_some() {
+            Box::pin(async { Ok(Vec::new()) }) as io::ReadFuture
+        } else {
+            self.io.read(handles)
+        };
         let plane_lengths = vec![self.output_plane_length; self.plane_count];
-        let pending = Pending::new(future, plane_lengths);
+        let pending = Pending::new(future, plane_lengths, device);
 
         Ok(pending)
     }

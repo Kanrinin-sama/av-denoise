@@ -1,16 +1,7 @@
 use av_denoise::accelerate::Accelerator;
 use av_denoise::{
-    Algorithm,
-    ChannelIntent,
-    DenoisingMode,
-    Depth,
-    Device,
-    FrameLayout,
-    Nl4dOptions,
-    NlmeansHqOptions,
-    NlmeansOptions,
-    PlaneOptions,
-    Subsampling,
+    Algorithm, ChannelIntent, DenoisingMode, Depth, Device, FrameLayout, Nl4dOptions, NlmeansHqOptions,
+    NlmeansOptions, PlaneOptions, Subsampling,
 };
 
 pub struct ParityConfig {

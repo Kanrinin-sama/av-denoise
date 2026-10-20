@@ -9,6 +9,10 @@ mod engine;
 mod error;
 #[cfg(any(feature = "vulkan", feature = "metal"))]
 pub mod gpu_share;
+#[cfg(feature = "vulkan")]
+mod vulkan_setup;
+#[cfg(feature = "vulkan")]
+mod vulkan_features;
 pub mod nl4d;
 pub mod nlmeans;
 mod options;

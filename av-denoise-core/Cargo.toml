@@ -23,6 +23,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
 anyhow = "1"
+parking_lot = "0.12"
 thiserror = "2"
 tracing = "0.1"
 strum_macros = "0.28"
@@ -34,13 +35,15 @@ cubecl.workspace = true
 cubecl-runtime.workspace = true
 cubecl-environment.workspace = true
 wgpu = { version = "30", optional = true }
+ash = { version = "0.38", optional = true }
+tracel-ash = { version = "0.39", optional = true }
 
 [dev-dependencies]
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
 
 [features]
-vulkan = ["cubecl/vulkan", "dep:wgpu"]
+vulkan = ["cubecl/vulkan", "dep:wgpu", "dep:ash", "dep:tracel-ash"]
 metal = ["cubecl/metal", "dep:wgpu"]
 cuda = ["cubecl/cuda"]
 rocm = ["cubecl/hip"]

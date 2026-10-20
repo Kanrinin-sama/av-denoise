@@ -10,6 +10,7 @@ use super::io::ReadFuture;
 /// blocks until it lands.
 pub struct Pending {
     future: ReadFuture,
+    device: Option<Vec<crate::gpu_share::GpuPlane>>,
     /// Set while `future` has been polled but has not produced its result.
     polled: bool,
     /// The byte length of each plane, which trims the word padding off each buffer.
@@ -25,12 +26,23 @@ pub enum TryWait {
 }
 
 impl Pending {
-    pub(crate) fn new(future: ReadFuture, plane_lengths: Vec<usize>) -> Self {
+    pub(crate) fn new(
+        future: ReadFuture,
+        plane_lengths: Vec<usize>,
+        device: Option<Vec<crate::gpu_share::GpuPlane>>,
+    ) -> Self {
         Self {
             future,
+            device,
             polled: false,
             plane_lengths,
         }
+    }
+
+    pub(crate) fn device(mut self) -> Result<Vec<crate::gpu_share::GpuPlane>, anyhow::Error> {
+        self.device
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("pending frame uses host output"))
     }
 
     /// Blocks until the readback finishes and returns one buffer per plane.

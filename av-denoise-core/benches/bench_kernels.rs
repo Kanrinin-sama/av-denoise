@@ -18,10 +18,7 @@ use kernels::distance_ref::DistanceRefBench;
 use kernels::egress::{EgressBench, EgressFormat};
 use kernels::finish::FinishBench;
 use kernels::fused_window::{
-    FusedPairWindowBench,
-    FusedPairWindowRefBench,
-    FusedSingleWindowBench,
-    FusedSingleWindowRefBench,
+    FusedPairWindowBench, FusedPairWindowRefBench, FusedSingleWindowBench, FusedSingleWindowRefBench,
 };
 use kernels::grain::{GRAIN_SIZES, GrainMeasureBench, GrainReducePartialsBench, GrainSaveVectorsBench};
 use kernels::horizontal_sum::HSumBench;

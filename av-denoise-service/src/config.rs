@@ -9,7 +9,7 @@ use crate::{CreationGuard, FrameRange};
 /// `planes` carries the nl4d options, the accelerators, the device and
 /// the output depth. `creation_guard` wraps every call that creates
 /// threads inside the decoder or the GPU runtime.
-#[derive(Debug, Clone)]
+
 pub struct ServiceConfig {
     pub source: PathBuf,
     pub planes: PlaneOptions,
@@ -19,4 +19,5 @@ pub struct ServiceConfig {
     pub workers: usize,
     pub frame_budget: u64,
     pub creation_guard: CreationGuard,
+    pub resident: Option<crate::Resident>,
 }

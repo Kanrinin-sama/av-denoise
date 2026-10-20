@@ -62,7 +62,7 @@ pub fn warm(opts: &PlaneOptions, layout: FrameLayout, cancel: &AtomicBool) -> Re
     warm_resident(&mut create_denoiser(opts, layout)?, layout, cancel)
 }
 
-pub(crate) fn warm_resident(
+pub fn warm_resident(
     (denoiser, warm_up): &mut Resident,
     layout: FrameLayout,
     cancel: &AtomicBool,
@@ -116,6 +116,7 @@ fn synthetic_frame(layout: FrameLayout) -> Planes {
     };
 
     Planes {
+        device: None,
         y: plane(layout.luma_bytes()),
         u: plane(layout.chroma_bytes()),
         v: plane(layout.chroma_bytes()),

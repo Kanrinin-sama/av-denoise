@@ -4,14 +4,7 @@ use std::time::{Duration, Instant};
 use av_denoise_core::bench_api::kernels::{nlm_accumulate, nlm_bilateral, nlm_dist_2d_weight, nlm_finish};
 use av_denoise_core::bench_api::prefilter::bilateral_radius;
 use av_denoise_core::bench_api::{
-    BLOCK_X,
-    BLOCK_Y,
-    Device,
-    HostIo,
-    NlmDenoiser,
-    NlmParams,
-    start_read,
-    wait_read,
+    BLOCK_X, BLOCK_Y, Device, HostIo, NlmDenoiser, NlmParams, start_read, wait_read,
 };
 use av_denoise_core::{ChannelMode, PrefilterMode};
 use clap::Parser;

@@ -339,6 +339,7 @@ impl Nl4dArgs {
         };
 
         let planes = PlaneOptions {
+            device_sink: None,
             accelerators: globals.accelerators.clone(),
             device: globals.device.clone(),
             intent,

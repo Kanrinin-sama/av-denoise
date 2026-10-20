@@ -64,6 +64,7 @@ pub fn run_stream<R: Read>(opts: &RunOptions, reader: R) -> Result<(), anyhow::E
         };
 
         let planes = Planes {
+            device: None,
             y: frame.get_y_plane().to_vec(),
             u: frame.get_u_plane().to_vec(),
             v: frame.get_v_plane().to_vec(),

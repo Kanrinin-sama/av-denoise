@@ -61,7 +61,10 @@ impl WindowService {
         pipeline.keep_opened(decoder);
         let output_layout = pipeline.output_layout(scenes.layout);
         let scenes = Arc::new(scenes);
-        let mut warmed = Some(pipeline.warmed_resident(source_layout, &cancel)?);
+        let mut warmed = Some(match config.resident {
+            Some(resident) => resident,
+            None => pipeline.warmed_resident(source_layout, &cancel)?,
+        });
         let slots = (0..config.slots)
             .map(|_| {
                 let (requests, rx) = crossbeam_channel::bounded::<SlotRequest>(1);

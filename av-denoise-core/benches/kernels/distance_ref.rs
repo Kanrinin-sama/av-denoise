@@ -4,15 +4,7 @@ use cubecl::prelude::*;
 
 use super::distance::DistanceInput;
 use super::{
-    HEIGHT,
-    Q_X,
-    Q_Y,
-    WIDTH,
-    block_sync,
-    cube_count_2d,
-    cube_dim_2d,
-    make_padded_frame,
-    shapes_with_channels,
+    HEIGHT, Q_X, Q_Y, WIDTH, block_sync, cube_count_2d, cube_dim_2d, make_padded_frame, shapes_with_channels,
     stored_channels,
 };
 

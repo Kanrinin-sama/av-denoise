@@ -4,15 +4,7 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use super::{
-    BLOCK_1D,
-    BLOCK_X,
-    BLOCK_Y,
-    HEIGHT,
-    WIDTH,
-    block_sync,
-    cube_count_2d,
-    cube_dim_2d,
-    make_padded_frame,
+    BLOCK_1D, BLOCK_X, BLOCK_Y, HEIGHT, WIDTH, block_sync, cube_count_2d, cube_dim_2d, make_padded_frame,
     shapes_with_channels,
 };
 

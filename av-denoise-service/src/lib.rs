@@ -25,5 +25,18 @@ pub use self::layout::{
 pub use self::pipeline::denoise_scenes;
 pub use self::service::WindowService;
 pub use self::threads::CreationGuard;
-pub use self::warm::{create_denoiser, finish_warm_up, install_kernel_cache, warm};
+pub use self::warm::{create_denoiser, finish_warm_up, install_kernel_cache, warm, warm_resident};
 pub use self::window::Window;
+
+pub use self::worker::Resident;
+
+pub fn load_frame_layout(
+    path: &std::path::Path,
+    keep: &[(usize, usize)],
+) -> Result<av_denoise::FrameLayout, anyhow::Error> {
+    let keep = keep
+        .iter()
+        .map(|&(start, end)| FrameRange { start, end })
+        .collect::<Vec<_>>();
+    stored_layout::UncheckedLayout::load(path, &keep)?.frame_layout()
+}

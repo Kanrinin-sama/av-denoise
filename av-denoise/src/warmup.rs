@@ -66,6 +66,8 @@ fn release_key(key: u128) {
 /// cache directory.
 pub fn kernel_key(options: &PlaneOptions, layout: FrameLayout) -> u128 {
     let version = env!("CARGO_PKG_VERSION");
+    let mut options = options.clone();
+    options.device_sink = None;
     let rendered = format!("{version}|{options:?}|{layout:?}");
     StableHasher::hash_one(&rendered)
 }

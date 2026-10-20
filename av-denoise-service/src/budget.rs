@@ -99,7 +99,7 @@ impl FramePermits {
         Ok(Self {
             shared: Pool::filled(afforded),
             count: afforded,
-            cap: afforded - floor * (windows - 1),
+            cap: afforded / windows,
         })
     }
 

@@ -1,9 +1,7 @@
 use av_denoise_core::bench_api::NOISE_CURVE_BINS;
 use av_denoise_core::bench_api::collab::geometry::{fused_cubes_x, ref_count, refs_along, strength_map_dims};
 use av_denoise_core::bench_api::collab::kernels::aggregate::{
-    cross_frame_accum_scale,
-    kaiser_window,
-    weight_scale,
+    cross_frame_accum_scale, kaiser_window, weight_scale,
 };
 use av_denoise_core::bench_api::collab::kernels::fused::{STRENGTH_MAP_LUMA, STRENGTH_MAP_OFF, collab_fused};
 use av_denoise_core::bench_api::collab::kernels::transforms::dct_noise_profile;
@@ -13,19 +11,8 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use super::nl4d_geometry::{
-    BLK_STEP,
-    BLKSIZE,
-    CENTRE_SLOT,
-    K_MAX,
-    LAMBDA_HT,
-    N_FRAMES,
-    NEIGHBOUR_SLOTS,
-    RADIUS,
-    REFINE,
-    SIGMA,
-    SPATIAL_RADIUS,
-    conf_stride,
-    mv_stride,
+    BLK_STEP, BLKSIZE, CENTRE_SLOT, K_MAX, LAMBDA_HT, N_FRAMES, NEIGHBOUR_SLOTS, RADIUS, REFINE, SIGMA,
+    SPATIAL_RADIUS, conf_stride, mv_stride,
 };
 use super::{HEIGHT, WIDTH, block_sync, make_padded_frame, shapes_with_channels, stored_channels};
 

@@ -1,7 +1,5 @@
 use av_denoise_core::bench_api::kernels::{
-    nlm_fused_pair_accumulate_window,
-    nlm_fused_pair_accumulate_window_ref,
-    nlm_fused_single_window,
+    nlm_fused_pair_accumulate_window, nlm_fused_pair_accumulate_window_ref, nlm_fused_single_window,
     nlm_fused_single_window_ref,
 };
 use cubecl::benchmark::Benchmark;
@@ -9,19 +7,8 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use super::{
-    BLOCK_X,
-    BLOCK_Y,
-    HEIGHT,
-    PATCH_RADIUS,
-    SEARCH_RADIUS,
-    WIDTH,
-    block_sync,
-    cube_count_2d,
-    cube_dim_2d,
-    h2_inv_norm,
-    make_padded_frame,
-    shapes_with_channels,
-    stored_channels,
+    BLOCK_X, BLOCK_Y, HEIGHT, PATCH_RADIUS, SEARCH_RADIUS, WIDTH, block_sync, cube_count_2d, cube_dim_2d,
+    h2_inv_norm, make_padded_frame, shapes_with_channels, stored_channels,
 };
 
 /// A zero-filled spatial-offset LUT for `SEARCH_RADIUS`.

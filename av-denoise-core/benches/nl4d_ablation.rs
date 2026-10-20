@@ -6,19 +6,12 @@
 
 use av_denoise_core::bench_api::collab::geometry::{fused_cubes_x, ref_count, refs_along, strength_map_dims};
 use av_denoise_core::bench_api::collab::kernels::aggregate::{
-    collab_normalise,
-    collab_zero_accum,
-    cross_frame_accum_scale,
-    kaiser_window,
-    weight_scale,
+    collab_normalise, collab_zero_accum, cross_frame_accum_scale, kaiser_window, weight_scale,
 };
 use av_denoise_core::bench_api::collab::kernels::fused::{STRENGTH_MAP_OFF, collab_fused};
 use av_denoise_core::bench_api::collab::kernels::transforms::dct_noise_profile;
 use av_denoise_core::bench_api::collab::{
-    PATCH_SIZE,
-    grid_frames,
-    needs_warp_uniform_search,
-    supports_f16_search,
+    PATCH_SIZE, grid_frames, needs_warp_uniform_search, supports_f16_search,
 };
 use av_denoise_core::bench_api::{BLOCK_X, BLOCK_Y, Device, NOISE_CURVE_BINS};
 use clap::Parser;

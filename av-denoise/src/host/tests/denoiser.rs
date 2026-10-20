@@ -1,12 +1,5 @@
 use av_denoise_core::{
-    ChannelMode,
-    DenoisingMode,
-    DevicePlane,
-    EdgePadding,
-    Engine,
-    Nl4dOptions,
-    NlmTuning,
-    NlmeansOptions,
+    ChannelMode, DenoisingMode, DevicePlane, EdgePadding, Engine, Nl4dOptions, NlmTuning, NlmeansOptions,
     WindowSpan,
 };
 

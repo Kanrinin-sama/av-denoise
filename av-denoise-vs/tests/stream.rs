@@ -2,14 +2,7 @@ use std::ops::Range;
 
 use av_denoise::{EdgePadding, WindowSpan};
 use av_denoise_vs::stream::{
-    MIN_LOOKBACK,
-    OutputBuffer,
-    Outstanding,
-    Plan,
-    Step,
-    StreamGeometry,
-    StreamPlanner,
-    lookback_for,
+    MIN_LOOKBACK, OutputBuffer, Outstanding, Plan, Step, StreamGeometry, StreamPlanner, lookback_for,
 };
 
 const LOOKBACK: usize = 16;

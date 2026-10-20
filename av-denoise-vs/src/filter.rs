@@ -375,6 +375,7 @@ fn pack_frame(frame: &FrameRef, depth_bytes: usize) -> Planes {
     let v_plane = pack(2);
 
     Planes {
+        device: None,
         y: y_plane,
         u: u_plane,
         v: v_plane,

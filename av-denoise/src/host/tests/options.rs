@@ -1,11 +1,5 @@
 use av_denoise_core::{
-    ChannelMode,
-    DenoisingMode,
-    Nl4dOptions,
-    NlmeansAlgorithm,
-    NlmeansHqOptions,
-    NlmeansOptions,
-    SampleFormat,
+    ChannelMode, DenoisingMode, Nl4dOptions, NlmeansAlgorithm, NlmeansHqOptions, NlmeansOptions, SampleFormat,
 };
 
 use crate::backend::EngineSpec;

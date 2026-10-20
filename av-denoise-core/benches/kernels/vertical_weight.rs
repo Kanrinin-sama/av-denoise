@@ -4,15 +4,7 @@ use cubecl::prelude::*;
 
 use super::horizontal_sum::HSumInput;
 use super::{
-    BLOCK_X,
-    BLOCK_Y,
-    HEIGHT,
-    PATCH_RADIUS,
-    WIDTH,
-    block_sync,
-    cube_count_2d,
-    cube_dim_2d,
-    h2_inv_norm,
+    BLOCK_X, BLOCK_Y, HEIGHT, PATCH_RADIUS, WIDTH, block_sync, cube_count_2d, cube_dim_2d, h2_inv_norm,
 };
 
 pub struct VWeightBench<R: Runtime> {

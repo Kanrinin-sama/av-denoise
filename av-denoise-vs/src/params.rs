@@ -455,6 +455,7 @@ pub fn plane_options_from(
     };
 
     Ok(PlaneOptions {
+        device_sink: None,
         accelerators,
         device,
         intent,

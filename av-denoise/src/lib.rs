@@ -35,3 +35,6 @@ pub use self::planar::{
 };
 pub use self::stack::{CODEGEN_STACK_BYTES, codegen_stack_is_sufficient, raise_codegen_stack_limit};
 pub use self::warmup::{WarmUp, kernel_key};
+
+pub use av_denoise_core::gpu_share;
+pub mod device_output;

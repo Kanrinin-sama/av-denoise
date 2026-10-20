@@ -349,6 +349,7 @@ impl NlmeansArgs {
 
         let algorithm = self.resolve_algorithm(resolved, nlm)?;
         let planes = PlaneOptions {
+            device_sink: None,
             output_depth: self
                 .common
                 .output_depth

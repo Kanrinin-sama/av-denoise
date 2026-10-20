@@ -32,10 +32,8 @@ impl SceneLayout {
     }
 
     pub fn select_span(mut self, span: FrameRange) -> Result<Self, anyhow::Error> {
-        if self.scene_starts.binary_search(&span.start).is_err()
-            || self.scene_starts.binary_search(&span.end).is_err()
-        {
-            anyhow::bail!("--scene-span must match retained scene boundaries");
+        if span.start >= span.end || span.end > self.total_frames {
+            anyhow::bail!("window span is outside the retained timeline");
         }
 
         let mut source_ranges = Vec::new();
@@ -64,11 +62,14 @@ impl SceneLayout {
             compact_start = compact_end;
         }
 
-        self.scene_starts = self
-            .scene_starts
-            .into_iter()
-            .filter(|boundary| *boundary >= span.start && *boundary <= span.end)
-            .map(|boundary| boundary - span.start)
+        self.scene_starts = std::iter::once(0)
+            .chain(
+                self.scene_starts
+                    .into_iter()
+                    .filter(|boundary| *boundary > span.start && *boundary < span.end)
+                    .map(|boundary| boundary - span.start),
+            )
+            .chain(std::iter::once(span.end - span.start))
             .collect();
         self.total_frames = span.end - span.start;
         self.source_ranges = source_ranges;

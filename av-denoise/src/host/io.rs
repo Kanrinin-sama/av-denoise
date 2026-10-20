@@ -13,6 +13,8 @@ pub(crate) trait PlaneIo: Send {
     fn upload(&mut self, planes: &[&[u8]]) -> Vec<Handle>;
 
     fn allocate(&self, bytes: usize) -> Handle;
+    fn export(&self, handles: &[Handle]) -> Result<Vec<crate::gpu_share::GpuPlane>, anyhow::Error>;
+    fn flush(&self) -> Result<(), anyhow::Error>;
 
     /// Starts reading `handles` back to the host.
     ///
@@ -43,6 +45,14 @@ impl<R: Runtime> PlaneIo for ClientIo<R> {
         (0..planes.len())
             .map(|index| input.handle(index).clone())
             .collect()
+    }
+
+    fn export(&self, handles: &[Handle]) -> Result<Vec<crate::gpu_share::GpuPlane>, anyhow::Error> {
+        crate::gpu_share::export_planes(&self.client, handles)
+    }
+    fn flush(&self) -> Result<(), anyhow::Error> {
+        self.client.flush()?;
+        Ok(())
     }
 
     fn allocate(&self, bytes: usize) -> Handle {

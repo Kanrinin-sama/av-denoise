@@ -2,20 +2,8 @@ use std::time::{Duration, Instant};
 
 use av_denoise::accelerate::Accelerator;
 use av_denoise::{
-    Algorithm,
-    ChannelIntent,
-    ChannelMode,
-    DenoiserOptions,
-    DenoisingMode,
-    Depth,
-    Device,
-    FrameLayout,
-    HostDenoiser,
-    PlanarDenoiser,
-    PlaneOptions,
-    Planes,
-    Subsampling,
-    push_needs_retry,
+    Algorithm, ChannelIntent, ChannelMode, DenoiserOptions, DenoisingMode, Depth, Device, FrameLayout,
+    HostDenoiser, PlanarDenoiser, PlaneOptions, Planes, Subsampling, push_needs_retry,
 };
 use clap::Parser;
 

@@ -4,13 +4,7 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use super::{
-    BLOCK_1D,
-    COPY_GRID_1D,
-    HEIGHT,
-    WIDTH,
-    block_sync,
-    make_padded_frame,
-    shapes_with_channels,
+    BLOCK_1D, COPY_GRID_1D, HEIGHT, WIDTH, block_sync, make_padded_frame, shapes_with_channels,
     stored_channels,
 };
 

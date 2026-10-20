@@ -82,7 +82,7 @@ fn unavailable(accelerator: Accelerator) -> BackendDevices {
 /// A backend that cannot open a client at all, because its driver libraries are missing, is reported
 /// as unavailable rather than allowed to take the process down.
 fn query_runtime<R: Runtime>(accelerator: Accelerator, device: &R::Device) -> BackendDevices {
-    let Some(client) = open_client::<R>(accelerator, device) else {
+    let Some(_client) = open_client::<R>(accelerator, device) else {
         return unavailable(accelerator);
     };
 

@@ -2,16 +2,8 @@ use std::time::{Duration, Instant};
 
 use av_denoise::accelerate::Accelerator;
 use av_denoise::{
-    Algorithm,
-    ChannelMode,
-    DenoiserError,
-    DenoiserOptions,
-    DenoisingMode,
-    Device,
-    HostDenoiser,
-    MotionCompensationMode,
-    NlmeansOptions,
-    PrefilterMode,
+    Algorithm, ChannelMode, DenoiserError, DenoiserOptions, DenoisingMode, Device, HostDenoiser,
+    MotionCompensationMode, NlmeansOptions, PrefilterMode,
 };
 use clap::Parser;
 
