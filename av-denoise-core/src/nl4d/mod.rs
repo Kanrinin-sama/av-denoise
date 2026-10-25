@@ -15,6 +15,7 @@ mod fruit;
 pub mod grain;
 pub(crate) mod harness;
 pub(crate) mod kernels;
+mod memory;
 mod options;
 pub(crate) mod params;
 mod psy;
@@ -28,6 +29,7 @@ pub(crate) mod tests;
 #[cfg(all(test, any(feature = "vulkan", feature = "metal")))]
 pub(crate) use self::denoiser::Nl4dDenoiser;
 pub use self::engine::Nl4d;
+pub use self::memory::vram_requirement;
 pub(crate) use self::options::nl4d_pool_ratio;
 #[cfg(all(test, any(feature = "vulkan", feature = "metal")))]
 pub(crate) use self::options::resolve_params;

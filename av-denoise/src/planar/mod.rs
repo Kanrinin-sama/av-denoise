@@ -1,3 +1,4 @@
+mod memory;
 mod reseed;
 
 #[cfg(test)]
@@ -10,6 +11,7 @@ use av_denoise_core::{
     WindowSpan,
 };
 
+pub use self::memory::nl4d_vram_requirement;
 pub use self::reseed::ReseedWindow;
 use crate::backend::Device;
 use crate::backend::accelerate::Accelerator;

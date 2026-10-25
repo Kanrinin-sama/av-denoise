@@ -31,7 +31,7 @@ pub use self::host::{
 };
 pub use self::planar::{
     ChannelIntent, FrameLayout, PlanarDenoiser, PlaneOptions, Planes, ReseedWindow, Subsampling, fill_plane,
-    push_needs_retry,
+    nl4d_vram_requirement, push_needs_retry,
 };
 pub use self::stack::{CODEGEN_STACK_BYTES, codegen_stack_is_sufficient, raise_codegen_stack_limit};
 pub use self::warmup::{WarmUp, kernel_key};
