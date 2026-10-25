@@ -1,10 +1,9 @@
 use std::io::{BufRead, BufWriter, Stdout, Write, stdout};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::thread;
 
-use av_denoise_service::{CreationGuard, FrameRange, ServiceConfig, Window, WindowService};
+use av_denoise_service::{Cancellation, CreationGuard, FrameRange, ServiceConfig, Window, WindowService};
 
 use crate::cli::RunOptions;
 use crate::file_mode::write_window;
@@ -55,7 +54,7 @@ pub fn run_window_service(
             frame_budget: frame_budget_bytes,
             creation_guard: CreationGuard::default(),
         },
-        Arc::new(AtomicBool::new(false)),
+        Cancellation::new(),
     )?;
     let events = Events::new(BufWriter::new(stdout()));
     thread::scope(|scope| {
@@ -76,7 +75,7 @@ pub fn run_window_service(
                     output_path,
                 } => {
                     let window = service
-                        .open(slot, start, end, Arc::new(AtomicBool::new(false)))
+                        .open(slot, start, end, Cancellation::new())
                         .unwrap_or_else(|error| control_fatal(&format!("{error:#}")));
                     let events = &events;
                     writers.push(scope.spawn(move || serve_window(events, id, slot, window, &output_path)));

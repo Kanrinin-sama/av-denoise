@@ -11,7 +11,7 @@ use crate::stored_layout::UncheckedLayout;
 use crate::threads::release_affinity;
 use crate::window::{Window, WindowJob};
 use crate::worker::Resident;
-use crate::{FrameRange, SceneLayout, ServiceConfig};
+use crate::{Cancellation, FrameRange, SceneLayout, ServiceConfig};
 
 struct SlotRequest {
     job: WindowJob,
@@ -30,13 +30,13 @@ pub struct WindowService {
     slots: Vec<Slot>,
     scenes: Arc<SceneLayout>,
     output_layout: FrameLayout,
-    cancel: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
+    cancel: Cancellation,
+    stop: Cancellation,
     pipeline: Arc<Pipeline>,
 }
 
 impl WindowService {
-    pub fn start(config: ServiceConfig, cancel: Arc<AtomicBool>) -> Result<Self, anyhow::Error> {
+    pub fn start(config: ServiceConfig, cancel: Cancellation) -> Result<Self, anyhow::Error> {
         if config.slots == 0 {
             anyhow::bail!("--window-service-slots must be at least 1");
         }
@@ -63,7 +63,7 @@ impl WindowService {
         let scenes = Arc::new(scenes);
         let mut warmed = Some(match config.resident {
             Some(resident) => resident,
-            None => pipeline.warmed_resident(source_layout, &cancel)?,
+            None => pipeline.warmed_resident(source_layout, &cancel.flag())?,
         });
         let slots = (0..config.slots)
             .map(|_| {
@@ -71,7 +71,7 @@ impl WindowService {
                 let busy = Arc::new(AtomicBool::new(false));
                 let pipeline = Arc::clone(&pipeline);
                 let slot_busy = Arc::clone(&busy);
-                let warm_cancel = Arc::clone(&cancel);
+                let warm_cancel = cancel.flag();
                 let residents = vec![warmed.take()];
                 let handle = thread::spawn(move || {
                     release_affinity();
@@ -89,7 +89,7 @@ impl WindowService {
             output_layout,
             scenes,
             cancel,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: Cancellation::new(),
             pipeline,
         })
     }
@@ -106,7 +106,7 @@ impl WindowService {
         slot: usize,
         start: usize,
         end: usize,
-        cancel: Arc<AtomicBool>,
+        cancel: Cancellation,
     ) -> Result<Window, anyhow::Error> {
         if start >= end {
             anyhow::bail!("window start must be less than end");
@@ -125,7 +125,7 @@ impl WindowService {
             self.output_layout,
             Arc::clone(&self.scenes),
             Some(FrameRange { start, end }),
-            vec![Arc::clone(&self.cancel), Arc::clone(&self.stop), cancel],
+            vec![self.cancel.clone(), self.stop.clone(), cancel],
             Arc::clone(&self.pipeline.pools),
         );
         if target.requests.try_send(SlotRequest { job, done }).is_err() {
@@ -160,7 +160,7 @@ impl WindowService {
 
 impl Drop for WindowService {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.cancel();
         let _ = self.join_slots();
     }
 }

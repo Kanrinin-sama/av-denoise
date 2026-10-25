@@ -1,16 +1,14 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use av_decoders::Rational32;
 use av_denoise::{FrameLayout, Planes, SceneGrain};
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::budget::CANCEL_POLL;
 use crate::cancel::Cancel;
 use crate::pool::SharedPools;
 use crate::worker::OutputMsg;
-use crate::{FrameRange, SceneLayout};
+use crate::{Cancellation, FrameRange, SceneLayout};
 
 /// The half of a window the pipeline runs.
 pub(crate) struct WindowJob {
@@ -19,7 +17,7 @@ pub(crate) struct WindowJob {
     pub(crate) output: Sender<OutputMsg>,
     pub(crate) closed: Receiver<()>,
     pub(crate) cancel: Cancel,
-    pub(crate) abort: Arc<AtomicBool>,
+    pub(crate) abort: Cancellation,
     pub(crate) pools: Arc<SharedPools>,
     pub(crate) grain: Arc<Mutex<Vec<SceneGrain>>>,
 }
@@ -45,8 +43,8 @@ pub struct Window {
     done: Option<Receiver<Result<(), anyhow::Error>>>,
     failure: Option<anyhow::Error>,
     cancel: Cancel,
-    stop: Arc<AtomicBool>,
-    abort: Arc<AtomicBool>,
+    stop: Cancellation,
+    abort: Cancellation,
     _closed: Sender<()>,
     pools: Arc<SharedPools>,
     grain: Arc<Mutex<Vec<SceneGrain>>>,
@@ -57,12 +55,12 @@ impl Window {
         layout: FrameLayout,
         scenes: Arc<SceneLayout>,
         span: Option<FrameRange>,
-        mut flags: Vec<Arc<AtomicBool>>,
+        mut flags: Vec<Cancellation>,
         pools: Arc<SharedPools>,
     ) -> (Self, WindowJob, Sender<Result<(), anyhow::Error>>) {
-        let stop = Arc::new(AtomicBool::new(false));
-        let abort = Arc::new(AtomicBool::new(false));
-        flags.extend([Arc::clone(&stop), Arc::clone(&abort)]);
+        let stop = Cancellation::new();
+        let abort = Cancellation::new();
+        flags.extend([stop.clone(), abort.clone()]);
         let cancel = Cancel::new(flags);
         let total = span.map_or(scenes.total_frames, |span| span.end - span.start);
         let (output_tx, output) = crossbeam_channel::unbounded();
@@ -80,7 +78,7 @@ impl Window {
             failure: None,
             cancel: cancel.clone(),
             stop,
-            abort: Arc::clone(&abort),
+            abort: abort.clone(),
             _closed: closed_tx,
             pools: Arc::clone(&pools),
             grain: Arc::clone(&grain),
@@ -114,7 +112,7 @@ impl Window {
     }
 
     pub fn cancel(&self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.cancel();
     }
 
     /// Hands a received frame's buffers back to the pool, so the next
@@ -140,7 +138,7 @@ impl Window {
             }
 
             if self.cancel.is_set() {
-                let error = if self.abort.load(Ordering::Acquire) {
+                let error = if self.abort.is_set() {
                     self.pipeline_error()
                 } else {
                     anyhow::anyhow!("the window was cancelled")
@@ -158,12 +156,13 @@ impl Window {
                         return Some(Err(self.fail(error)));
                     },
                 },
-                default(CANCEL_POLL) => {},
+                recv(self.cancel.receiver()) -> _ => {},
             }
         }
     }
 
     fn fail(&mut self, error: anyhow::Error) -> anyhow::Error {
+        self.stop.cancel();
         let reported = anyhow::anyhow!("{error:#}");
         self.failure = Some(error);
         reported
@@ -220,5 +219,11 @@ impl Window {
         );
         grain.sort_by_key(|scene| scene.first_frame);
         Ok((self.next as usize, grain))
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        self.stop.cancel();
     }
 }

@@ -7,8 +7,7 @@
 
 use crate::runtime::{ComputeClient, Runtime};
 use std::any::Any;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use cubecl::wgpu::WgpuRuntime;
 
@@ -37,8 +36,13 @@ struct Target {
 
 struct Slot {
     buffer: wgpu::Buffer,
-    state: Arc<AtomicU8>,
+    state: Arc<MapState>,
     submission: Option<wgpu::SubmissionIndex>,
+}
+
+struct MapState {
+    value: Mutex<u8>,
+    ready: Condvar,
 }
 
 impl StagingRing {
@@ -79,7 +83,10 @@ impl StagingRing {
                     usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: true,
                 }),
-                state: Arc::new(AtomicU8::new(MAPPED)),
+                state: Arc::new(MapState {
+                    value: Mutex::new(MAPPED),
+                    ready: Condvar::new(),
+                }),
                 submission: None,
             })
             .collect();
@@ -105,21 +112,21 @@ impl StagingRing {
         let slot = &mut self.slots[index];
 
         if let Some(submission) = slot.submission.take() {
-            // The map callback can run on whichever thread polls the
-            // device, so the wait repeats until this thread sees it.
-            while slot.state.load(Ordering::Acquire) == PENDING {
-                self.device
-                    .poll(wgpu::PollType::Wait {
-                        submission_index: Some(submission.clone()),
-                        timeout: None,
-                    })
-                    .expect("waiting on an upload staging buffer failed");
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: None,
+                })
+                .expect("waiting on an upload staging buffer failed");
+            let mut state = slot.state.value.lock().unwrap_or_else(|error| error.into_inner());
+            while *state == PENDING {
+                state = slot
+                    .state
+                    .ready
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
             }
-            assert_eq!(
-                slot.state.load(Ordering::Acquire),
-                MAPPED,
-                "an upload staging buffer failed to map"
-            );
+            assert_eq!(*state, MAPPED, "an upload staging buffer failed to map");
         }
 
         {
@@ -166,12 +173,14 @@ impl StagingRing {
             .expect("submitting queued launches ahead of an upload failed");
         slot.submission = Some(self.queue.submit([encoder.finish()]));
 
-        slot.state.store(PENDING, Ordering::Release);
+        *slot.state.value.lock().unwrap_or_else(|error| error.into_inner()) = PENDING;
         let state = slot.state.clone();
         slot.buffer
             .slice(..)
             .map_async(wgpu::MapMode::Write, move |result| {
-                state.store(if result.is_ok() { MAPPED } else { FAILED }, Ordering::Release);
+                *state.value.lock().unwrap_or_else(|error| error.into_inner()) =
+                    if result.is_ok() { MAPPED } else { FAILED };
+                state.ready.notify_all();
             });
     }
 }

@@ -14,7 +14,7 @@ use crate::threads::release_affinity;
 use crate::warm::{create_denoiser, warm_resident};
 use crate::window::{Window, WindowJob};
 use crate::worker::{Resident, WorkerConfig, spawn_workers};
-use crate::{CreationGuard, SceneLayout};
+use crate::{Cancellation, CreationGuard, SceneLayout};
 
 /// The decode, denoise and budget settings every window of one source
 /// runs with.
@@ -190,6 +190,7 @@ impl Pipeline {
             )
         });
         if dispatched.is_err() {
+            job.abort.cancel();
             *decoder = None;
         }
 
@@ -201,10 +202,12 @@ impl Pipeline {
             let resident = match handle.join() {
                 Ok(Ok(resident)) => resident,
                 Ok(Err(error)) => {
+                    job.abort.cancel();
                     failure.get_or_insert(error);
                     None
                 },
                 Err(panic) => {
+                    job.abort.cancel();
                     failure.get_or_insert(anyhow::anyhow!(
                         "worker panicked: {}",
                         panic_message(panic.as_ref())
@@ -237,7 +240,7 @@ pub fn denoise_scenes(
     scenes: SceneLayout,
     workers: usize,
     frame_budget: u64,
-    cancel: Arc<AtomicBool>,
+    cancel: Cancellation,
 ) -> Result<Window, anyhow::Error> {
     let index = SourceIndex::open(&source)?;
     let pipeline = Pipeline::new(

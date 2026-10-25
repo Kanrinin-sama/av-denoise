@@ -12,24 +12,14 @@
 //! the lock entirely.
 
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
 
 use cubecl::hash::StableHasher;
 
 use crate::cache::compilation_cache_dir;
 use crate::planar::{FrameLayout, PlaneOptions};
-
-/// How long a process waits for the one ahead of it before compiling for itself.
-///
-/// Compiling the kernels was measured at about ten seconds on a quiet machine, and a machine running
-/// an encode is not quiet, so the limit is generous. Waiting longer is worse than duplicating the
-/// work, because the encoder has nothing to do until a frame arrives.
-const WAIT_LIMIT: Duration = Duration::from_secs(180);
-
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The keys this process already holds a place for.
 static CLAIMED_KEYS: LazyLock<Mutex<HashSet<u128>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -88,27 +78,21 @@ impl WarmUp {
     /// Takes a place in the queue for the kernels `key` identifies.
     ///
     /// Returns `Some` while holding the lock, and the caller compiles under it. Returns `None` when
-    /// the cache is already warm for these kernels, caching is off, or the lock could not be taken
-    /// within the three minute wait limit. In every one of those the caller compiles as usual.
+    /// the cache is already warm for these kernels, caching is off, or the lock could not be taken.
     ///
     /// Blocks for as long as the process ahead takes to compile, so it belongs on the path that
     /// builds a denoiser rather than the path that renders a frame.
     pub fn begin(key: u128) -> Option<Self> {
         let dir = compilation_cache_dir()?;
-        Self::begin_in(dir, key, WAIT_LIMIT)
+        Self::begin_in(dir, key)
     }
 
-    /// [WarmUp::begin] against an explicit directory and wait limit.
-    fn begin_in(dir: &Path, key: u128, wait_limit: Duration) -> Option<Self> {
-        // A file lock is held by the process rather than the handle, so a second filter in this
-        // process asking for the same kernels would wait out `wait_limit` on its own lock. One script
-        // can easily build two filters, so the place is taken at most once per key per process and
-        // the second caller carries on.
+    fn begin_in(dir: &Path, key: u128) -> Option<Self> {
         if !claim_key(key) {
             return None;
         }
 
-        let held = Self::acquire(dir, key, wait_limit);
+        let held = Self::acquire(dir, key);
 
         if held.is_none() {
             release_key(key);
@@ -118,7 +102,7 @@ impl WarmUp {
     }
 
     /// [WarmUp::begin_in] without the in-process bookkeeping, which its caller handles.
-    fn acquire(dir: &Path, key: u128, wait_limit: Duration) -> Option<Self> {
+    fn acquire(dir: &Path, key: u128) -> Option<Self> {
         let stamp_name = format!("warm-{key:032x}.stamp");
         let stamp = dir.join(stamp_name);
 
@@ -130,7 +114,8 @@ impl WarmUp {
         let lock_path = dir.join(lock_name);
         let lock = open_lock_file(&lock_path)?;
 
-        if !wait_for_lock(&lock, wait_limit) {
+        if let Err(error) = lock.lock() {
+            tracing::debug!(%error, "cannot take the kernel warm-up lock, compiling unqueued");
             return None;
         }
 
@@ -182,36 +167,6 @@ fn open_lock_file(path: &Path) -> Option<File> {
     }
 }
 
-/// Blocks until the lock is held, giving up after `wait_limit`.
-///
-/// Returns whether the lock is held. It is a real advisory file lock rather than a file whose presence
-/// means "taken", so the operating system releases it when Av1an kills a worker mid-compile and the
-/// next process in line wakes up straight away.
-fn wait_for_lock(lock: &File, wait_limit: Duration) -> bool {
-    let start = Instant::now();
-
-    loop {
-        match lock.try_lock() {
-            Ok(()) => return true,
-            Err(TryLockError::WouldBlock) => {},
-            Err(TryLockError::Error(err)) => {
-                tracing::debug!(%err, "cannot take the kernel warm-up lock, compiling unqueued");
-                return false;
-            },
-        }
-
-        if start.elapsed() >= wait_limit {
-            tracing::warn!(
-                "waited {:?} for another process to compile kernels, compiling for ourselves",
-                wait_limit,
-            );
-            return false;
-        }
-
-        std::thread::sleep(POLL_INTERVAL);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,37 +176,15 @@ mod tests {
         0xa5a5_0000_0000_0000_0000_0000_0000_0000 + index
     }
 
-    /// Short enough that a contended lock fails the test quickly rather than after three minutes.
-    const BRIEFLY: Duration = Duration::from_millis(50);
-
-    /// The lock is taken directly because a file lock is held per process, and a second `begin_in`
-    /// would be answered by the in-process registry instead of the lock.
-    #[test]
-    fn a_lock_held_elsewhere_keeps_this_process_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock_key = key(1);
-        let lock_name = format!("warm-{lock_key:032x}.lock");
-        let path = dir.path().join(lock_name);
-        let elsewhere = open_lock_file(&path).unwrap();
-        elsewhere.lock().unwrap();
-
-        let place = WarmUp::begin_in(dir.path(), lock_key, BRIEFLY);
-
-        assert!(
-            place.is_none(),
-            "a caller gives up rather than compiling alongside the process ahead",
-        );
-    }
-
     #[test]
     fn one_process_takes_one_place_per_key() {
         let dir = tempfile::tempdir().unwrap();
         let shared_key = key(6);
 
-        let first = WarmUp::begin_in(dir.path(), shared_key, BRIEFLY);
+        let first = WarmUp::begin_in(dir.path(), shared_key);
         assert!(first.is_some(), "the first caller compiles");
 
-        let second = WarmUp::begin_in(dir.path(), shared_key, BRIEFLY);
+        let second = WarmUp::begin_in(dir.path(), shared_key);
         assert!(
             second.is_none(),
             "the second caller carries on rather than waiting for itself",
@@ -263,10 +196,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let place_key = key(7);
 
-        let released = WarmUp::begin_in(dir.path(), place_key, BRIEFLY);
+        let released = WarmUp::begin_in(dir.path(), place_key);
         drop(released);
 
-        let retaken = WarmUp::begin_in(dir.path(), place_key, BRIEFLY);
+        let retaken = WarmUp::begin_in(dir.path(), place_key);
         assert!(
             retaken.is_some(),
             "the key is free again once the place is given up",
@@ -278,9 +211,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let place_key = key(2);
 
-        WarmUp::begin_in(dir.path(), place_key, BRIEFLY).unwrap().finish();
+        WarmUp::begin_in(dir.path(), place_key).unwrap().finish();
 
-        let next = WarmUp::begin_in(dir.path(), place_key, BRIEFLY);
+        let next = WarmUp::begin_in(dir.path(), place_key);
         assert!(next.is_none(), "a warm cache needs no queue");
     }
 
@@ -289,10 +222,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let place_key = key(3);
 
-        let abandoned = WarmUp::begin_in(dir.path(), place_key, BRIEFLY);
+        let abandoned = WarmUp::begin_in(dir.path(), place_key);
         drop(abandoned);
 
-        let next = WarmUp::begin_in(dir.path(), place_key, BRIEFLY);
+        let next = WarmUp::begin_in(dir.path(), place_key);
         assert!(next.is_some(), "no stamp means the kernels still need compiling");
     }
 
@@ -393,8 +326,8 @@ mod tests {
         let first_key = key(4);
         let second_key = key(5);
 
-        let first = WarmUp::begin_in(dir.path(), first_key, BRIEFLY);
-        let second = WarmUp::begin_in(dir.path(), second_key, BRIEFLY);
+        let first = WarmUp::begin_in(dir.path(), first_key);
+        let second = WarmUp::begin_in(dir.path(), second_key);
 
         assert!(
             first.is_some() && second.is_some(),

@@ -17,6 +17,7 @@ mod worker;
 
 pub use av_decoders::Rational32;
 
+pub use self::cancel::Cancellation;
 pub use self::config::ServiceConfig;
 pub use self::frame_range::FrameRange;
 pub use self::layout::{

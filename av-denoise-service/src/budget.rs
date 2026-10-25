@@ -1,12 +1,7 @@
-use std::time::Duration;
-
 use av_denoise::DenoisingMode;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::cancel::Cancel;
-
-/// How often a dispatcher waiting on a permit looks at its cancel flags.
-pub(crate) const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 pub(crate) fn temporal_radius(mode: DenoisingMode) -> u32 {
     match mode {
@@ -157,18 +152,16 @@ impl Pool {
     }
 
     fn acquire(&self, closed: &Receiver<()>, cancel: &Cancel) -> Result<Token, anyhow::Error> {
-        loop {
-            if cancel.is_set() {
-                anyhow::bail!("the window was cancelled");
-            }
-            crossbeam_channel::select! {
-                recv(self.take) -> permit => {
-                    permit.map_err(|_| anyhow::anyhow!("the coordinator stopped before the stream finished"))?;
-                    return Ok(Token(self.give.clone()));
-                },
-                recv(closed) -> _ => anyhow::bail!("the window was closed before the stream finished"),
-                default(CANCEL_POLL) => {},
-            }
+        if cancel.is_set() {
+            anyhow::bail!("the window was cancelled");
+        }
+        crossbeam_channel::select! {
+            recv(self.take) -> permit => {
+                permit.map_err(|_| anyhow::anyhow!("the coordinator stopped before the stream finished"))?;
+                Ok(Token(self.give.clone()))
+            },
+            recv(closed) -> _ => anyhow::bail!("the window was closed before the stream finished"),
+            recv(cancel.receiver()) -> _ => anyhow::bail!("the window was cancelled"),
         }
     }
 }

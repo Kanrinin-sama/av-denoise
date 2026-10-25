@@ -1,18 +1,19 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use av_denoise::{FrameLayout, PlanarDenoiser, PlaneOptions, Planes, SceneGrain, WarmUp, push_needs_retry};
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::CreationGuard;
 use crate::budget::Permit;
 use crate::cancel::Cancel;
 use crate::dispatch::{SceneJob, StagedFrame};
+use crate::pipeline::panic_message;
 use crate::pool::SharedPools;
 use crate::threads::release_affinity;
 use crate::warm::{create_denoiser, finish_warm_up};
+use crate::{Cancellation, CreationGuard};
 
 /// One denoised frame on its way to the window, still holding its permit.
 pub(crate) struct OutputMsg {
@@ -44,7 +45,7 @@ pub(crate) struct WorkerConfig<'a> {
     pub(crate) layout: FrameLayout,
     pub(crate) output: Sender<OutputMsg>,
     pub(crate) cancel: &'a Cancel,
-    pub(crate) abort: &'a Arc<AtomicBool>,
+    pub(crate) abort: &'a Cancellation,
     pub(crate) guard: &'a CreationGuard,
     pub(crate) pools: &'a Arc<SharedPools>,
     pub(crate) grain: &'a Arc<Mutex<Vec<SceneGrain>>>,
@@ -63,25 +64,33 @@ pub(crate) fn spawn_workers(
         let out_tx = config.output.clone();
         let job_rx = job_rx.clone();
         let cancel = config.cancel.clone();
-        let abort = Arc::clone(config.abort);
+        let abort = config.abort.clone();
         let guard = config.guard.clone();
         let pools = Arc::clone(config.pools);
         let grain = Arc::clone(config.grain);
 
         worker_handles.push(thread::spawn(move || {
             release_affinity();
-            let result = run_worker(
-                worker_id,
-                || guard.run(|| create_denoiser(&opts, layout)),
-                denoiser,
-                job_rx,
-                out_tx,
-                &cancel,
-                &pools,
-                &grain,
-            );
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                run_worker(
+                    worker_id,
+                    || guard.run(|| create_denoiser(&opts, layout)),
+                    denoiser,
+                    job_rx,
+                    out_tx,
+                    &cancel,
+                    &pools,
+                    &grain,
+                )
+            }))
+            .unwrap_or_else(|panic| {
+                Err(anyhow::anyhow!(
+                    "worker panicked: {}",
+                    panic_message(panic.as_ref())
+                ))
+            });
             if result.is_err() {
-                abort.store(true, Ordering::Release);
+                abort.cancel();
             }
             result
         }));

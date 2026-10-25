@@ -1,10 +1,8 @@
 use std::io::{IsTerminal, Write, stdout};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use av_denoise::SceneGrain;
-use av_denoise_service::{FrameRange, SceneLayout, Window, denoise_scenes};
+use av_denoise_service::{Cancellation, FrameRange, SceneLayout, Window, denoise_scenes};
 use indicatif::ProgressBar;
 use y4m::Frame as Y4mFrame;
 
@@ -53,7 +51,7 @@ pub fn run_file(
         scenes,
         workers,
         frame_budget_bytes,
-        Arc::new(AtomicBool::new(false)),
+        Cancellation::new(),
     )?;
     let framerate = window.frame_rate();
     let (_, grain) =
