@@ -351,6 +351,7 @@ impl PlanarDenoiser {
         let _queue = options
             .device_sink
             .as_ref()
+            .filter(|sink| sink.requires_queue_lock())
             .map(|_| crate::gpu_share::queue_lock());
         let (chroma_width, chroma_height) = layout.chroma_dims();
 
@@ -474,7 +475,11 @@ impl PlanarDenoiser {
     /// The planes go over as wire bytes, so the normalisation and the channel interleave both happen
     /// on the GPU.
     fn push_with(&mut self, planes: &Planes, push_frame: WirePush) -> Result<(), DenoiserError> {
-        let _queue = self.device_sink.as_ref().map(|_| crate::gpu_share::queue_lock());
+        let _queue = self
+            .device_sink
+            .as_ref()
+            .filter(|sink| sink.requires_queue_lock())
+            .map(|_| crate::gpu_share::queue_lock());
         self.check_planes(planes)?;
 
         if let Some(denoiser) = self.yuv.as_mut() {
@@ -543,7 +548,7 @@ impl PlanarDenoiser {
     /// Returns `Ok(None)` if neither half had pending output.
     pub fn recv_into(&mut self, output: &mut Planes) -> Result<bool, anyhow::Error> {
         if let Some(sink) = &self.device_sink {
-            let _queue = crate::gpu_share::queue_lock();
+            let _queue = sink.requires_queue_lock().then(crate::gpu_share::queue_lock);
             let mut planes = match self
                 .luma
                 .as_mut()
@@ -621,7 +626,11 @@ impl PlanarDenoiser {
             while let Some(frame) = self.recv()? {
                 sink(frame);
             }
-            let _queue = crate::gpu_share::queue_lock();
+            let _queue = self
+                .device_sink
+                .as_ref()
+                .filter(|sink| sink.requires_queue_lock())
+                .map(|_| crate::gpu_share::queue_lock());
             let luma = self
                 .luma
                 .as_mut()

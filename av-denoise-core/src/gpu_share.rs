@@ -6,7 +6,8 @@
 //! from its own persistent staging.
 
 use crate::runtime::Runtime;
-use std::sync::Mutex;
+use std::any::Any;
+use std::sync::{Arc, Mutex};
 pub use wgpu;
 
 use cubecl::prelude::*;
@@ -43,7 +44,8 @@ pub fn register(device: &WgpuDevice) -> Client {
     let (setup, registered, queue_count) = if matches!(device.backend, cubecl::wgpu::WgpuBackend::Vulkan)
         || matches!(device.backend, cubecl::wgpu::WgpuBackend::Auto) && !cfg!(target_vendor = "apple")
     {
-        let (setup, queue_count) = crate::vulkan_setup::create(device).expect("creating the shared Vulkan compute device");
+        let (setup, queue_count) =
+            crate::vulkan_setup::create(device).expect("creating the shared Vulkan compute device");
         let registered = cubecl::wgpu::try_init_device_with_api::<cubecl::wgpu::Vulkan>(
             setup.clone(),
             RuntimeOptions::default(),
@@ -100,19 +102,33 @@ pub fn vulkan_gpu(index: usize) -> (wgpu::Device, wgpu::Queue, wgpu::Adapter, u3
         .iter()
         .find(|entry| std::ptr::eq(entry.client.properties(), client.properties()))
         .unwrap();
-    (entry.gpu.clone(), entry.queue.clone(), entry.adapter.clone(), entry.queue_count)
+    (
+        entry.gpu.clone(),
+        entry.queue.clone(),
+        entry.adapter.clone(),
+        entry.queue_count,
+    )
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GpuPlane {
     pub buffer: wgpu::Buffer,
     pub offset: u64,
+    _resource: Arc<dyn Any + Send + Sync>,
+}
+
+impl std::fmt::Debug for GpuPlane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuPlane")
+            .field("buffer", &self.buffer)
+            .field("offset", &self.offset)
+            .finish_non_exhaustive()
+    }
 }
 pub fn export_planes<R: Runtime>(
     client: &crate::runtime::ComputeClient<R>,
     handles: &[cubecl::server::Handle],
 ) -> Result<Vec<GpuPlane>, anyhow::Error> {
-    use std::any::Any;
     let client = (client as &dyn Any)
         .downcast_ref::<crate::runtime::ComputeClient<WgpuRuntime<cubecl::wgpu::AutoCompiler>>>()
         .ok_or_else(|| anyhow::anyhow!("device output requires a Vulkan client"))?;
@@ -120,10 +136,11 @@ pub fn export_planes<R: Runtime>(
     handles
         .iter()
         .map(|handle| {
-            let resource = client.get_resource::<<WgpuRuntime as Runtime>::Server>(handle.clone())?;
+            let resource = Arc::new(client.get_resource::<<WgpuRuntime as Runtime>::Server>(handle.clone())?);
             Ok(GpuPlane {
                 buffer: resource.resource().buffer.clone(),
                 offset: resource.resource().offset,
+                _resource: resource,
             })
         })
         .collect()

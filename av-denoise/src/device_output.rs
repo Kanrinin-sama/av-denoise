@@ -11,6 +11,10 @@ impl std::fmt::Debug for DeviceFrame {
     }
 }
 pub trait DeviceSink: std::fmt::Debug + Send + Sync {
+    fn requires_queue_lock(&self) -> bool {
+        true
+    }
+
     fn write(&self, layout: FrameLayout, planes: &[GpuPlane]) -> Result<DeviceFrame, anyhow::Error>;
 }
 pub(crate) fn emit(
