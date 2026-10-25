@@ -1,13 +1,11 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use av_denoise::{FrameLayout, PlanarDenoiser, PlaneOptions, Planes, WarmUp, kernel_key, push_needs_retry};
+use av_denoise::{
+    FrameLayout, MAX_PENDING, PlanarDenoiser, PlaneOptions, Planes, WarmUp, kernel_key, push_needs_retry,
+};
 
 use crate::worker::Resident;
-
-/// Frames a warm-up pushes, enough to fill the temporal window and
-/// compile every kernel a real run dispatches.
-const WARM_FRAMES: usize = 8;
 
 /// Points CubeCL at the kernel cache.
 ///
@@ -68,8 +66,9 @@ pub fn warm_resident(
     cancel: &AtomicBool,
 ) -> Result<(), anyhow::Error> {
     let planes = synthetic_frame(layout);
+    let warm_frames = denoiser.window_span().ahead + MAX_PENDING + 2;
 
-    for _ in 0..WARM_FRAMES {
+    for _ in 0..warm_frames {
         if cancel.load(Ordering::Acquire) {
             anyhow::bail!("NL4D warm-up was cancelled");
         }
@@ -80,10 +79,6 @@ pub fn warm_resident(
             }
 
             denoiser.push(&planes)?;
-        }
-
-        if denoiser.recv()?.is_some() {
-            finish_warm_up(warm_up);
         }
     }
 
