@@ -86,6 +86,24 @@ impl<'a> ExtendedFeatures<'a> {
         let phys_caps = adapter.physical_device_capabilities();
         let version = phys_caps.properties().api_version;
 
+        #[cfg(target_os = "windows")]
+        for (extension, dependency) in [
+            (KHR_EXTERNAL_MEMORY_WIN32_NAME, KHR_EXTERNAL_MEMORY_NAME),
+            (KHR_EXTERNAL_SEMAPHORE_WIN32_NAME, KHR_EXTERNAL_SEMAPHORE_NAME),
+        ] {
+            if !phys_caps.supports_extension(extension)
+                || version < API_VERSION_1_1 && !phys_caps.supports_extension(dependency)
+            {
+                continue;
+            }
+            if version < API_VERSION_1_1 && !self.extensions.contains(&dependency) {
+                self.extensions.push(dependency);
+            }
+            if !self.extensions.contains(&extension) {
+                self.extensions.push(extension);
+            }
+        }
+
         if version >= API_VERSION_1_3 {
             self.max_spirv_version = (1, 6);
         } else if version >= API_VERSION_1_2 {

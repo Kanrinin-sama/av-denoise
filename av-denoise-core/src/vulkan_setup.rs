@@ -42,7 +42,7 @@ pub fn create(selector: &WgpuDevice) -> Result<(WgpuSetup, u32), anyhow::Error> 
         if !extended.has_required_features() {
             anyhow::bail!("Vulkan adapter lacks native CubeCL features");
         }
-        let extensions = hal.required_device_extensions(features);
+        let extensions = extended.extensions.clone();
         let mut physical = hal.physical_device_features(&extensions, features);
         limits.max_immediate_size = hal
             .physical_device_capabilities()
@@ -66,13 +66,16 @@ pub fn create(selector: &WgpuDevice) -> Result<(WgpuSetup, u32), anyhow::Error> 
         if host_query.host_query_reset == 0 {
             anyhow::bail!("Vulkan adapter lacks host query reset for tonemapping");
         }
-        queue_count = shared.raw_instance().get_physical_device_queue_family_properties(hal.raw_physical_device())[0].queue_count.min(2);
+        queue_count = shared
+            .raw_instance()
+            .get_physical_device_queue_family_properties(hal.raw_physical_device())[0]
+            .queue_count
+            .min(2);
         let priorities = vec![1.0; queue_count as usize];
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(0)
             .queue_priorities(&priorities)];
-        let names = extended
-            .extensions
+        let names = extensions
             .iter()
             .map(|extension| extension.as_ptr())
             .collect::<Vec<_>>();
@@ -90,7 +93,16 @@ pub fn create(selector: &WgpuDevice) -> Result<(WgpuSetup, u32), anyhow::Error> 
             .raw_instance()
             .create_device(hal.raw_physical_device(), &info, None)?;
         let memory = wgpu::MemoryHints::MemoryUsage;
-        let opened = hal.device_from_raw(native, None, &extensions, features, &limits, &memory, 0, queue_count - 1)?;
+        let opened = hal.device_from_raw(
+            native,
+            None,
+            &extensions,
+            features,
+            &limits,
+            &memory,
+            0,
+            queue_count - 1,
+        )?;
         let descriptor = wgpu::DeviceDescriptor {
             label: None,
             required_features: features,
@@ -101,11 +113,14 @@ pub fn create(selector: &WgpuDevice) -> Result<(WgpuSetup, u32), anyhow::Error> 
         };
         adapter.create_device_from_hal(opened, &descriptor)?
     };
-    Ok((WgpuSetup {
-        instance,
-        adapter,
-        device,
-        queue,
-        backend: wgpu::Backend::Vulkan,
-    }, queue_count))
+    Ok((
+        WgpuSetup {
+            instance,
+            adapter,
+            device,
+            queue,
+            backend: wgpu::Backend::Vulkan,
+        },
+        queue_count,
+    ))
 }
