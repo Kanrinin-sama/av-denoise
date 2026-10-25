@@ -113,6 +113,7 @@ impl Pipeline {
         &self,
         residents: &mut Vec<Option<Resident>>,
         layout: FrameLayout,
+        cancel: &AtomicBool,
     ) -> Result<(), anyhow::Error> {
         residents.resize_with(self.workers, || None);
         thread::scope(|scope| {
@@ -122,7 +123,7 @@ impl Pipeline {
                 .map(|resident| {
                     scope.spawn(move || -> Result<(), anyhow::Error> {
                         release_affinity();
-                        *resident = Some(self.guard.run(|| create_denoiser(&self.planes, layout))?);
+                        *resident = Some(self.warmed_resident(layout, cancel)?);
                         Ok(())
                     })
                 })

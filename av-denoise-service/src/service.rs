@@ -71,10 +71,11 @@ impl WindowService {
                 let busy = Arc::new(AtomicBool::new(false));
                 let pipeline = Arc::clone(&pipeline);
                 let slot_busy = Arc::clone(&busy);
+                let warm_cancel = Arc::clone(&cancel);
                 let residents = vec![warmed.take()];
                 let handle = thread::spawn(move || {
                     release_affinity();
-                    run_slot(&pipeline, source_layout, &slot_busy, &rx, residents)
+                    run_slot(&pipeline, source_layout, &slot_busy, &rx, residents, &warm_cancel)
                 });
                 Slot {
                     requests,
@@ -170,11 +171,12 @@ fn run_slot(
     busy: &AtomicBool,
     requests: &Receiver<SlotRequest>,
     mut residents: Vec<Option<Resident>>,
+    cancel: &AtomicBool,
 ) {
     let mut decoder = None;
     while let Ok(request) = requests.recv() {
         let result = pipeline
-            .build_residents(&mut residents, layout)
+            .build_residents(&mut residents, layout, cancel)
             .and_then(|()| pipeline.run(request.job, &mut residents, &mut decoder));
         busy.store(false, Ordering::Release);
         let _ = request.done.send(result);
